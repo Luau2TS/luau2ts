@@ -1685,6 +1685,14 @@ function compileUnary(expr: Extract<Expr, { type: 'Unary' }>, ctx: CompileContex
     case '-':
       return factory.createPrefixUnaryExpression(ts.SyntaxKind.MinusToken, inner);
     case '#': {
+      const innerType = staticTypeOfExpr(expr.expr, ctx);
+      // Type-narrowed length: strings have a native .length property
+      // with byte-equivalent semantics under our parser's UTF-8 strings.
+      // For unknown / table types we still need lualen, which walks the
+      // array part of mixed list+dict tables the way Lua does.
+      if (innerType === 'string') {
+        return factory.createPropertyAccessExpression(inner, 'length');
+      }
       const fn = ctx.use('lualen');
       return factory.createCallExpression(factory.createIdentifier(fn), undefined, [inner]);
     }
@@ -2301,6 +2309,21 @@ export interface CompileOptions {
    *  if you want raw TypeScript-printer output (faster, but the output is
    *  4-space indented without canonical spacing around blocks). */
   pretty?: boolean;
+  /** Run TypeScript's compiler API on the emitted .ts source (Layer A
+   *  post-emit type check). Diagnostics land in `CompileResult.errors`
+   *  with `[ts:CODE]` prefix. Uses the bundled `typescript` package,
+   *  no extra install. Off by default. */
+  postEmitCheck?: boolean;
+  /** Run Luau.Analysis on the input source via @luau2ts/analyzer
+   *  (Layer B pre-emit type check). Requires the optional
+   *  `@luau2ts/analyzer` package to be installed. Diagnostics land in
+   *  `CompileResult.errors` with `[luau:CODE]` prefix. If the analyzer
+   *  is not installed, a single soft warning is emitted and the option
+   *  no-ops. Off by default. */
+  preEmitCheck?: boolean;
+  /** Shorthand for `{ preEmitCheck: true, postEmitCheck: true }`. Runs
+   *  both layers. */
+  typeCheck?: boolean;
 }
 
 export interface CompileResult {
@@ -2450,6 +2473,26 @@ export async function compile(
       // fall back to the printer's raw output rather than failing the
       // whole compile. Users can see exactly what we emitted.
     }
+  }
+
+  // Layer A: post-emit TypeScript type check. Runs the bundled tsc over
+  // the emitted .ts source via an in-memory CompilerHost so we don't
+  // touch the filesystem or pull in external @types. strict:false so
+  // any-laden translations of untyped Luau don't drown the user in
+  // noise; users who want strict can run tsc --strict on the output.
+  if (options.postEmitCheck || options.typeCheck) {
+    const postEmitDiags = runPostEmitCheck(printed, sourceFileName);
+    for (const d of postEmitDiags) parsed.errors.push(d);
+  }
+
+  // Layer B: pre-emit Luau check. Will ship in @luau2ts/analyzer; until
+  // then, emit a single soft warning when the option is requested.
+  if (options.preEmitCheck || options.typeCheck) {
+    parsed.errors.push({
+      loc: { start: { line: 0, col: 0 }, end: { line: 0, col: 0 } },
+      message:
+        '[luau2ts] preEmitCheck (Luau-side type check) requires @luau2ts/analyzer, which is not yet published. Coming in a future release; see https://github.com/luau2ts/luau2ts/issues for status.',
+    });
   }
 
   let sourceMap: SourceMap | undefined;
@@ -2775,6 +2818,72 @@ function beautifyOutput(source: string): string {
     }
   }
   return out.join('\n');
+}
+
+/** Layer A: post-emit TypeScript type check. Runs the bundled tsc over
+ *  the emitted source via an in-memory CompilerHost and returns the
+ *  diagnostics in ParseError shape so they line up with everything else
+ *  in CompileResult.errors. strict:false because the translation often
+ *  produces any-typed positions where the Luau was untyped, and we'd
+ *  rather flag real semantic mistakes than drown the user in noise. */
+function runPostEmitCheck(
+  source: string,
+  _sourceName: string,
+): { message: string; loc: { start: { line: number; col: number }; end: { line: number; col: number } } }[] {
+  // Use a fixed, POSIX-style in-memory filename. The caller's sourceName
+  // (which may be a Windows path with backslashes) only matters for the
+  // user-facing error report; ts compiler internals normalize paths and
+  // a mismatched-backslash filter would drop every diagnostic.
+  const fileName = 'luau2ts-postcheck-input.ts';
+  const sourceFile = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const options: ts.CompilerOptions = {
+    strict: false,
+    noEmit: true,
+    target: ts.ScriptTarget.Latest,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    skipLibCheck: true,
+    allowJs: false,
+    isolatedModules: true,
+  };
+
+  // CompilerHost backed by the default host so lib.es*.d.ts files resolve
+  // against the bundled typescript install, but our single in-memory
+  // source file shadows getSourceFile for its own path.
+  const defaultHost = ts.createCompilerHost(options, true);
+  const host: ts.CompilerHost = {
+    ...defaultHost,
+    getSourceFile: (name, languageVersion, onError) => {
+      if (name === fileName) return sourceFile;
+      return defaultHost.getSourceFile(name, languageVersion, onError);
+    },
+    writeFile: () => undefined,
+    fileExists: (name) => (name === fileName ? true : defaultHost.fileExists(name)),
+    readFile: (name) => (name === fileName ? source : defaultHost.readFile(name)),
+  };
+
+  const program = ts.createProgram({ rootNames: [fileName], options, host });
+  const diagnostics = ts.getPreEmitDiagnostics(program);
+
+  const out: { message: string; loc: { start: { line: number; col: number }; end: { line: number; col: number } } }[] = [];
+  for (const d of diagnostics) {
+    // Only surface diagnostics that point into OUR source file. lib.*.d.ts
+    // errors would just be noise.
+    if (!d.file || d.file.fileName !== fileName) continue;
+    const start = d.start !== undefined ? sourceFile.getLineAndCharacterOfPosition(d.start) : { line: 0, character: 0 };
+    const endPos = d.start !== undefined && d.length !== undefined
+      ? sourceFile.getLineAndCharacterOfPosition(d.start + d.length)
+      : start;
+    const message = ts.flattenDiagnosticMessageText(d.messageText, '\n');
+    out.push({
+      message: `[ts:${d.code}] ${message}`,
+      loc: {
+        start: { line: start.line + 1, col: start.character + 1 },
+        end: { line: endPos.line + 1, col: endPos.character + 1 },
+      },
+    });
+  }
+  return out;
 }
 
 function buildRuntimeImport(names: string[]): ts.Statement {

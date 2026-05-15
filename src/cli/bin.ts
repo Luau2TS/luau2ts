@@ -33,7 +33,13 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  const opts = { mode: args.mode, sourcemap: args.sourcemap };
+  const opts = {
+    mode: args.mode,
+    sourcemap: args.sourcemap,
+    checkTs: args.checkTs,
+    checkLuau: args.checkLuau,
+    typeCheck: args.typeCheck,
+  };
 
   if (args.project !== undefined) {
     if (!args.output) {

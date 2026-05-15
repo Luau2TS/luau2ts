@@ -10,6 +10,9 @@ export interface ParsedArgs {
   output: string | undefined;
   mode: CompatMode;
   sourcemap: boolean;
+  checkLuau: boolean;
+  checkTs: boolean;
+  typeCheck: boolean;
   help: boolean;
   version: boolean;
 }
@@ -23,6 +26,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
     output: undefined,
     mode: 'rbxts',
     sourcemap: false,
+    checkLuau: false,
+    checkTs: false,
+    typeCheck: false,
     help: false,
     version: false,
   };
@@ -48,6 +54,21 @@ export function parseArgs(argv: string[]): ParsedArgs {
     }
     if (arg === '--sourcemap') {
       result.sourcemap = true;
+      i += 1;
+      continue;
+    }
+    if (arg === '--check-ts') {
+      result.checkTs = true;
+      i += 1;
+      continue;
+    }
+    if (arg === '--check-luau') {
+      result.checkLuau = true;
+      i += 1;
+      continue;
+    }
+    if (arg === '--typecheck') {
+      result.typeCheck = true;
       i += 1;
       continue;
     }
@@ -116,7 +137,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   return result;
 }
 
-export const HELP_TEXT = `luau2ts — A Luau-to-TypeScript compiler for Roblox.
+export const HELP_TEXT = `luau2ts: A Luau-to-TypeScript compiler for Roblox.
 
 Usage:
   luau2ts <file.luau>                    Compile one file. Writes to stdout.
@@ -134,14 +155,22 @@ Flags:
   -p, --project <path>    Path to a Rojo *.project.json file, or a directory
                           containing default.project.json.
       --mode <name>       Emit compatibility mode. One of:
-                            rbxts   (default) — emits TS that imports from
+                            rbxts   (default) emits TS that imports from
                                                 @rbxts/types, @rbxts/services,
                                                 etc. Pairs with roblox-ts.
-                            native           — emits TS that imports stdlib
+                            native             emits TS that imports stdlib
                                                 helpers from 'luau2ts/runtime'.
                                                 Pairs with a host runtime that
                                                 provides Roblox's Luau API.
       --sourcemap         Emit a .ts.map next to each .ts.
+      --check-ts          Run TypeScript's type checker over the emitted
+                          .ts source. Diagnostics print with [ts:CODE]
+                          prefix; non-zero exit on errors.
+      --check-luau        Run Luau's type checker (Luau.Analysis) over
+                          the input. Requires @luau2ts/analyzer to be
+                          installed; currently emits a soft notice
+                          (analyzer ships in a future release).
+      --typecheck         Shorthand: --check-ts plus --check-luau.
   -h, --help              Show this help text.
   -v, --version           Print the installed luau2ts version.
 `;

@@ -8,6 +8,9 @@ import type { CompatMode } from '../compile/context.js';
 export interface ModeOptions {
   mode: CompatMode;
   sourcemap: boolean;
+  checkTs: boolean;
+  checkLuau: boolean;
+  typeCheck: boolean;
 }
 
 function compileOptionsFor(
@@ -19,15 +22,27 @@ function compileOptionsFor(
     compatMode: opts.mode,
   };
   if (opts.sourcemap) out.sourceMap = true;
+  if (opts.checkTs) out.postEmitCheck = true;
+  if (opts.checkLuau) out.preEmitCheck = true;
+  if (opts.typeCheck) out.typeCheck = true;
   return out;
 }
 
 function reportErrors(filePath: string, result: CompileResult): boolean {
   if (result.errors.length === 0) return false;
   for (const err of result.errors) {
-    const line = (err as { line?: number }).line ?? 0;
-    const col = (err as { col?: number }).col ?? 0;
-    const msg = (err as { message?: string }).message ?? String(err);
+    // Parser/check errors carry a loc: { start: { line, col }, end }.
+    // Walk through both shapes defensively so a future error variant
+    // with a flat {line, col} still formats sensibly.
+    const e = err as {
+      message?: string;
+      line?: number;
+      col?: number;
+      loc?: { start?: { line?: number; col?: number } };
+    };
+    const line = e.loc?.start?.line ?? e.line ?? 0;
+    const col = e.loc?.start?.col ?? e.col ?? 0;
+    const msg = e.message ?? String(err);
     process.stderr.write(`${filePath}:${line}:${col}: ${msg}\n`);
   }
   return true;

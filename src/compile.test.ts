@@ -612,3 +612,43 @@ describe('compile — header / sourcemap / comments', () => {
     expect(r.source).toContain('//# sourceMappingURL=data:application/json;base64,');
   });
 });
+
+describe('compile — type checking', () => {
+  it('postEmitCheck flags a TypeScript type error in the emitted source', async () => {
+    // Untyped helpers are stripped from the call so we exercise the
+    // narrowing path: a typed `number` local can't take a string literal.
+    const r = await _compile('local x: number = "hi"', { postEmitCheck: true });
+    const tsErrors = r.errors.filter((e) => e.message.includes('[ts:'));
+    expect(tsErrors.length).toBeGreaterThan(0);
+    expect(tsErrors[0]!.message).toContain('not assignable');
+    expect(tsErrors[0]!.loc.start.line).toBeGreaterThan(0);
+  });
+
+  it('postEmitCheck is silent on clean code', async () => {
+    const r = await _compile('local x: number = 1\nlocal y: string = "ok"', {
+      postEmitCheck: true,
+    });
+    const tsErrors = r.errors.filter((e) => e.message.includes('[ts:'));
+    expect(tsErrors).toEqual([]);
+  });
+
+  it('postEmitCheck is opt-in (no errors surface without the flag)', async () => {
+    const r = await _compile('local x: number = "hi"');
+    const tsErrors = r.errors.filter((e) => e.message.includes('[ts:'));
+    expect(tsErrors).toEqual([]);
+  });
+
+  it('preEmitCheck emits a soft warning until the analyzer ships', async () => {
+    const r = await _compile('local x = 1', { preEmitCheck: true });
+    const stubs = r.errors.filter((e) => e.message.includes('@luau2ts/analyzer'));
+    expect(stubs.length).toBe(1);
+  });
+
+  it('typeCheck runs both layers (postEmit + preEmit stub)', async () => {
+    const r = await _compile('local x: number = "hi"', { typeCheck: true });
+    const tsErrors = r.errors.filter((e) => e.message.includes('[ts:'));
+    const stubs = r.errors.filter((e) => e.message.includes('@luau2ts/analyzer'));
+    expect(tsErrors.length).toBeGreaterThan(0);
+    expect(stubs.length).toBe(1);
+  });
+});
