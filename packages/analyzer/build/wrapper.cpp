@@ -14,9 +14,17 @@
 #include "Luau/FileResolver.h"
 #include "Luau/Location.h"
 #include "Luau/Module.h"
+#include "Luau/Scope.h"
+#include "Luau/Type.h"
 #include "Luau/TypeArena.h"
 
+// Generated header: const char kRobloxGlobals[] / size_t kRobloxGlobalsLen
+// holding the Roblox-globals Luau definition source produced by
+// scripts/gen-roblox-defs.mjs and embedded via build/embed-globals.mjs.
+#include "roblox_globals_data.h"
+
 #include <emscripten.h>
+#include <string_view>
 
 #include <cstdint>
 #include <cstdio>
@@ -128,6 +136,57 @@ const char* luau_analyze(const char* source, std::size_t len) {
 
   Luau::Frontend frontend(&fileResolver, &configResolver, options);
   Luau::registerBuiltinGlobals(frontend, frontend.globals);
+
+  // Roblox runtime globals (task, datatypes, classes, services, ...) that
+  // ship with the Roblox VM but aren't part of Luau's core stdlib. Without
+  // these declarations the analyzer flags every Roblox API as UnknownSymbol.
+  //
+  // The definitions are generated from Roblox's API-Dump.json by
+  // scripts/gen-roblox-defs.mjs, embedded into a C++ header at build time
+  // (build/build.sh runs embed-globals.mjs before emcc), and linked in here.
+  // Loaded after registerBuiltinGlobals (which loads Luau's own builtins)
+  // and before freeze.
+  Luau::LoadDefinitionFileResult defsResult = frontend.loadDefinitionFile(
+      frontend.globals, frontend.globals.globalScope,
+      std::string_view(reinterpret_cast<const char*>(kRobloxGlobals), kRobloxGlobalsLen),
+      "@roblox", /*captureComments*/ false);
+  if (!defsResult.success) {
+    // Surface the parse errors as JSON-tagged diagnostics so the user sees
+    // exactly which line in roblox-globals.d.lua broke the load. Without
+    // this we silently lose every Roblox global and every script flags
+    // "Unknown global 'game'" etc., which is impossible to debug.
+    std::ostringstream out;
+    out << "{\"errors\":[";
+    bool first = true;
+    for (const auto& err : defsResult.parseResult.errors) {
+      if (!first) out << ',';
+      first = false;
+      std::string esc;
+      jsonEscape(esc, std::string("[roblox-globals.d.lua] ") + err.getMessage());
+      out << "{";
+      out << "\"line\":" << (err.getLocation().begin.line + 1);
+      out << ",\"col\":" << (err.getLocation().begin.column + 1);
+      out << ",\"endLine\":" << (err.getLocation().end.line + 1);
+      out << ",\"endCol\":" << (err.getLocation().end.column + 1);
+      out << ",\"code\":\"DefinitionFileParseError\"";
+      out << ",\"message\":" << esc;
+      out << "}";
+    }
+    out << "],\"warnings\":[]}";
+    g_lastResult = out.str();
+    return g_lastResult.c_str();
+  }
+
+  // Pin every loaded global binding so its TypeId isn't reclaimed by
+  // type-arena cleanup mid-check. registerBuiltinGlobals does this for
+  // its own bindings via a file-local finalizeGlobalBindings(); we have
+  // to mirror that for the additional Roblox globals we just loaded, or
+  // subsequent frontend.check() runs silently lose them and the analyzer
+  // reports zero diagnostics for everything (including syntax errors).
+  for (const auto& [_, binding] : frontend.globals.globalScope->bindings) {
+    Luau::persist(binding.typeId);
+  }
+
   Luau::freeze(frontend.globals.globalTypes);
 
   Luau::CheckResult result;

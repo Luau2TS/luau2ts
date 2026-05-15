@@ -44,6 +44,12 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+# Regenerate the embedded Roblox-globals header before invoking emcc, so
+# wrapper.cpp picks up the latest roblox-globals.d.lua contents. The script
+# is a fast no-op when nothing changed.
+echo ">> Embedding roblox-globals.d.lua into roblox_globals_data.h..."
+node embed-globals.mjs
+
 echo ">> Building $OUT_DIR/luau-analyzer.mjs with $EMCC..."
 
 # Collect every .cpp under the modules we need. Globbing keeps the
