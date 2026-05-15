@@ -46,7 +46,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           npm version ${{ inputs.version }} --allow-same-version -m "chore: release v%s"
-          npm publish --access public
+          # pnpm publish (not npm publish) so workspace:* in
+          # optionalDependencies expands to the analyzer's real
+          # version on the registry. --no-git-checks because we just
+          # bumped + amended.
+          pnpm publish --access public --no-git-checks
           git push
           git push --tags
         env:
