@@ -40,12 +40,41 @@ When you change the compiler's emit, run the test suite and update any assertion
 
 ## Releasing
 
-1. Open a PR; label it `fix`, `feature`, `breaking`, or `docs`.
-2. Release-drafter auto-collects merged PR titles into a draft GitHub release.
-3. When ready, publish the draft release with a tag like `v0.2.0`.
-4. The `release.yml` workflow runs on the tag push, builds, tests, and publishes to npm with provenance.
+### First-time setup (one off)
 
-npm publishing uses [OIDC trusted publishing](https://docs.npmjs.com/trusted-publishers); there is no long-lived `NPM_TOKEN`. Before the first release, configure trusted publishing in the package's settings on npmjs.com.
+Before the very first publish, configure a trusted publisher on npm for `luau2ts`. This lets the release workflow upload without a long-lived `NPM_TOKEN`.
+
+1. Log in at https://www.npmjs.com.
+2. Open https://www.npmjs.com/settings/`<your-username>`/trusted-publishers (or **Account → Trusted Publishers**).
+3. Click **Add publisher** and fill in:
+   - Publisher: **GitHub Actions**
+   - Organization / user: `luau2ts`
+   - Repository: `luau2ts`
+   - Workflow filename: `release.yml`
+   - Environment name: `npm`
+4. Save. The publisher is now bound to `luau2ts/luau2ts` and the `release.yml` workflow can publish without a token.
+
+For coverage badges, register the repo at https://app.codecov.io/gh/luau2ts/luau2ts. Public repos work without a token, but adding `CODECOV_TOKEN` to repo secrets bumps reliability.
+
+### Cutting a release
+
+1. Open PRs against `main` and label each one: `feature`, `fix`, `breaking`, `docs`, or `chore`.
+2. Release-drafter (`.github/workflows/release-drafter.yml`) auto-collects the merged titles into a *draft* GitHub release whose tag is computed from the labels (breaking → major, feature → minor, others → patch).
+3. Bump `version` in `package.json` and add the new section in `CHANGELOG.md`. Commit and merge.
+4. On https://github.com/luau2ts/luau2ts/releases, edit the draft release: confirm the tag, add a one-line summary if needed, and click **Publish release**.
+5. Publishing the release creates the tag `vX.Y.Z`, which triggers `release.yml`. It builds, tests, and runs `npm publish --provenance --access public` via OIDC.
+
+You can also publish manually from the CLI by triggering the workflow at https://github.com/luau2ts/luau2ts/actions/workflows/release.yml with **Run workflow** and supplying the tag input.
+
+### Verifying a published release
+
+```bash
+npm view luau2ts version           # should match the tag
+npm install -g luau2ts             # global install
+luau2ts --version                  # round-trip check
+```
+
+The shields.io badges in the README pick up the new version automatically on next browser cache flush (usually a few minutes).
 
 ## Labels
 
