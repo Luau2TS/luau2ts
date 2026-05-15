@@ -10,6 +10,11 @@ updates:
       timezone: 'Etc/UTC'
     open-pull-requests-limit: 5
     labels: ['dependencies']
+    # Hold majors back: they need manual review (compiler / test runner
+    # majors usually have breaking changes that need fixture updates).
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
     groups:
       typescript-tooling:
         patterns: ['typescript', '@types/*', '@vitest/*', 'vitest']
