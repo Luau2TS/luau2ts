@@ -580,7 +580,7 @@ describe('compile — header / sourcemap / comments', () => {
   it('pretty-prints output via Prettier by default', async () => {
     // Compile through the un-wrapped function so Prettier runs.
     const r = await _compile('local function greet(name)\n  print("hi " .. name)\nend\ngreet("world")');
-    // Prettier flips double-quoted string literals to single-quote (rbx-web .prettierrc).
+    // Prettier flips double-quoted string literals to single-quote (per .prettierrc).
     expect(r.source).toContain("greet('world')");
     // Prettier uses 2-space indents, the TS factory printer uses 4.
     expect(r.source).toMatch(/\n {2}print\(/);

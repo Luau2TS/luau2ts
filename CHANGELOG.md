@@ -6,7 +6,7 @@ All notable changes to `luau2ts` are documented here. Format adheres loosely to 
 
 ## [0.1.0]
 
-First public release. Extracted from the [`rbx-web`](https://github.com/tonybolivar/rbx-web) monorepo into a standalone npm package.
+First public release.
 
 ### Added
 - `compile(source, options?)` library API. Parses Luau via a WASM-built parser and emits readable, idiomatic TypeScript.

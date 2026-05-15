@@ -2430,8 +2430,8 @@ export async function compile(
 
   // Pretty-print the final output via Prettier. The TS factory printer
   // produces correct but ugly TypeScript: 4-space indents, no blank lines
-  // between top-level blocks, no consistent quoting. Prettier with rbx-web's
-  // .prettierrc rules brings it in line with how humans write TS. Source-map
+  // between top-level blocks, no consistent quoting. Prettier with the
+  // baked-in rules brings it in line with how humans write TS. Source-map
   // building runs AFTER this step so generated-line numbers match the
   // final output the user sees.
   if (options.pretty !== false) {
