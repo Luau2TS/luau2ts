@@ -15,3 +15,6 @@ coverage
 # Docusaurus build artifacts
 docs/.docusaurus
 docs/build
+
+# Luau source clone used by the WASM analyzer build (not committed)
+packages/analyzer/build/luau/

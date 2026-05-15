@@ -649,17 +649,18 @@ describe('compile — type checking', () => {
     expect(tsErrors).toEqual([]);
   });
 
-  it('preEmitCheck emits a soft warning until the analyzer ships', async () => {
-    const r = await _compile('local x = 1', { preEmitCheck: true });
-    const stubs = r.errors.filter((e) => e.message.includes('@luau2ts/analyzer'));
-    expect(stubs.length).toBe(1);
+  it('preEmitCheck surfaces Luau-side type errors via @luau2ts/analyzer', async () => {
+    const r = await _compile('local x: number = "hi"', { pretty: false, preEmitCheck: true, postEmitCheck: false });
+    const luauErrors = r.errors.filter((e) => e.message.includes('[luau:'));
+    expect(luauErrors.length).toBeGreaterThan(0);
+    expect(luauErrors[0]!.message).toMatch(/TypeMismatch|number|string/);
   });
 
-  it('typeCheck runs both layers (postEmit + preEmit stub)', async () => {
-    const r = await _compile('local x: number = "hi"', { typeCheck: true });
+  it('typeCheck runs both layers and tags diagnostics with their source', async () => {
+    const r = await _compile('local x: number = "hi"', { pretty: false, typeCheck: true });
     const tsErrors = r.errors.filter((e) => e.message.includes('[ts:'));
-    const stubs = r.errors.filter((e) => e.message.includes('@luau2ts/analyzer'));
+    const luauErrors = r.errors.filter((e) => e.message.includes('[luau:'));
     expect(tsErrors.length).toBeGreaterThan(0);
-    expect(stubs.length).toBe(1);
+    expect(luauErrors.length).toBeGreaterThan(0);
   });
 });

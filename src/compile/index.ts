@@ -2496,12 +2496,17 @@ export async function compile(
   // they're expecting the analyzer to be there.
   const runLayerB = options.typeCheck === true || options.preEmitCheck === true || options.preEmitCheck !== false;
   if (runLayerB) {
+    type AnalyzerDiagnostic = {
+      severity: 'error' | 'warning';
+      code: string;
+      message: string;
+      line: number;
+      col: number;
+      endLine: number;
+      endCol: number;
+    };
     type AnalyzerMod = {
-      analyze: (
-        source: string,
-      ) => Promise<
-        { message: string; loc: { start: { line: number; col: number }; end: { line: number; col: number } } }[]
-      >;
+      analyze: (source: string) => Promise<AnalyzerDiagnostic[]>;
     };
     let analyzerMod: AnalyzerMod | undefined;
     try {
@@ -2526,7 +2531,18 @@ export async function compile(
     }
     if (analyzerMod) {
       const diags = await analyzerMod.analyze(source);
-      for (const d of diags) parsed.errors.push(d);
+      for (const d of diags) {
+        // Normalize the analyzer's flat {line, col} into the
+        // parser's nested loc shape so the union of errors in
+        // CompileResult stays uniform.
+        parsed.errors.push({
+          message: `[luau:${d.code}] ${d.message}`,
+          loc: {
+            start: { line: d.line, col: d.col },
+            end: { line: d.endLine, col: d.endCol },
+          },
+        });
+      }
     }
   }
 

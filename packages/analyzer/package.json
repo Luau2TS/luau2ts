@@ -1,30 +1,17 @@
 {
-  "name": "luau2ts",
+  "name": "@luau2ts/analyzer",
   "version": "0.1.0",
-  "description": "A Luau-to-TypeScript compiler for Roblox.",
+  "description": "Luau type checker (Luau.Analysis compiled to WebAssembly). Optional companion to luau2ts that surfaces input-side type errors before translation.",
   "type": "module",
   "license": "MIT",
   "author": "Tony Bolivar",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": {
-    "luau2ts": "./dist/cli/bin.js"
-  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./runtime": {
-      "types": "./dist/runtime/index.d.ts",
-      "import": "./dist/runtime/index.js",
-      "default": "./dist/runtime/index.js"
-    },
-    "./rojo": {
-      "types": "./dist/rojo/index.d.ts",
-      "import": "./dist/rojo/index.js",
-      "default": "./dist/rojo/index.js"
     }
   },
   "files": [
@@ -34,34 +21,27 @@
   ],
   "scripts": {
     "build": "tsc -b && node scripts/copy-wasm.mjs",
+    "build:wasm": "bash build/build.sh",
     "clean": "tsc -b --clean",
     "test": "vitest run",
-    "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "prettier": "^3.4.0",
-    "typescript": "^5.5.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "@vitest/coverage-v8": "^2.0.0",
+    "typescript": "^5.5.0",
     "vitest": "^2.0.0"
-  },
-  "optionalDependencies": {
-    "@luau2ts/analyzer": "workspace:*"
   },
   "keywords": [
     "luau",
-    "typescript",
-    "compiler",
-    "roblox",
-    "roblox-ts",
-    "transpiler"
+    "type-checker",
+    "luau-analyze",
+    "wasm",
+    "roblox"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/luau2ts/luau2ts.git"
+    "url": "git+https://github.com/luau2ts/luau2ts.git",
+    "directory": "packages/analyzer"
   },
   "homepage": "https://luau2ts.com",
   "bugs": {
@@ -69,5 +49,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
