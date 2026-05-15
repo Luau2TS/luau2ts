@@ -7,16 +7,11 @@ name: npm owner
 on:
   workflow_dispatch:
     inputs:
-      add:
-        description: 'Owner to add (user or org)'
-        required: false
+      command:
+        description: 'Command shell to run (use full npm CLI)'
+        required: true
         type: string
-        default: ''
-      remove:
-        description: 'Owner to remove (user or org)'
-        required: false
-        type: string
-        default: ''
+        default: 'npm owner ls luau2ts'
 
 jobs:
   owner:
@@ -27,19 +22,11 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Run npm owner commands
+      - name: Run command
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          set -e
-          npm owner ls luau2ts
-          if [ -n "${{ inputs.add }}" ]; then
-            echo "==> npm owner add ${{ inputs.add }} luau2ts"
-            npm owner add ${{ inputs.add }} luau2ts
-          fi
-          if [ -n "${{ inputs.remove }}" ]; then
-            echo "==> npm owner rm ${{ inputs.remove }} luau2ts"
-            npm owner rm ${{ inputs.remove }} luau2ts
-          fi
-          echo "--- after ---"
+          set -ex
+          ${{ inputs.command }}
+          echo "--- final owners ---"
           npm owner ls luau2ts
