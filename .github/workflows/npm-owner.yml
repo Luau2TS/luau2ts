@@ -1,0 +1,45 @@
+name: npm owner
+
+# One-off workflow to manage npm package owners. Useful right after
+# the first publish, to transfer ownership from a personal user to
+# the luau2ts npm org without re-publishing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      add:
+        description: 'Owner to add (user or org)'
+        required: false
+        type: string
+        default: ''
+      remove:
+        description: 'Owner to remove (user or org)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  owner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Run npm owner commands
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          npm owner ls luau2ts
+          if [ -n "${{ inputs.add }}" ]; then
+            echo "==> npm owner add ${{ inputs.add }} luau2ts"
+            npm owner add ${{ inputs.add }} luau2ts
+          fi
+          if [ -n "${{ inputs.remove }}" ]; then
+            echo "==> npm owner rm ${{ inputs.remove }} luau2ts"
+            npm owner rm ${{ inputs.remove }} luau2ts
+          fi
+          echo "--- after ---"
+          npm owner ls luau2ts
