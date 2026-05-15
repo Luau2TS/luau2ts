@@ -2392,6 +2392,24 @@ function compileLogicalBinary(
       right,
     );
   }
+  // rbxts mode: collapse `a or b` / `a and b` to native TS operators.
+  // `??` and `&&` / `||` already short-circuit, so we don't need the
+  // capture-LHS-once IIFE that native mode uses. The choice between `||`
+  // and `??` for `or` follows the LHS's static type: a boolean LHS
+  // really might be `false`, so `||` is the closer Luau match; for
+  // anything else `??` reads as the typical "default when nil" intent
+  // the source author meant. Lossy on edge cases (a number-typed LHS
+  // that's 0 still falls through `||` in JS but is truthy in Luau), but
+  // matches what roblox-ts users write by hand.
+  if (ctx.compatMode === 'rbxts') {
+    if (op === 'and') {
+      return factory.createBinaryExpression(left, ts.SyntaxKind.AmpersandAmpersandToken, right);
+    }
+    const orToken = leftType === 'boolean'
+      ? ts.SyntaxKind.BarBarToken
+      : ts.SyntaxKind.QuestionQuestionToken;
+    return factory.createBinaryExpression(left, orToken, right);
+  }
   if (isRepeatableExpression(left)) {
     return factory.createConditionalExpression(
       truthify(left, ctx, leftType),
@@ -2403,20 +2421,15 @@ function compileLogicalBinary(
   }
   // Non-repeatable LHS — bind it once via a single-expression arrow IIFE
   // so the truthiness test and the chosen-operand both reference the
-  // same evaluation: `(__l => isTruthy(__l) ? right : __l)(left)`. In
-  // rbxts mode, drop the isTruthy wrap; roblox-ts re-derives Lua-truthy
-  // when it compiles the ternary back to Lua.
+  // same evaluation: `(__l => isTruthy(__l) ? right : __l)(left)`.
   const leftId = factory.createIdentifier('__l');
   const needsAsync = nodeContainsAwait(right);
-  const truthCheck = ctx.compatMode === 'rbxts'
-    ? leftId
-    : factory.createCallExpression(
-        factory.createIdentifier(ctx.use('isTruthy')),
-        undefined,
-        [leftId],
-      );
   const choose = factory.createConditionalExpression(
-    truthCheck,
+    factory.createCallExpression(
+      factory.createIdentifier(ctx.use('isTruthy')),
+      undefined,
+      [leftId],
+    ),
     factory.createToken(ts.SyntaxKind.QuestionToken),
     op === 'and' ? right : leftId,
     factory.createToken(ts.SyntaxKind.ColonToken),
