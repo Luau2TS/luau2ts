@@ -45,14 +45,24 @@ When you change the compiler's emit, run the test suite and update any assertion
 Before the very first publish, configure a trusted publisher on npm for `luau2ts`. This lets the release workflow upload without a long-lived `NPM_TOKEN`.
 
 1. Log in at https://www.npmjs.com.
-2. Open https://www.npmjs.com/settings/`<your-username>`/trusted-publishers (or **Account → Trusted Publishers**).
+2. Open **your account's** Trusted Publishers page (npm does not expose a separate org-level page; the binding always lives under a user account):
+   `https://www.npmjs.com/settings/<your-npm-username>/trusted-publishers`
 3. Click **Add publisher** and fill in:
    - Publisher: **GitHub Actions**
    - Organization / user: `luau2ts`
    - Repository: `luau2ts`
    - Workflow filename: `release.yml`
    - Environment name: `npm`
-4. Save. The publisher is now bound to `luau2ts/luau2ts` and the `release.yml` workflow can publish without a token.
+4. Save. The trusted publisher is now bound by package name and works even though `luau2ts` isn't published yet.
+
+After the first publish, transfer ownership to the `luau2ts` org so the package is org-owned (matching the GitHub repo):
+
+```bash
+npm owner add luau2ts luau2ts             # add the org
+npm owner rm <your-npm-username> luau2ts  # remove yourself (optional)
+```
+
+The trusted publisher keeps working after ownership transfer; npm remembers the binding by package name.
 
 For coverage badges, register the repo at https://app.codecov.io/gh/luau2ts/luau2ts. Public repos work without a token, but adding `CODECOV_TOKEN` to repo secrets bumps reliability.
 
