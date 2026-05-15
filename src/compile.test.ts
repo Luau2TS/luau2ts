@@ -108,6 +108,41 @@ describe('compile — statements', () => {
     expect(c.source).toContain('luaConcat');
   });
 
+  it('table[k] = v with non-literal key routes through luaIndexSet', async () => {
+    // `luaIndex(t, k) = v` is not a valid TS lvalue; the compiler must
+    // pair the read-side luaIndex with a luaIndexSet helper for writes.
+    const r = await compile(`
+      local t = {}
+      local k = "foo"
+      t[k] = 42
+    `);
+    expect(r.source).toContain('luaIndexSet(t, k, 42)');
+    expect(r.source).not.toMatch(/luaIndex\([^)]*\)\s*=/);
+    expect(r.helpers).toContain('luaIndexSet');
+  });
+
+  it('table[k] += v with non-literal key expands to luaIndexSet + luaIndex', async () => {
+    const r = await compile(`
+      local t = {}
+      local k = "foo"
+      t[k] += 1
+    `);
+    expect(r.source).toContain('luaIndexSet(t, k,');
+    expect(r.source).toContain('luaIndex(t, k)');
+    expect(r.source).not.toMatch(/luaIndex\([^)]*\)\s*\+=/);
+  });
+
+  it('table[literal] = v stays as plain bracket assignment', async () => {
+    const r = await compile(`
+      local t = {}
+      t[1] = "a"
+      t["k"] = "b"
+    `);
+    expect(r.source).toContain('t[0] = "a"');
+    expect(r.source).toContain('t["k"] = "b"');
+    expect(r.source).not.toContain('luaIndexSet');
+  });
+
   it('if / elseif / else', async () => {
     const r = await compile('if a then x = 1 elseif b then x = 2 else x = 3 end');
     const out = r.source;
@@ -152,7 +187,7 @@ describe('compile — statements', () => {
 
 describe('compile — expressions', () => {
   it('every literal kind', async () => {
-    expect((await compile('return nil')).source).toContain('return undefined;');
+    expect((await compile('return nil')).source).toContain('return null;');
     expect((await compile('return true')).source).toContain('return true;');
     expect((await compile('return false')).source).toContain('return false;');
     expect((await compile('return 42')).source).toContain('return 42;');
@@ -299,7 +334,10 @@ describe('compile — functions', () => {
 
   it('member function with yielding call → async', async () => {
     const r = await compile('function obj.fn() wait(1) end');
-    expect(r.source).toContain('obj.fn = async function');
+    // Async member assignments cast the base through `any` so a typed
+    // impl-type slot (`fn: () -> ()`) doesn't reject the `Promise<void>`
+    // return. The right-hand side is still emitted as `async function`.
+    expect(norm(r.source)).toMatch(/\(obj as any\)\.fn = async function/);
   });
 
   it('assignment with yielding function rhs propagates await to call sites', async () => {
@@ -496,6 +534,120 @@ describe('compile — type aliases & declares', () => {
     expect(r.source).toContain('value: T');
   });
 
+  it('type alias with generic type pack', async () => {
+    // `type Foo<T...> = ...` declared the alias without the generic param,
+    // then `Foo<T...>` references collapsed to `Foo<unknown>` — declaration
+    // vs. reference mismatched and tsc surfaced "Type 'Foo' is not generic".
+    const r = await compile(`
+      type Sig<T...> = {
+        fire: (Sig<T...>, T...) -> (),
+      }
+    `);
+    // Declaration carries the pack-as-tuple generic.
+    expect(r.source).toMatch(/type Sig<T extends unknown\[\] = unknown\[\]>/);
+    // Self-reference `Sig<T...>` uses the same name, NOT `Sig<unknown>`.
+    expect(r.source).toContain('Sig<T>');
+    expect(r.source).not.toContain('Sig<unknown>');
+  });
+
+  it('type alias generic-pack reference with multiple positional args is grouped as a tuple', async () => {
+    // `Signal<a, b, c>` against `type Signal<T...>` means T... = (a, b, c).
+    // Without grouping it emits `Signal<a, b, c>` (three TS generics) and
+    // tsc flags "requires between 0 and 1 type arguments".
+    const r = await compile(`
+      type Signal<T...> = (T...) -> ()
+      type X = Signal<string, number>
+    `);
+    expect(norm(r.source)).toContain('type X = Signal<[ string, number ]>');
+  });
+
+  it('typeof(setmetatable(body :: B, meta :: M)) intersects body and meta', async () => {
+    // Luau's canonical "instance type" idiom — without this it collapses
+    // to `unknown` and every `self.field` cascades.
+    const r = await compile(`
+      type Inst = typeof(setmetatable({} :: { x: number }, {} :: { add: (Inst) -> () }))
+    `);
+    expect(r.source).toMatch(/x: number/);
+    expect(r.source).toMatch(/add:/);
+  });
+
+  it('mapped type emitted for union-literal indexer', async () => {
+    // `{ [LogLevel]: number }` with `type LogLevel = "a" | "b"` can't
+    // become a plain TS index signature `[key: LogLevel]: number` (1337
+    // rejects literal-union keys). Emit `{ [K in LogLevel]: number }`.
+    const r = await compile(`
+      type LogLevel = "trace" | "info"
+      type Order = { [LogLevel]: number }
+    `);
+    expect(r.source).toContain('[K in LogLevel]: number');
+  });
+
+  it('{T} (Luau array shorthand) emits as T[] not numeric index signature', async () => {
+    const r = await compile('type Names = { string }');
+    expect(r.source).toContain('type Names = string[]');
+    expect(r.source).not.toMatch(/\[key: number\]: string/);
+  });
+
+  it('trailing nilable params become call-site-optional via `= null` default', async () => {
+    const r = await compile(`
+      local function f(a: string, b: string?, c: number?) end
+    `);
+    // Previously emitted `b?: string | null` (which widens in-body to
+    // `string | null | undefined` and conflicts with `T | null`-typed
+    // receivers). Now emits `b: string | null = null` — same call-site
+    // optionality, but in-body type stays the declared `T | null`.
+    expect(r.source).toMatch(/b: string \| null = null/);
+    expect(r.source).toMatch(/c: number \| null = null/);
+    expect(r.source).toMatch(/a: string,/);
+    expect(r.source).not.toMatch(/b\?:/);
+  });
+
+  it('async function with return annotation wraps return type in Promise', async () => {
+    const r = await compile(`
+      local function f(): number
+        task.wait(1)
+        return 1
+      end
+    `);
+    // task.wait is yielding → body uses await → return type must be Promise<T>.
+    expect(r.source).toMatch(/Promise<number>/);
+  });
+
+  it('module-trailing return becomes export default', async () => {
+    const r = await compile(`
+      local M = { x = 1 }
+      return M
+    `);
+    expect(r.source).toContain('export default M');
+    // The trailing top-level `return` is gone.
+    expect(r.source).not.toMatch(/return M;?\s*$/);
+  });
+
+  it('runtime globals (setmetatable, table, os, pcall, error) auto-import', async () => {
+    const r = await compile(`
+      local function f()
+        local t = setmetatable({}, {})
+        table.insert(t, 1)
+        pcall(error, "oops")
+        return os.time()
+      end
+    `);
+    expect(r.helpers).toContain('setmetatable');
+    expect(r.helpers).toContain('table');
+    expect(r.helpers).toContain('pcall');
+    expect(r.helpers).toContain('error');
+    expect(r.helpers).toContain('os');
+  });
+
+  it('ambient globals (task, game, workspace) become `declare const`', async () => {
+    const r = await compile(`
+      task.spawn(function() print(workspace.Name) end)
+    `);
+    expect(r.source).toContain('declare const task: any');
+    expect(r.source).toContain('declare const workspace: any');
+    expect(r.source).toContain('declare const print: any');
+  });
+
   it('exported type alias', async () => {
     const r = await compile('export type Foo = number');
     expect(r.source).toContain('export type Foo = number');
@@ -549,9 +701,11 @@ describe('compile — expressions: type assertion / if-else / interp string', ()
 });
 
 describe('compile — runtime semantics', () => {
-  it('Lua nil maps to JS undefined', async () => {
+  it('Lua nil maps to JS null', async () => {
+    // Lower `nil` to `null` (not `undefined`) so it composes cleanly with
+    // every nilable type annotation: `T?` already compiles to `T | null`.
     const r = await compile('local x = nil');
-    expect(r.source).toContain('let x = undefined');
+    expect(r.source).toContain('let x = null');
   });
 
   it('Lua truthiness wraps conditional expressions, not the value itself', async () => {

@@ -10,6 +10,8 @@ import {
   type ForStat,
   type FunctionExpr,
   type FunctionStat,
+  type GenericType,
+  type GenericTypePack,
   type IfStat,
   type Local,
   type LocalFunctionStat,
@@ -31,7 +33,7 @@ import './macros/instance.js';
 import './macros/stdlib.js';
 import './rbxts-runtime.js';
 import { detectClasses, compileClassPattern, type ClassPattern } from './class-shape.js';
-import { compileType, compileTypePack } from './type.js';
+import { compileType, compileTypePack, setAliasArities } from './type.js';
 import {
   buildSourceMap,
   inlineSourceMapURL,
@@ -308,7 +310,21 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
   for (let i = 0; i < stat.vars.length; i += 1) {
     const v = stat.vars[i]!;
     const init = stat.values[i];
-    const initExpr = init ? compileExpr(init, ctx) : undefined;
+    let initExpr = init ? compileExpr(init, ctx) : undefined;
+    // `local x: { [string]: T } = {}` — the empty Luau table compiles to
+    // `[]` by default (array literal), which tsc rejects against any
+    // non-array annotation. Swap to `{}` when the annotation is clearly
+    // not an array shape. Same rationale as the TypeAssertion swap; this
+    // covers the `local x: Foo = {}` case the assertion path can't see.
+    if (
+      initExpr
+      && init?.type === 'Table'
+      && (init as { items?: unknown[] }).items?.length === 0
+      && v.annotation
+      && !isArrayShapedType(v.annotation)
+    ) {
+      initExpr = factory.createObjectLiteralExpression([], false);
+    }
     const safeName = safeIdentifier(v.name);
     // Pick the JS name for the new binding.
     //
@@ -473,7 +489,7 @@ function compileLocalFunction(stat: LocalFunctionStat, ctx: CompileContext): ts.
   // `local function foo() end` → `async function foo() {}` (when needed)
   // with hoisting parity. Use a function declaration so `foo` is callable
   // before its line in TS.
-  const { params, returnType, body } = compileFunctionShape(stat.func, ctx);
+  const { params, typeParams, returnType, body } = compileFunctionShape(stat.func, ctx);
   // If the name was already declared as a `let` in this scope (e.g. an
   // earlier `local foo = …`), a function declaration would conflict. Emit
   // assignment to the existing binding instead.
@@ -485,7 +501,7 @@ function compileLocalFunction(stat: LocalFunctionStat, ctx: CompileContext): ts.
           asyncModIfNeeded(body),
           undefined,
           undefined,
-          undefined,
+          typeParams.length > 0 ? typeParams : undefined,
           params,
           returnType,
           body,
@@ -498,7 +514,7 @@ function compileLocalFunction(stat: LocalFunctionStat, ctx: CompileContext): ts.
     asyncModIfNeeded(body),
     undefined,
     factory.createIdentifier(safeIdentifier(stat.name.name)),
-    undefined,
+    typeParams.length > 0 ? typeParams : undefined,
     params,
     returnType,
     body,
@@ -513,7 +529,12 @@ function compileFunctionStat(stat: FunctionStat, ctx: CompileContext): ts.Statem
   if (stat.name.type === 'ExprError' || (stat.name as { type?: string }).type === 'UnknownExpr') {
     return factory.createEmptyStatement();
   }
-  const fn = compileFunctionExpr(stat.func, ctx);
+  // `function Obj.method(self, …) end` or `function Obj:method(…)` —
+  // the name is a member access, so a `self` first-arg or colon-bound
+  // self should fold into `this`. `function bareGlobal(…)` (name is a
+  // Global) is not a method even if its first arg happens to be `self`.
+  const isMemberDefinition = stat.name.type === 'IndexName' || stat.name.type === 'IndexExpr';
+  const fn = compileFunctionExpr(stat.func, ctx, { allowImplicitSelf: isMemberDefinition });
   if (stat.name.type === 'Global') {
     // A previously declared local with the same name (e.g. `local scrollUp`
     // then later `function scrollUp(args)`) makes the JS function-declaration
@@ -549,6 +570,29 @@ function compileFunctionStat(stat: FunctionStat, ctx: CompileContext): ts.Statem
     );
   }
   // Member: `obj.x = function ...` — use the parsed name as an lvalue.
+  // When the implementation got forced-async (body contains `await` because
+  // it calls into a yieldable Luau API like pcall) AND the slot lives on
+  // a typed object, the assignment will trip on a return-type mismatch:
+  // the user's impl-type says `(...) -> T` but the function evaluates to
+  // `Promise<T>`. Cast the base through `any` so the slot's sync return
+  // type doesn't reject the async impl. Property access on reads is
+  // unaffected — readers still see the typed slot.
+  const isAsyncFn =
+    ts.isFunctionExpression(fn) && (fn.modifiers ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+  if (isAsyncFn && stat.name.type === 'IndexName') {
+    return factory.createExpressionStatement(
+      factory.createAssignment(
+        factory.createPropertyAccessExpression(
+          factory.createAsExpression(
+            compileExpr(stat.name.expr, ctx),
+            factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+          ),
+          factory.createIdentifier(propertyName(stat.name.index)),
+        ),
+        fn,
+      ),
+    );
+  }
   return factory.createExpressionStatement(
     factory.createAssignment(compileExpr(stat.name, ctx), fn),
   );
@@ -1132,6 +1176,66 @@ function compileForInFastPath(
   return null;
 }
 
+/** Build an assignment statement for one LHS/RHS pair. `IndexExpr` targets
+ *  with a non-literal key route through `luaIndexSet(t, k, v)` so we don't
+ *  emit `luaIndex(t, k) = v` (which is not a valid TS LHS). Literal numeric
+ *  / string keys keep plain bracket-assignment shape. All other lvalues
+ *  (locals, globals, dotted property access) compile straight through. */
+function buildAssignmentStatement(
+  target: Expr,
+  valueExpr: ts.Expression,
+  ctx: CompileContext,
+): ts.Statement {
+  if (target.type === 'IndexExpr') {
+    const indexExpr = target.index;
+    // Literal numeric: `t[1] = v` → `t[0] = v`.
+    if (
+      (indexExpr.type === 'ConstantNumber' || indexExpr.type === 'ConstantInteger')
+      && typeof (indexExpr as { value: number }).value === 'number'
+    ) {
+      const n = (indexExpr as { value: number }).value - 1;
+      const lit = n < 0
+        ? factory.createPrefixUnaryExpression(
+            ts.SyntaxKind.MinusToken,
+            factory.createNumericLiteral(Math.abs(n)),
+          )
+        : factory.createNumericLiteral(n);
+      return factory.createExpressionStatement(
+        factory.createAssignment(
+          factory.createElementAccessExpression(compileExpr(target.expr, ctx), lit),
+          valueExpr,
+        ),
+      );
+    }
+    // Literal string: `t["k"] = v` → plain bracket assignment.
+    if (indexExpr.type === 'ConstantString') {
+      return factory.createExpressionStatement(
+        factory.createAssignment(
+          factory.createElementAccessExpression(
+            compileExpr(target.expr, ctx),
+            compileExpr(indexExpr, ctx),
+          ),
+          valueExpr,
+        ),
+      );
+    }
+    // Runtime key: route through the helper so we don't generate
+    // `luaIndex(t, k) = v`. The helper also handles the array-vs-dict
+    // dynamic 1-index correction symmetric with luaIndex on reads.
+    const luaIndexSetFn = ctx.use('luaIndexSet');
+    return factory.createExpressionStatement(
+      factory.createCallExpression(
+        factory.createIdentifier(luaIndexSetFn),
+        undefined,
+        [compileExpr(target.expr, ctx), compileExpr(indexExpr, ctx), valueExpr],
+      ),
+    );
+  }
+  return factory.createExpressionStatement(
+    factory.createAssignment(compileExpr(target, ctx), valueExpr),
+  );
+}
+
 function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
   // ExprError on either side means the parser couldn't recover. Skip the
   // whole statement — emitting it as JS would produce "invalid assignment
@@ -1174,14 +1278,15 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
     const target = stat.vars[i]!;
     const value = stat.values[i];
     if (!value) continue;
-    const targetExpr = compileExpr(target, ctx);
     const valueExpr = compileExpr(value, ctx);
     if (target.type === 'Local') ctx.assignLocal(target.name, staticTypeOfExpr(value, ctx));
-    stmts.push(
-      factory.createExpressionStatement(
-        factory.createAssignment(targetExpr, valueExpr),
-      ),
-    );
+    // `tbl[k] = v` with a non-literal numeric key compiles to a luaIndexSet
+    // call; plain `target = v` would emit `luaIndex(tbl, k) = v` which is
+    // not a valid LHS in TS. Literal numeric / string keys go through plain
+    // bracket assignment so they preserve assignment semantics for things
+    // like array.length tracking.
+    const writeStmt = buildAssignmentStatement(target, valueExpr, ctx);
+    stmts.push(writeStmt);
     // `_G["X"] = expr` in Lua sets the global `X`. In JS our `_G` is a
     // plain object, so the assignment only updates _G.X — a later bare
     // `X(...)` reads the implicit-global predecl (undefined) and crashes.
@@ -1225,31 +1330,37 @@ function compileCompoundAssign(stat: CompoundAssignStat, ctx: CompileContext): t
         : 'unknown';
     ctx.assignLocal(stat.var.name, nextType);
   }
+  // `t[k] += v` (and friends) with a non-literal numeric key would otherwise
+  // emit `luaIndex(t, k) += v`, which is not a valid TS lvalue. Expand to
+  // `luaIndexSet(t, k, luaIndex(t, k) <op> v)` so reads + writes both go
+  // through the array-vs-dict helper.
+  const newValue =
+    stat.op === '..'
+      ? factory.createCallExpression(
+          factory.createIdentifier(ctx.use('luaConcat')),
+          undefined,
+          [target, value],
+        )
+      : stat.op === '//'
+        ? factory.createCallExpression(
+            factory.createIdentifier(ctx.use('luaIdiv')),
+            undefined,
+            [target, value],
+          )
+        : compileBinary(stat.op, target, value, ctx);
+  if (
+    stat.var.type === 'IndexExpr'
+    && stat.var.index.type !== 'ConstantNumber'
+    && stat.var.index.type !== 'ConstantInteger'
+    && stat.var.index.type !== 'ConstantString'
+  ) {
+    return buildAssignmentStatement(stat.var, newValue, ctx);
+  }
   const op = compoundAssignToken(stat.op);
-  if (op !== undefined) {
+  if (op !== undefined && stat.op !== '..' && stat.op !== '//') {
     return factory.createExpressionStatement(factory.createBinaryExpression(target, op, value));
   }
-  if (stat.op === '..') {
-    const concat = ctx.use('luaConcat');
-    return factory.createExpressionStatement(
-      factory.createAssignment(
-        target,
-        factory.createCallExpression(factory.createIdentifier(concat), undefined, [target, value]),
-      ),
-    );
-  }
-  if (stat.op === '//') {
-    const idiv = ctx.use('luaIdiv');
-    return factory.createExpressionStatement(
-      factory.createAssignment(
-        target,
-        factory.createCallExpression(factory.createIdentifier(idiv), undefined, [target, value]),
-      ),
-    );
-  }
-  return factory.createExpressionStatement(
-    factory.createAssignment(target, compileBinary(stat.op, target, value, ctx)),
-  );
+  return factory.createExpressionStatement(factory.createAssignment(target, newValue));
 }
 
 function compoundAssignToken(op: string): ts.BinaryOperator | undefined {
@@ -1272,15 +1383,11 @@ function compoundAssignToken(op: string): ts.BinaryOperator | undefined {
 }
 
 function compileTypeAlias(stat: TypeAliasStat): ts.Statement {
-  // `type X<T> = ...` → `type X<T> = ...;` with same generics.
-  const typeParams = stat.generics.map((g) =>
-    factory.createTypeParameterDeclaration(
-      undefined,
-      factory.createIdentifier(g.name),
-      undefined,
-      g.defaultValue ? compileType(g.defaultValue) : undefined,
-    ),
-  );
+  // `type X<T> = ...` → `type X<T> = ...;` and `type X<T...> = ...` →
+  // `type X<T extends unknown[] = unknown[]> = ...;`. Both go through
+  // buildTypeParams so function declarations / expressions share the
+  // same pack-to-tuple mapping.
+  const typeParams = buildTypeParams(stat.generics, stat.genericPacks);
   return factory.createTypeAliasDeclaration(
     stat.exported ? [factory.createToken(ts.SyntaxKind.ExportKeyword)] : undefined,
     factory.createIdentifier(stat.name),
@@ -1350,32 +1457,77 @@ function compileDeclareFunction(stat: DeclareFunctionStat): ts.Statement {
 
 interface CompiledFunction {
   params: ts.ParameterDeclaration[];
+  typeParams: ts.TypeParameterDeclaration[];
   returnType: ts.TypeNode | undefined;
   body: ts.Block;
 }
 
-function compileFunctionShape(fn: FunctionExpr, ctx: CompileContext): CompiledFunction {
+/** Turn a Luau function's generic + generic-pack lists into TS type
+ *  parameters. Regular generics map 1:1 (`<T>`); type packs become
+ *  `<T extends unknown[] = unknown[]>` so usages like `(T...) -> ()` (which
+ *  compile to `(...rest: T) => void`) keep a sensible shape. Both helpers
+ *  used in alias declarations and function declarations / expressions. */
+function buildTypeParams(
+  generics: readonly GenericType[],
+  genericPacks: readonly GenericTypePack[],
+): ts.TypeParameterDeclaration[] {
+  const out: ts.TypeParameterDeclaration[] = [];
+  for (const g of generics) {
+    out.push(
+      factory.createTypeParameterDeclaration(
+        undefined,
+        factory.createIdentifier(g.name),
+        undefined,
+        g.defaultValue ? compileType(g.defaultValue) : undefined,
+      ),
+    );
+  }
+  for (const g of genericPacks) {
+    out.push(
+      factory.createTypeParameterDeclaration(
+        undefined,
+        factory.createIdentifier(g.name),
+        factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+        factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+      ),
+    );
+  }
+  return out;
+}
+
+function compileFunctionShape(
+  fn: FunctionExpr,
+  ctx: CompileContext,
+  options: { allowImplicitSelf?: boolean } = {},
+): CompiledFunction {
   const params: ts.ParameterDeclaration[] = [];
-  // Treat any function whose first explicit argument is literally named
-  // `self` as a method, even if defined via dot syntax. Roblox places
-  // ship plenty of dot-defined methods like
-  // `Invisicam.SetMode = function(self, newMode) end` paired with
-  // colon calls (`Invisicam:SetMode(x)`); without this, the function
-  // signature would consume the call's first real argument into `self`
-  // and shift everything else down by one. `self` is reserved by
-  // convention in Lua, so the false-positive risk is negligible.
-  const implicitSelf = fn.self === null
+  // Treat a function whose first explicit argument is literally named
+  // `self` as a method, but ONLY when the function is being defined as
+  // a member of an object (e.g. `function Invisicam.SetMode(self, ...)`
+  // or via assignment to `Obj.method`). For bare `local function f(self, …)`
+  // the `self` is a regular positional parameter — collapsing it into
+  // `this` would change the function's arity and break every caller.
+  const implicitSelf = (options.allowImplicitSelf ?? false)
+    && fn.self === null
     && fn.args.length > 0
-    && fn.args[0]!.name === 'self';
+    && (fn.args[0]!.name === 'self' || fn.args[0]!.name === '_');
   const hasSelf = fn.self !== null || implicitSelf;
   if (hasSelf) {
+    // `this: any` rather than `this: unknown`: Luau methods defined via
+    // `obj:method(...)` (colon syntax) or `function obj.method(self, ...)`
+    // attach to setmetatable-built instances whose shape doesn't survive
+    // translation — TS has no way to recover the instance type from the
+    // metatable plumbing. `unknown` rejects every `self.field` access
+    // downstream; `any` matches Luau's actual semantics (the method body
+    // is free to touch any field on the receiver). Users who want stricter
+    // typing can annotate explicitly.
     params.push(
       factory.createParameterDeclaration(
         undefined,
         undefined,
         factory.createIdentifier('this'),
         undefined,
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
       ),
     );
   }
@@ -1439,21 +1591,46 @@ function compileFunctionShape(fn: FunctionExpr, ctx: CompileContext): CompiledFu
     }
     return bodyStatements;
   });
+  const block = factory.createBlock(innerStatements, true);
+  // If the body contains `await`, the function will get the `async`
+  // modifier from asyncModIfNeeded — wrap the annotated return type in
+  // `Promise<...>` so tsc accepts the signature ("the return type of an
+  // async function must be the global Promise<T> type"). Skip when no
+  // annotation exists (TS infers Promise<T> automatically then).
+  let finalReturnType = returnType;
+  if (returnType && bodyContainsAwait(block)) {
+    finalReturnType = factory.createTypeReferenceNode('Promise', [returnType]);
+  }
   return {
     params,
-    returnType,
-    body: factory.createBlock(innerStatements, true),
+    typeParams: buildTypeParams(fn.generics, fn.genericPacks),
+    returnType: finalReturnType,
+    body: block,
   };
 }
 
 function paramsFromLocals(locals: readonly Local[]): ts.ParameterDeclaration[] {
   const seen = new Set<string>();
   const out: ts.ParameterDeclaration[] = [];
+  // Detect a trailing run of nilable annotations and mark them optional.
+  // Luau treats `data: T?` as both nilable AND positionally optional, but
+  // TS requires the explicit `?` marker for the latter — without it,
+  // callers that omit the arg get "Expected N arguments, got N-1".
+  // Optionality has to be trailing: once a required arg follows, the
+  // earlier `?` slots can't be omitted positionally either.
+  const optionalFrom = computeTrailingOptionalStart(locals);
   locals.forEach((local, i) => {
     const base = safeIdentifier(local.name);
     let name = base;
     if (seen.has(name)) name = `_dup_${i}`;
     seen.add(name);
+    // For trailing nilable params (`data: T?`) we used to emit `data?: T | null`,
+    // which gives the in-body type `T | null | undefined` — the extra
+    // `| undefined` then conflicts with `T | null`-typed receivers (record
+    // fields, other-param signatures). Instead, emit `data: T | null = null`:
+    // a default value keeps the param call-site-optional, while the in-body
+    // type stays the declared `T | null` without `| undefined` widening.
+    const isOptional = i >= optionalFrom;
     out.push(
       factory.createParameterDeclaration(
         undefined,
@@ -1461,19 +1638,69 @@ function paramsFromLocals(locals: readonly Local[]): ts.ParameterDeclaration[] {
         factory.createIdentifier(name),
         undefined,
         local.annotation ? compileType(local.annotation) : undefined,
+        isOptional ? factory.createNull() : undefined,
       ),
     );
   });
   return out;
 }
 
-function compileFunctionExpr(fn: FunctionExpr, ctx: CompileContext): ts.FunctionExpression {
-  const { params, returnType, body } = compileFunctionShape(fn, ctx);
+/** Index of the first trailing parameter whose annotation includes nil
+ *  (`T?` or `T | nil`). Returns `locals.length` if none — i.e. no params
+ *  should be marked optional. */
+function computeTrailingOptionalStart(locals: readonly Local[]): number {
+  let firstTrailing = locals.length;
+  for (let i = locals.length - 1; i >= 0; i--) {
+    if (annotationIsNilable(locals[i]!.annotation)) {
+      firstTrailing = i;
+    } else {
+      break;
+    }
+  }
+  return firstTrailing;
+}
+
+/** True for Luau type annotations whose TS shape is an array type, so the
+ *  compiler knows `{}` for `local x: T = {}` should stay as `[]` (matches
+ *  empty-array literal). `{T}` (numeric-indexer-only) is the canonical
+ *  Luau array shorthand; everything else is treated as object-shaped. */
+function isArrayShapedType(t: TypeNode | null | undefined): boolean {
+  if (!t) return false;
+  if (t.type === 'TypeTable'
+      && t.props.length === 0
+      && t.indexer
+      && t.indexer.indexType.type === 'TypeReference'
+      && t.indexer.indexType.name === 'number') {
+    return true;
+  }
+  if (t.type === 'TypeGroup') return isArrayShapedType(t.groupType);
+  return false;
+}
+
+function annotationIsNilable(t: TypeNode | null | undefined): boolean {
+  if (!t) return false;
+  if (t.type === 'TypeOptional') return true;
+  if (t.type === 'TypeUnion') {
+    return t.types.some((u) =>
+      u.type === 'TypeOptional'
+      || (u.type === 'TypeReference' && u.name === 'nil')
+      || (u.type === 'TypeReference' && u.name === 'undefined'),
+    );
+  }
+  return false;
+}
+
+function compileFunctionExpr(
+  fn: FunctionExpr,
+  ctx: CompileContext,
+  options: { allowImplicitSelf?: boolean } = {},
+): ts.FunctionExpression {
+  const { params, typeParams, returnType, body } = compileFunctionShape(fn, ctx, options);
   return factory.createFunctionExpression(
     asyncModIfNeeded(body),
     undefined,
     undefined,
-    undefined,
+    typeParams.length > 0 ? typeParams : undefined,
     params,
     returnType,
     body,
@@ -1576,7 +1803,12 @@ function isPrimitiveStaticType(type: StaticValueType): boolean {
 function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
   switch (expr.type) {
     case 'ConstantNil':
-      return factory.createIdentifier('undefined');
+      // Lower `nil` to `null`. We previously emitted `undefined`, but every
+      // nilable type annotation (`T?`) compiles to `T | null` — so passing,
+      // assigning, or returning `nil` widened the slot to `T | null | undefined`
+      // and tsc rejected it against the declared `T | null`. Picking `null`
+      // keeps expression-side and type-side `nil` lowering aligned.
+      return factory.createNull();
     case 'ConstantBool':
       return expr.value ? factory.createTrue() : factory.createFalse();
     case 'ConstantInteger':
@@ -1597,6 +1829,19 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
     case 'Local':
       return factory.createIdentifier(ctx.getLocalJsName(expr.name) ?? safeIdentifier(expr.name));
     case 'Global':
+      // Register the global so the emitter can either auto-import it from
+      // `luau2ts/runtime` (for names the runtime exports) or prepend a
+      // `declare const X: any;` (for host-environment names like `task`).
+      // Local aliases shadow this — `local task = …` causes the read to
+      // route via `getLocalJsName`, so we only register when there's no
+      // overriding local.
+      if (!ctx.getLocalJsName(expr.name)) {
+        if (RUNTIME_AVAILABLE_GLOBALS.has(expr.name)) {
+          ctx.use(expr.name);
+        } else if (AMBIENT_GLOBALS.has(expr.name)) {
+          ctx.useAmbient(expr.name);
+        }
+      }
       return factory.createIdentifier(ctx.getLocalJsName(expr.name) ?? safeIdentifier(expr.name));
     case 'Varargs':
       // Single-value default; call-arg / table-list use compileExprAsArg.
@@ -1663,8 +1908,26 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       return compileFunctionExpr(expr, ctx);
     case 'Table':
       return compileTableExpr(expr, ctx);
-    case 'TypeAssertion':
-      return factory.createAsExpression(compileExpr(expr.expr, ctx), compileType(expr.annotation));
+    case 'TypeAssertion': {
+      const targetTy = compileType(expr.annotation);
+      // `{} :: SomeImpl` — the empty Luau table compiles to `[]` (the
+      // array literal default), and `[] as SomeImpl` is rejected by tsc
+      // unless SomeImpl is itself an array type. Switch to `{}` for
+      // non-array targets so the assertion lands. The inner Table check
+      // is intentionally narrow: only empty tables get this swap; populated
+      // tables already commit to array-vs-object via compileTableExpr.
+      if (
+        expr.expr.type === 'Table'
+        && expr.expr.items.length === 0
+        && !ts.isArrayTypeNode(targetTy)
+      ) {
+        return factory.createAsExpression(
+          factory.createObjectLiteralExpression([], false),
+          targetTy,
+        );
+      }
+      return factory.createAsExpression(compileExpr(expr.expr, ctx), targetTy);
+    }
     case 'IfElse':
       return compileIfElseExpr(expr, ctx);
     case 'InterpString':
@@ -1720,7 +1983,43 @@ function compileBinaryExpr(expr: Extract<Expr, { type: 'Binary' }>, ctx: Compile
   const leftType = staticTypeOfExpr(expr.left, ctx);
   const rightType = staticTypeOfExpr(expr.right, ctx);
   const left = compileExpr(expr.left, ctx);
-  const right = compileExpr(expr.right, ctx);
+  // `or { }` fallback: `config = config or {}` overwhelmingly means
+  // "default to empty object," not "default to empty array." compileTable
+  // returns `[]` for `{}` by default (array literal). When the empty
+  // table sits on the RHS of `or`, override to an empty-object literal
+  // with a cast so it lands in any context (typed function-param
+  // fallbacks, dict accumulators, array seeds) without tripping a
+  // slot-type mismatch.
+  //
+  // For the common shape `x = x or {}` where the LHS is a plain identifier,
+  // cast to `NonNullable<typeof x>` so the ternary's overall type collapses
+  // to the truthy form of `x`, and the surrounding assignment can narrow
+  // `x` out of `T | null | undefined`. Without this, `{} as any` poisoned
+  // the false branch with `any`, which TS treats as no narrowing — every
+  // subsequent `x.field` access then fired TS18049.
+  //
+  // For complex LHS shapes (property accesses, calls, computed indexes)
+  // fall back to `as any` — `typeof` over those forms is either invalid
+  // or fragile, and the surrounding assignment usually isn't `x = x or {}`
+  // anyway.
+  let right: ts.Expression;
+  if (
+    expr.op === 'or'
+    && expr.right.type === 'Table'
+    && expr.right.items.length === 0
+  ) {
+    const castType = ts.isIdentifier(left)
+      ? factory.createTypeReferenceNode('NonNullable', [
+          factory.createTypeQueryNode(factory.createIdentifier(left.text)),
+        ])
+      : factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
+    right = factory.createAsExpression(
+      factory.createObjectLiteralExpression([], false),
+      castType,
+    );
+  } else {
+    right = compileExpr(expr.right, ctx);
+  }
 
   if (expr.op === 'and' || expr.op === 'or') {
     return compileLogicalBinary(expr.op, left, right, ctx, leftType);
@@ -2148,6 +2447,34 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     return macroResult;
   }
 
+  // Lua string method calls: `s:format(...)`, `"...":gsub(...)`, etc. JS
+  // strings don't have `.format`/`.gsub`/`.reverse`/etc., so a literal
+  // colon-method-on-string emits `"x".format(...)` which tsc rejects.
+  // Route to the runtime helper unconditionally for method names that
+  // only exist on Lua strings — Roblox classes don't define `gsub` /
+  // `format` / `match` / `gmatch` on any datatype, so the false-positive
+  // risk is negligible. A static-type guard would miss the common
+  // `tostring(x):reverse()` chain where staticTypeOfExpr returns
+  // 'unknown' (the call return type doesn't propagate).
+  if (
+    expr.self
+    && expr.func.type === 'IndexName'
+    && STRING_LIB_METHODS.has(expr.func.index)
+  ) {
+    const meta = STRING_LIB_METHODS.get(expr.func.index)!;
+    const helperCall = factory.createCallExpression(
+      factory.createIdentifier(ctx.use(meta.helper)),
+      undefined,
+      [compileExpr(expr.func.expr, ctx), ...args],
+    );
+    // gsub/find/byte return `[main, ...extras]`. Lua single-value
+    // assignment takes just the main, so extract [0] for the
+    // colon-call form.
+    return meta.tupleFirst
+      ? factory.createElementAccessExpression(helperCall, 0)
+      : helperCall;
+  }
+
   let call: ts.Expression;
   if (expr.self && expr.func.type === 'IndexName') {
     call = factory.createCallExpression(
@@ -2174,6 +2501,20 @@ function compileTableExpr(
   const allList = expr.items.every((i) => i.kind === 'List');
   const allRecord = expr.items.every((i) => i.kind === 'Record');
 
+  // Empty Luau `{}` is ambiguous — it could be an array seed (`{}` then
+  // `table.insert(t, v)`) or an object seed (`{}` then `t.field = v`).
+  // We emit `{} as any` so subsequent property access AND numeric-index
+  // assignment both compile under tsc — the empty literal alone is the
+  // `{}` type (no excess properties), which rejects `obj.Sync = X` even
+  // though Luau tables freely grow. The `as any` matches Luau's
+  // dynamic-table semantics. Annotated locals + type assertions still get
+  // their typed shapes via compileLocal / TypeAssertion overrides.
+  if (expr.items.length === 0) {
+    return factory.createAsExpression(
+      factory.createObjectLiteralExpression([], false),
+      factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+    );
+  }
   if (allList) {
     return factory.createArrayLiteralExpression(
       expr.items.map((i) => compileExprAsArg(i.value, ctx)),
@@ -2221,7 +2562,16 @@ function compileTableExpr(
 }
 
 function compileTableProp(item: TableItem, ctx: CompileContext): ts.PropertyAssignment {
-  const value = compileExpr(item.value, ctx);
+  // Function-valued record entries (`{ disconnect = function(_) ... end }`)
+  // are conventionally methods — the field is a slot in an instance type
+  // like `{ disconnect: (self: Connection) -> () }`. Compile the inner
+  // FunctionExpr in method context so the first arg (commonly named
+  // `self` or `_` for "ignore me") folds into `this`, matching the
+  // emitted impl-type that uses `this:` for `self:` parameters.
+  const value =
+    item.value.type === 'Function'
+      ? compileFunctionExpr(item.value, ctx, { allowImplicitSelf: true })
+      : compileExpr(item.value, ctx);
   if (item.key === null) {
     return factory.createPropertyAssignment(factory.createIdentifier('_'), value);
   }
@@ -2362,8 +2712,58 @@ export async function compile(
     // wrappers, anything that internally calls `task.wait`, etc.).
     scanYieldingFunctions(rootBlock, ctx);
   }
+  // Pre-scan the AST for `type Foo<T...>` declarations so compileType
+  // can rewrite multi-arg references `Foo<a, b, c>` to `Foo<[a, b, c]>`
+  // when Foo's generic list includes a type-pack. Without this the args
+  // get spread positionally and tsc surfaces "requires between 0 and 1
+  // type arguments". Module-scoped state so all compileType call sites
+  // see the same arity map for the duration of this compile.
+  const aliasArities = new Map<string, { generics: number; hasPack: boolean }>();
+  if (parsed.root) {
+    const walkAliases = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      const n = node as { type?: string; name?: string; generics?: unknown[]; genericPacks?: unknown[] };
+      if (n.type === 'TypeAlias' && typeof n.name === 'string') {
+        aliasArities.set(n.name, {
+          generics: n.generics?.length ?? 0,
+          hasPack: (n.genericPacks?.length ?? 0) > 0,
+        });
+      }
+      for (const v of Object.values(node as Record<string, unknown>)) {
+        if (Array.isArray(v)) for (const it of v) walkAliases(it);
+        else if (v && typeof v === 'object') walkAliases(v);
+      }
+    };
+    walkAliases(parsed.root);
+  }
+  setAliasArities(aliasArities);
+
   const stmts: ts.Statement[] = rootBlock ? compileBlockBody(rootBlock, ctx) : [];
+  // Luau ModuleScripts end with `return <export-value>` — the value is
+  // what `require(script)` returns. TS has no top-level `return`; rewrite
+  // the trailing return as `export default <value>`. Conservative scope:
+  // only when the trailing statement IS a return AND it carries a value
+  // AND the file has at least one other statement (skips bare-`return X`
+  // test snippets / single-line scripts where the user wants the literal
+  // return form).
+  if (stmts.length > 1) {
+    const last = stmts[stmts.length - 1]!;
+    if (ts.isReturnStatement(last) && last.expression) {
+      stmts[stmts.length - 1] = factory.createExportAssignment(
+        undefined,
+        false,
+        last.expression,
+      );
+    }
+  }
   const helpers = ctx.importedHelpers();
+  // Codegen registers runtime-available names (`setmetatable`, `pcall`, …)
+  // via `ctx.use(name)` from compileExpr's Global path, and ambient names
+  // via `ctx.useAmbient(name)`. We pick the ambient set up here so we can
+  // emit a `declare const X: any;` block before the user statements. This
+  // runs AFTER codegen, not before, so statements consumed by the
+  // class-shape rewriter (which never go through compileExpr) don't count.
+  const ambientGlobalsUsed = ctx.ambientGlobals();
 
   // Track each top-level Luau stmt → output TS stmt for source maps.
   const stmtToLuauLoc = new WeakMap<ts.Statement, { line: number; col: number }>();
@@ -2389,6 +2789,11 @@ export async function compile(
   // print, …) are excluded — those come from the script wrapper.
   const implicitGlobals = collectImplicitGlobals(parsed);
   const implicitGlobalDecls: ts.Statement[] = [];
+  // The predecl form is `let foo = _G["foo"];`, which references `_G`
+  // directly without going through compileExpr — so the ambient-globals
+  // walker never sees `_G` and tsc surfaces "Cannot find name". Mark it
+  // ambient up-front whenever we emit any predecl.
+  if (implicitGlobals.size > 0) ctx.useAmbient('_G');
   for (const name of implicitGlobals) {
     // Initialize the predecl from `_G[name]` so cross-script globals set
     // earlier in the place's startup are visible at this script's start.
@@ -2422,8 +2827,46 @@ export async function compile(
   for (const { module, names } of ctx.extraImportEntries()) {
     allStatements.push(buildNamedImport(module, names));
   }
+  // `declare const X: any;` for every Roblox / host-environment global the
+  // script referenced. Pure type-only; emits nothing at runtime, but lets
+  // tsc resolve the names without surfacing "Cannot find name" cascades.
+  if (ambientGlobalsUsed.size > 0) {
+    for (const name of [...ambientGlobalsUsed].sort()) {
+      allStatements.push(
+        factory.createVariableStatement(
+          [factory.createToken(ts.SyntaxKind.DeclareKeyword)],
+          factory.createVariableDeclarationList(
+            [factory.createVariableDeclaration(
+              factory.createIdentifier(safeIdentifier(name)),
+              undefined,
+              factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+              undefined,
+            )],
+            ts.NodeFlags.Const,
+          ),
+        ),
+      );
+    }
+  }
   allStatements.push(...implicitGlobalDecls);
   allStatements.push(...stmts);
+
+  // Force the output to be treated as a module. Without an import or export,
+  // tsc treats top-level `await` as illegal ("'await' expressions are only
+  // allowed at the top level of a file when that file is a module"). Even
+  // a `declare const X: any;` doesn't qualify. Append `export {};` so the
+  // file is unambiguously a module, but skip it when an import/export
+  // already exists to keep the output clean.
+  const alreadyModule = allStatements.some((s) =>
+    ts.isImportDeclaration(s)
+    || ts.isExportAssignment(s)
+    || ts.isExportDeclaration(s)
+    || ((ts.canHaveModifiers(s) ? ts.getModifiers(s) : undefined) ?? [])
+      .some((m) => m.kind === ts.SyntaxKind.ExportKeyword),
+  );
+  if (!alreadyModule) {
+    allStatements.push(factory.createExportDeclaration(undefined, false, factory.createNamedExports([]), undefined));
+  }
 
   const sourceFile = factory.updateSourceFile(
     ts.createSourceFile('output.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS),
@@ -2722,6 +3165,139 @@ const HOST_PROVIDED_GLOBALS = new Set([
   'collectgarbage',
   'ypcall',
 ]);
+
+/** Names that ship as named exports from `luau2ts/runtime`. When the script
+ *  uses one of these as a Global, we auto-add it to the runtime import list
+ *  the same way `luaIndex` / `luaIndexSet` / etc. get added by codegen. This
+ *  keeps the standalone CLI usable without a host preamble — `setmetatable`,
+ *  `pcall`, `error`, etc. resolve to runtime stubs out of the box. */
+/** Lua string library methods callable via colon syntax (`s:method(args)`).
+ *  Lua's string metatable forwards `s:X(...)` to `string.X(s, ...)`; we
+ *  emulate that by routing colon calls to the paired runtime helper.
+ *  `tupleFirst: true` means the runtime helper returns a tuple where the
+ *  first value is the "main" string return (Lua single-assign takes only
+ *  the first value); we wrap such calls in `[0]` so chained colon calls
+ *  see the string, not the tuple. Multi-target destructure (`local s, n =
+ *  str:gsub(...)`) loses the secondary value — users can call the
+ *  namespace form `string.gsub(s, ...)` if they need both. */
+const STRING_LIB_METHODS = new Map<string, { helper: string; tupleFirst?: boolean }>([
+  ['format', { helper: 'stringFormat' }],
+  ['gsub', { helper: 'stringGsub', tupleFirst: true }],
+  ['gmatch', { helper: 'stringGmatch' }],
+  ['find', { helper: 'stringFind', tupleFirst: true }],
+  ['match', { helper: 'stringMatch' }],
+  ['sub', { helper: 'stringSub' }],
+  ['rep', { helper: 'stringRep' }],
+  ['byte', { helper: 'stringByte', tupleFirst: true }],
+  ['char', { helper: 'stringChar' }],
+  ['len', { helper: 'stringLen' }],
+  ['lower', { helper: 'stringLower' }],
+  ['upper', { helper: 'stringUpper' }],
+  ['reverse', { helper: 'stringReverse' }],
+]);
+
+const RUNTIME_AVAILABLE_GLOBALS = new Set([
+  'setmetatable',
+  'getmetatable',
+  'rawget',
+  'rawset',
+  'rawequal',
+  'rawlen',
+  'pcall',
+  'xpcall',
+  'error',
+  'assert',
+  'tostring',
+  'tonumber',
+  'select',
+  'unpack',
+  'ipairs',
+  'pairs',
+  'next',
+  'newproxy',
+  // Lua stdlib namespaces (each is a `const X = { ... }` in the runtime).
+  'table',
+  'os',
+  'math',
+  'string',
+]);
+
+/** Names that aren't in the runtime but are expected at runtime from the
+ *  host environment (Roblox, or a user-supplied preamble). When the script
+ *  uses one of these, we emit `declare const X: any;` at the top so the TS
+ *  type-checker doesn't surface "Cannot find name" errors. Generation of
+ *  the actual binding is the host's responsibility. */
+const AMBIENT_GLOBALS = new Set([
+  'game',
+  'workspace',
+  'script',
+  'plugin',
+  'shared',
+  'print',
+  'warn',
+  'task',
+  'require',
+  'wait',
+  'spawn',
+  'delay',
+  'defer',
+  'tick',
+  'time',
+  'Wait',
+  'Spawn',
+  'Delay',
+  'Game',
+  'Workspace',
+  'LoadLibrary',
+  'elapsedTime',
+  'ElapsedTime',
+  'ypcall',
+  'loadstring',
+  'collectgarbage',
+  'type',
+  'typeof',
+  // Lua stdlib namespaces we don't ship runtime impls for. These come
+  // from the host preamble or `@rbxts/types` in real projects.
+  'coroutine',
+  'bit32',
+  'buffer',
+  'debug',
+  'utf8',
+  'io',
+  // Roblox datatypes — provided by `@rbxts/types` in projects that
+  // configure it, or by the host preamble otherwise.
+  'Instance',
+  'Vector3',
+  'Vector2',
+  'CFrame',
+  'Color3',
+  'UDim',
+  'UDim2',
+  'BrickColor',
+  'Enum',
+  'Ray',
+  'Region3',
+  'Rect',
+  'NumberRange',
+  'NumberSequence',
+  'NumberSequenceKeypoint',
+  'ColorSequence',
+  'ColorSequenceKeypoint',
+  'Faces',
+  'Axes',
+  'TweenInfo',
+  'PhysicalProperties',
+  'RaycastParams',
+  'OverlapParams',
+  'Random',
+  'DateTime',
+  'Font',
+  'Path2DControlPoint',
+  '_G',
+  '_ENV',
+  '_VERSION',
+]);
+
 
 function collectImplicitGlobals(parsed: ParseResult): Set<string> {
   const referenced = new Set<string>();

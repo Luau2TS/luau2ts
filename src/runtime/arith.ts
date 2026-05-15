@@ -80,37 +80,37 @@ function binNumeric(
   a: unknown,
   b: unknown,
   fn: (x: number, y: number) => number,
-): number | unknown {
+): any {
   const an = toNumber(a);
   const bn = toNumber(b);
   if (an !== undefined && bn !== undefined) return fn(an, bn);
   return callBinMetamethod(meta, opLabel, a, b);
 }
 
-export function luaAdd(a: unknown, b: unknown): number | unknown {
+export function luaAdd(a: unknown, b: unknown): any {
   return binNumeric('__add', 'add', a, b, (x, y) => x + y);
 }
-export function luaSub(a: unknown, b: unknown): number | unknown {
+export function luaSub(a: unknown, b: unknown): any {
   return binNumeric('__sub', 'sub', a, b, (x, y) => x - y);
 }
-export function luaMul(a: unknown, b: unknown): number | unknown {
+export function luaMul(a: unknown, b: unknown): any {
   return binNumeric('__mul', 'mul', a, b, (x, y) => x * y);
 }
-export function luaDiv(a: unknown, b: unknown): number | unknown {
+export function luaDiv(a: unknown, b: unknown): any {
   return binNumeric('__div', 'div', a, b, (x, y) => x / y);
 }
-export function luaIdiv(a: unknown, b: unknown): number | unknown {
+export function luaIdiv(a: unknown, b: unknown): any {
   return binNumeric('__idiv', 'idiv', a, b, (x, y) => Math.floor(x / y));
 }
-export function luaMod(a: unknown, b: unknown): number | unknown {
+export function luaMod(a: unknown, b: unknown): any {
   // Lua's % is floor modulo: ((a % b) + b) % b. JS's % is truncated.
   return binNumeric('__mod', 'mod', a, b, (x, y) => x - Math.floor(x / y) * y);
 }
-export function luaPow(a: unknown, b: unknown): number | unknown {
+export function luaPow(a: unknown, b: unknown): any {
   return binNumeric('__pow', 'pow', a, b, (x, y) => x ** y);
 }
 
-export function luaUnm(a: unknown): number | unknown {
+export function luaUnm(a: unknown): any {
   if (typeof a === 'number') return -a;
   const an = toNumber(a);
   if (an !== undefined) return -an;

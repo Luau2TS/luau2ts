@@ -1,4 +1,7 @@
-export function isTruthy(value: unknown): boolean {
+export type LuaFalsy = false | null | undefined;
+export type LuaTruthy<T> = Exclude<T, LuaFalsy>;
+
+export function isTruthy<T>(value: T): value is LuaTruthy<T> {
   return (
     value !== false
     && value !== null
@@ -11,7 +14,7 @@ export function isTruthy(value: unknown): boolean {
   );
 }
 
-export function luaNot(value: unknown): boolean {
+export function luaNot<T>(value: T): value is Extract<T, LuaFalsy> {
   return !isTruthy(value);
 }
 

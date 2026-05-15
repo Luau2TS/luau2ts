@@ -14,19 +14,19 @@ function toIndex(pos: number, len: number, isStart: boolean): number {
 
 // ─── Basic string ops ───────────────────────────────────────────────────────
 
-export function stringLen(s: string): number {
+export function stringLen(s: any): number {
   return new TextEncoder().encode(s).length;
 }
 
-export function stringUpper(s: string): string {
+export function stringUpper(s: any): string {
   return s.toUpperCase();
 }
 
-export function stringLower(s: string): string {
+export function stringLower(s: any): string {
   return s.toLowerCase();
 }
 
-export function stringSub(s: string, i: number, j: number = -1): string {
+export function stringSub(s: any, i: number, j: number = -1): string {
   const len = s.length;
   const start = toIndex(i, len, true);
   const end = toIndex(j, len, false) + 1;
@@ -34,17 +34,17 @@ export function stringSub(s: string, i: number, j: number = -1): string {
   return s.slice(start, end);
 }
 
-export function stringRep(s: string, n: number, sep?: string): string {
+export function stringRep(s: any, n: number, sep?: string): string {
   if (n <= 0) return '';
   if (!sep) return s.repeat(n);
   return new Array<string>(n).fill(s).join(sep);
 }
 
-export function stringReverse(s: string): string {
+export function stringReverse(s: any): string {
   return [...s].reverse().join('');
 }
 
-export function stringByte(s: string, i = 1, j: number = i): number[] {
+export function stringByte(s: any, i = 1, j: number = i): number[] {
   const len = s.length;
   const start = toIndex(i, len, true);
   const end = toIndex(j, len, false);
@@ -65,8 +65,8 @@ export function stringChar(...codes: number[]): string {
  * substring (no Lua pattern interpretation).
  */
 export function stringFind(
-  s: string,
-  pattern: string,
+  s: any,
+  pattern: any,
   init = 1,
   plain = false,
 ): [number, number, ...(string | number)[]] | undefined {
@@ -86,8 +86,8 @@ export function stringFind(
  * captures), undefined if no match.
  */
 export function stringMatch(
-  s: string,
-  pattern: string,
+  s: any,
+  pattern: any,
   init = 1,
 ): string | number | (string | number)[] | undefined {
   const startIdx = toIndex(init, s.length, true);
@@ -100,8 +100,8 @@ export function stringMatch(
 
 /** Lua's `string.gmatch`. Iterate captures (or whole match) per occurrence. */
 export function stringGmatch(
-  s: string,
-  pattern: string,
+  s: any,
+  pattern: any,
 ): () => string | (string | number)[] | undefined {
   const it = patternGmatch(pattern, s);
   return () => {
@@ -114,8 +114,8 @@ export function stringGmatch(
  * Lua's `string.gsub`. Returns [resultString, replacementCount].
  */
 export function stringGsub(
-  s: string,
-  pattern: string,
+  s: any,
+  pattern: any,
   repl:
     | string
     | ((match: string, ...captures: (string | number)[]) => string)
@@ -132,7 +132,7 @@ export function stringGsub(
  * Lua's `string.format`. Supports printf-style %d/%i/%u, %f/%g/%e, %s, %q,
  * %x/%X, %o, %c, %%. Width, precision, and flags (- + 0 #) are honored.
  */
-export function stringFormat(fmt: string, ...args: unknown[]): string {
+export function stringFormat(fmt: any, ...args: unknown[]): string {
   let out = '';
   let argIdx = 0;
   let i = 0;

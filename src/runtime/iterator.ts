@@ -119,7 +119,13 @@ function orderedRawPairKeys(state: object): (string | number)[] {
  *  wasn't a function. This adapter normalizes every shape to a real
  *  triple. */
 export function genericIter(value: unknown): readonly [
-  (state: unknown, ctrl: unknown) => unknown,
+  // The iter fn returns a tuple `[key, value, ...]` on each step or
+  // `undefined` when exhausted. Element type is `any` (not `unknown`)
+  // so destructured items (`let [_, t] = step`) get `any` for `t` and
+  // chained accesses like `t.event` compile cleanly. Luau tables don't
+  // carry their value type past the runtime here; `any` matches the
+  // looseness the user's Luau source already has.
+  (state: unknown, ctrl: unknown) => any[] | undefined,
   unknown,
   unknown,
 ] {
@@ -127,20 +133,20 @@ export function genericIter(value: unknown): readonly [
     return [emptyIter, null, null];
   }
   if (typeof value === 'function') {
-    return [value as (s: unknown, c: unknown) => unknown, null, null];
+    return [value as (s: unknown, c: unknown) => any[] | undefined, null, null];
   }
   if (Array.isArray(value)) {
     const [maybeIter, maybeState, maybeCtrl] = value;
     if (typeof maybeIter === 'function') {
       // Already a triple: pairs(t) / ipairs(t) / custom iterator.
       return [
-        maybeIter as (s: unknown, c: unknown) => unknown,
+        maybeIter as (s: unknown, c: unknown) => any[] | undefined,
         maybeState ?? null,
         maybeCtrl ?? null,
       ];
     }
     // Plain JS array. Iterate as ipairs would.
-    return [ipairsIter as unknown as (s: unknown, c: unknown) => unknown, value, 0];
+    return [ipairsIter as unknown as (s: unknown, c: unknown) => any[] | undefined, value, 0];
   }
   if (typeof value === 'object') {
     const obj = value as Record<string, unknown> & { __iter?: () => unknown };
@@ -148,13 +154,13 @@ export function genericIter(value: unknown): readonly [
       const triple = obj.__iter();
       if (Array.isArray(triple) && typeof triple[0] === 'function') {
         return [
-          triple[0] as (s: unknown, c: unknown) => unknown,
+          triple[0] as (s: unknown, c: unknown) => any[] | undefined,
           triple[1] ?? null,
           triple[2] ?? null,
         ];
       }
     }
-    return [pairsIter as unknown as (s: unknown, c: unknown) => unknown, value, null];
+    return [pairsIter as unknown as (s: unknown, c: unknown) => any[] | undefined, value, null];
   }
   return [emptyIter, null, null];
 }
@@ -182,7 +188,7 @@ export function multiret(v: unknown): unknown[] {
  *
  *  Falls back to the raw string for primitive keys and for the slow
  *  path before the runtime has loaded. */
-export function pairKeys(t: unknown): unknown[] {
+export function pairKeys(t: unknown): any[] {
   if (t == null || typeof t !== 'object') return [];
   const reifier = getKeyReifier();
   const out: unknown[] = [];
@@ -202,7 +208,7 @@ export function pairKeys(t: unknown): unknown[] {
 /** Companion lookup: `t[k]` where k may be a reified Instance. We use
  *  String(k) to recover the original property key. For numeric keys the
  *  compiler emits `t[k-1]` directly, so we only handle the reified case. */
-export function pairValue(t: unknown, k: unknown): unknown {
+export function pairValue(t: unknown, k: unknown): any {
   if (t == null || typeof t !== 'object') return undefined;
   const key = typeof k === 'object' && k !== null ? String(k) : (k as string | number);
   if (Array.isArray(t) && typeof key === 'number') {

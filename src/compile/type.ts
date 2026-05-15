@@ -19,6 +19,18 @@ const PRIMITIVE_TYPE_NAMES: Record<string, ts.KeywordTypeSyntaxKind> = {
   void: ts.SyntaxKind.VoidKeyword,
 };
 
+/** Map of type-alias name → generic arity, set by the compiler before
+ *  emitting types so `Foo<a, b, c>` for a Luau alias declared as
+ *  `type Foo<T...>` can be re-grouped into `Foo<[a, b, c]>` (a tuple
+ *  filling the pack). Module-scope rather than ctx-parameter so the
+ *  twenty-odd compileType call sites don't all need a context arg.
+ *  Set by `setAliasArities` on each compile() run. */
+let aliasArities: Map<string, { generics: number; hasPack: boolean }> = new Map();
+
+export function setAliasArities(map: Map<string, { generics: number; hasPack: boolean }>): void {
+  aliasArities = map;
+}
+
 export function compileType(t: TypeNode | null | undefined): ts.TypeNode {
   if (!t) return factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
   switch (t.type) {
@@ -37,6 +49,32 @@ export function compileType(t: TypeNode | null | undefined): ts.TypeNode {
       // identifier when possible.
       if (t.expr.type === 'Local' || t.expr.type === 'Global') {
         return factory.createTypeQueryNode(factory.createIdentifier(t.expr.name));
+      }
+      // `typeof(setmetatable(body :: BodyType, meta :: MetaType))` — Luau's
+      // canonical "instance type" idiom. TS has no native equivalent, but we
+      // can synthesize one by intersecting BodyType (the per-instance fields
+      // like `_handlers`, `_nextId`) with MetaType (which carries the method
+      // table via `__index`). Without this, every `type Foo = typeof(...)`
+      // alias collapses to `unknown` and every `self.field` access cascades.
+      if (
+        t.expr.type === 'Call'
+        && t.expr.func.type === 'Global'
+        && t.expr.func.name === 'setmetatable'
+        && t.expr.args.length >= 1
+      ) {
+        const bodyArg = t.expr.args[0]!;
+        const metaArg = t.expr.args[1];
+        const bodyTy =
+          bodyArg.type === 'TypeAssertion'
+            ? compileType(bodyArg.annotation)
+            : null;
+        const metaTy =
+          metaArg && metaArg.type === 'TypeAssertion'
+            ? compileType(metaArg.annotation)
+            : null;
+        if (bodyTy && metaTy) return factory.createIntersectionTypeNode([bodyTy, metaTy]);
+        if (bodyTy) return bodyTy;
+        if (metaTy) return metaTy;
       }
       return factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
     case 'TypeSingletonBool':
@@ -68,19 +106,62 @@ function compileTypeReference(t: TypeReferenceNode): ts.TypeNode {
     ? factory.createQualifiedName(factory.createIdentifier(t.prefix), t.name)
     : factory.createIdentifier(t.name);
 
-  const typeArgs = t.parameters
-    .map((p) => {
-      if (!p) return undefined;
-      if (p.kind === 'type') return compileType(p.value);
-      // Type-pack parameters (rare in our scope) — fall through to unknown.
-      return factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
-    })
-    .filter((x): x is ts.TypeNode => x !== undefined);
+  // Convert each Luau type arg to a TS type node. Type-pack args (rare in
+  // user code, but common for `T...` references) collapse here too.
+  const argNodes = t.parameters.map((p) => {
+    if (!p) return undefined;
+    if (p.kind === 'type') return compileType(p.value);
+    const pack = p.value;
+    if (pack.type === 'TypePackGeneric') {
+      return factory.createTypeReferenceNode(pack.genericName);
+    }
+    if (pack.type === 'TypePackVariadic') {
+      return factory.createArrayTypeNode(compileType(pack.variadicType));
+    }
+    if (pack.type === 'TypePackExplicit') {
+      const ts2 = pack.typeList.types;
+      if (ts2.length === 0) {
+        return factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword));
+      }
+      return factory.createTupleTypeNode(ts2.map(compileType));
+    }
+    return factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword));
+  }).filter((x): x is ts.TypeNode => x !== undefined);
+
+  // When the target alias was declared with a type-pack (`type Foo<T...>`),
+  // the TS-side alias takes a single tuple-typed generic. Luau call sites
+  // often write `Foo<a, b, c>` (three positional `kind: 'type'` args filling
+  // the pack); emit those as `Foo<[a, b, c]>` so the count matches the
+  // alias arity. If the source itself supplies a pack arg (`Foo<T...>` or
+  // `Foo<(a, b)>`), it's already in the right shape — don't re-wrap it.
+  const arity = aliasArities.get(t.name);
+  let typeArgs = argNodes;
+  const onlyPositionalTypes = t.parameters.every((p) => p && p.kind === 'type');
+  if (arity && arity.hasPack && onlyPositionalTypes) {
+    const head = argNodes.slice(0, arity.generics);
+    const tailNodes = argNodes.slice(arity.generics);
+    const packArg = tailNodes.length === 0
+      ? factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword))
+      : factory.createTupleTypeNode(tailNodes);
+    typeArgs = [...head, packArg];
+  }
 
   return factory.createTypeReferenceNode(name, typeArgs.length > 0 ? typeArgs : undefined);
 }
 
 function compileTypeTable(t: TypeTableNode): ts.TypeNode {
+  // Luau's `{T}` is the conventional array shorthand for `{[number]: T}`.
+  // Emit it as a TS array `T[]` so `push`/`pop`/`length` work; falling
+  // through to a numeric-keyed index signature is technically correct but
+  // strips array-ness from downstream usage.
+  if (
+    t.props.length === 0
+    && t.indexer
+    && t.indexer.indexType.type === 'TypeReference'
+    && t.indexer.indexType.name === 'number'
+  ) {
+    return factory.createArrayTypeNode(compileType(t.indexer.resultType));
+  }
   const members: ts.TypeElement[] = [];
   for (const prop of t.props) {
     members.push(
@@ -93,6 +174,40 @@ function compileTypeTable(t: TypeTableNode): ts.TypeNode {
     );
   }
   if (t.indexer) {
+    // TS index signatures allow only `string`, `number`, `symbol`, or
+    // template-literal types as the key — a Luau index like `[LogLevel]`
+    // where `LogLevel` is `"trace" | "debug" | ...` produces a TS error
+    // (1337) if emitted as `[key: LogLevel]: V`. Detect the
+    // non-primitive case and emit a mapped type `{ [K in LogLevel]: V }`
+    // instead. Property signatures (if any) get merged via intersection.
+    const idx = t.indexer.indexType;
+    const idxName = idx.type === 'TypeReference' ? idx.name : null;
+    // TS allows only string/number/symbol as plain index-signature keys.
+    // Anything else (literal unions, named aliases, etc.) goes through a
+    // mapped type instead.
+    const isPlainIndex =
+      idxName !== null
+      && (idxName === 'string' || idxName === 'number' || idxName === 'symbol');
+    if (!isPlainIndex) {
+      const mapped = factory.createMappedTypeNode(
+        undefined,
+        factory.createTypeParameterDeclaration(
+          undefined,
+          factory.createIdentifier('K'),
+          compileType(t.indexer.indexType),
+          undefined,
+        ),
+        undefined,
+        undefined,
+        compileType(t.indexer.resultType),
+        undefined,
+      );
+      if (members.length === 0) return mapped;
+      return factory.createIntersectionTypeNode([
+        factory.createTypeLiteralNode(members),
+        mapped,
+      ]);
+    }
     members.push(
       factory.createIndexSignature(
         undefined,
@@ -117,11 +232,18 @@ function compileTypeFunction(t: TypeFunctionNode): ts.TypeNode {
   for (let i = 0; i < t.argTypes.types.length; i += 1) {
     const argType = t.argTypes.types[i]!;
     const argName = t.argNames[i];
+    // Luau impl-table method shape: `addSink: (self: StateMachine, …) -> ()`.
+    // TS-side the same signature is `(this: StateMachine, …) => void`, which
+    // matches the implementation we emit (`function (this: any, …) {}`).
+    // Keep `self` as a parameter name only when it isn't the conventional
+    // first-arg-of-a-method-impl — that pattern would otherwise force an
+    // arity mismatch between the impl type and the actual function.
+    const isImplicitSelf = i === 0 && argName?.name === 'self';
     params.push(
       factory.createParameterDeclaration(
         undefined,
         undefined,
-        factory.createIdentifier(argName?.name ?? `arg${i}`),
+        factory.createIdentifier(isImplicitSelf ? 'this' : argName?.name ?? `arg${i}`),
         undefined,
         compileType(argType),
       ),

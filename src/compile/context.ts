@@ -52,6 +52,20 @@ export class CompileContext {
    *  the emitter can prepend the right imports alongside the runtime helpers. */
   private readonly extraImports = new Map<string, Set<string>>();
 
+  /** Host-environment globals the script touched (game, workspace, task, …).
+   *  The emitter prepends a `declare const X: any;` for each so tsc's
+   *  type-check stops surfacing "Cannot find name". Distinct from `imports`
+   *  because these aren't sourced from `luau2ts/runtime`; the host
+   *  environment provides the actual runtime values. */
+  private readonly ambientGlobalsUsed = new Set<string>();
+
+  /** Map of type-alias names → number of leading regular generics. Used by
+   *  the type-reference compiler so that `Foo<a, b, c>` for a Luau alias
+   *  `type Foo<T...>` collapses its args into a tuple (`Foo<[a, b, c]>`)
+   *  rather than emitting them as positional TS generics that Foo can't
+   *  accept. Populated by a pre-scan pass before codegen. */
+  private readonly aliasGenericArities = new Map<string, { generics: number; hasPack: boolean }>();
+
   /** Names of classes the class-shape detector inferred from
    *  metatable-OOP patterns. Recorded so subsequent `<Class>.new(...)`
    *  calls in the same file are lowered to `new <Class>(...)` rather than
@@ -117,6 +131,25 @@ export class CompileContext {
 
   importedHelpers(): string[] {
     return [...this.imports].sort();
+  }
+
+  /** Record a host-environment global as referenced. Triggers a
+   *  `declare const X: any;` preamble at emit time so the TS type-checker
+   *  resolves the name without surfacing "Cannot find name". */
+  useAmbient(name: string): void {
+    this.ambientGlobalsUsed.add(name);
+  }
+
+  ambientGlobals(): Set<string> {
+    return this.ambientGlobalsUsed;
+  }
+
+  recordAliasArity(name: string, generics: number, hasPack: boolean): void {
+    this.aliasGenericArities.set(name, { generics, hasPack });
+  }
+
+  aliasArity(name: string): { generics: number; hasPack: boolean } | undefined {
+    return this.aliasGenericArities.get(name);
   }
 
   freshIdentifier(prefix: string): string {

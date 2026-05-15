@@ -6,7 +6,11 @@ function checkFrozen(t: object): void {
   if (FROZEN.has(t)) throw new LuaError('attempt to modify a readonly table');
 }
 
-export function tableInsert<T>(t: T[], posOrValue: number | T, maybeValue?: T): void {
+// `<T = any>` (not unconstrained `<T>`) so call sites with no inferable
+// element type — `local t = {}; table.insert(t, x)` where `t: any` — see
+// the callback params resolve to `any` rather than `unknown`. Lua tables
+// don't carry element types past the call boundary anyway.
+export function tableInsert<T = any>(t: T[], posOrValue: number | T, maybeValue?: T): void {
   checkFrozen(t);
   if (arguments.length >= 3) {
     const pos = posOrValue as number;
@@ -19,7 +23,7 @@ export function tableInsert<T>(t: T[], posOrValue: number | T, maybeValue?: T): 
   }
 }
 
-export function tableRemove<T>(t: T[], pos?: number): T | undefined {
+export function tableRemove<T = any>(t: T[], pos?: number): T | undefined {
   checkFrozen(t);
   if (t.length === 0) return undefined;
   if (pos === undefined) return t.pop();
@@ -41,7 +45,7 @@ export function tableConcat(t: unknown[], sep = '', i = 1, j: number = t.length)
   return out.join(sep);
 }
 
-export function tableSort<T>(t: T[], comp?: (a: T, b: T) => boolean): void {
+export function tableSort<T = any>(t: T[], comp?: (a: T, b: T) => boolean): void {
   checkFrozen(t);
   if (comp) {
     t.sort((a, b) => {
@@ -61,7 +65,7 @@ export function tableSort<T>(t: T[], comp?: (a: T, b: T) => boolean): void {
   }
 }
 
-export function tableUnpack<T>(t: T[] | (Record<number, T> & { n?: number }), i = 1, j?: number): T[] {
+export function tableUnpack<T = any>(t: T[] | (Record<number, T> & { n?: number }), i = 1, j?: number): T[] {
   if (Array.isArray(t)) {
     return t.slice(i - 1, j);
   }
@@ -86,7 +90,7 @@ export function tablePack(...values: unknown[]): { n: number } & Record<number, 
   return out as { n: number } & Record<number, unknown>;
 }
 
-export function tableFind<T>(t: T[], value: T, init = 1): number | undefined {
+export function tableFind<T = any>(t: T[], value: T, init = 1): number | undefined {
   for (let k = init - 1; k < t.length; k += 1) {
     if (t[k] === value) return k + 1;
   }
@@ -98,7 +102,7 @@ export function tableClear(t: unknown[]): void {
   t.length = 0;
 }
 
-export function tableClone<T>(t: T[]): T[] {
+export function tableClone<T = any>(t: T[]): T[] {
   return [...t];
 }
 
@@ -112,7 +116,7 @@ export function tableIsFrozen(t: object): boolean {
   return FROZEN.has(t) || Object.isFrozen(t);
 }
 
-export function tableMove<T>(a1: T[], f: number, e: number, dest: number, a2: T[] = a1): T[] {
+export function tableMove<T = any>(a1: T[], f: number, e: number, dest: number, a2: T[] = a1): T[] {
   checkFrozen(a2);
   if (e < f) return a2;
   for (let k = 0; k <= e - f; k += 1) {
