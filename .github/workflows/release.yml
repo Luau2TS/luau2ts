@@ -37,9 +37,14 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - run: pnpm -r build
+      # Build analyzer first so its dist/ exists, then root which links
+      # to it. -r alone can skip the workspace root depending on pnpm
+      # version semantics, so call them explicitly.
+      - run: pnpm --filter @luau2ts/analyzer build
 
-      - run: pnpm -r test
+      - run: pnpm build
+
+      - run: pnpm test
 
       - name: Publish to npm
         run: |
