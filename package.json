@@ -1,6 +1,6 @@
 {
   "name": "luau2ts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A Luau-to-TypeScript compiler for Roblox.",
   "type": "module",
   "license": "MIT",
