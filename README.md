@@ -89,14 +89,14 @@ console.log(result.source);
 
 ## Docs
 
-Full guide and API reference at **[luau2ts.dev](https://luau2ts.dev)**.
+Full guide and API reference at **[luau2ts.dev](https://luau2ts.com)**.
 
 Highlights:
-- [Quick start](https://luau2ts.dev/docs/quick-start)
-- [Setup guide](https://luau2ts.dev/docs/setup-guide)
-- [CLI usage](https://luau2ts.dev/docs/usage)
-- [Rojo project conversion](https://luau2ts.dev/docs/guides/rojo-project-conversion)
-- [Using with roblox-ts](https://luau2ts.dev/docs/guides/using-with-roblox-ts)
+- [Quick start](https://luau2ts.com/docs/quick-start)
+- [Setup guide](https://luau2ts.com/docs/setup-guide)
+- [CLI usage](https://luau2ts.com/docs/usage)
+- [Rojo project conversion](https://luau2ts.com/docs/guides/rojo-project-conversion)
+- [Using with roblox-ts](https://luau2ts.com/docs/guides/using-with-roblox-ts)
 
 ## Contributing
 
