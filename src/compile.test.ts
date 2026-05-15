@@ -71,7 +71,10 @@ describe('compile — statements', () => {
     });
     expect(r.source).toContain('$tuple("abc", 123)');
     expect(r.source).toContain('LuaTuple');
-    expect(r.source).toMatch(/import \{[^}]*LuaTuple[^}]*\} from "@rbxts\/types"/);
+    // @rbxts/types is a globals-only package — `LuaTuple` is declared
+    // ambiently, not exported. Don't emit an import (would trip TS2306
+    // "is not a module" under roblox-ts strict mode).
+    expect(r.source).not.toContain('@rbxts/types');
   });
 
   it('multi-value return: rbxts mode tuple arity uses max across branches', async () => {

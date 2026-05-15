@@ -22,9 +22,13 @@ describe('macros — datatype constructors (R.2)', () => {
   });
 
   it("rbxts mode rewrites `Vector3.new(x,y,z)` as `new Vector3(x,y,z)`", async () => {
+    // Vector3 is a globally-declared class in @rbxts/types (no exports —
+    // the module isn't importable). We DON'T emit `import { Vector3 }
+    // from "@rbxts/types"` in rbxts mode; the bare `new Vector3(...)`
+    // resolves via the ambient declaration.
     const out = await emit('local v = Vector3.new(1, 2, 3)', 'rbxts');
     expect(out).toContain('new Vector3(1, 2, 3)');
-    expect(out).toContain('@rbxts/types');
+    expect(out).not.toContain('@rbxts/types');
   });
 
   it('rbxts mode rewrites every datatype constructor', async () => {
@@ -58,20 +62,25 @@ describe('macros — datatype constructors (R.2)', () => {
     }
   });
 
-  it('Instance.new("Part") → new Part() + types import (rbxts mode)', async () => {
+  it('Instance.new("Part") keeps the `new Instance("Part")` form in rbxts mode', async () => {
+    // @rbxts/types declares Roblox subclass names (Part, ClickDetector,
+    // Tool, …) as INTERFACES, not classes — `new Part(...)` fires
+    // TS2693 ("only refers to a type"). roblox-ts has special handling
+    // for `new Instance("ClassName")` that resolves the constructor and
+    // types the result as the subclass. So we keep the source's shape.
     const out = await emit('local p = Instance.new("Part")', 'rbxts');
-    expect(out).toContain('new Part()');
-    expect(out).toMatch(/import \{[^}]*Part[^}]*\} from "@rbxts\/types"/);
+    expect(out).toContain('new Instance("Part")');
+    expect(out).not.toContain('@rbxts/types');
   });
 
   it('Instance.new with parent forwards the second arg', async () => {
     const out = await emit('local p = Instance.new("Part", workspace)', 'rbxts');
-    expect(out).toContain('new Part(workspace)');
+    expect(out).toMatch(/new Instance\("Part", workspace[^)]*\)/);
   });
 
-  it('Instance.new with non-literal class name falls through to default emit', async () => {
+  it('Instance.new with non-literal class name forwards the call', async () => {
     const out = await emit('local p = Instance.new(name)', 'rbxts');
-    expect(out).toContain('Instance.new(name)');
+    expect(out).toContain('new Instance(name)');
   });
 
   it('game:GetService("Workspace") → Workspace + services import', async () => {
@@ -359,19 +368,22 @@ describe('class-shape recognition (R.9, rbxts mode only)', () => {
 });
 
 describe('macros — re-export grouping', () => {
-  it('rbxts mode emits a single grouped @rbxts/types import per file', async () => {
+  it('rbxts mode does NOT emit an `@rbxts/types` import (globals only)', async () => {
+    // @rbxts/types declares Roblox classes as TypeScript-side ambient
+    // globals — the package has no named exports. Importing from it
+    // surfaces TS2306 "File '...roblox.d.ts' is not a module" under
+    // roblox-ts strict mode. The bare class identifiers
+    // (`new Vector3()`, etc.) resolve via the ambient declarations.
     const out = await emit(
       `local v = Vector3.new(1,2,3)
        local c = Color3.fromRGB(255,0,0)
        local p = CFrame.new(0,0,0)`,
       'rbxts',
     );
-    const matches = out.match(/from "@rbxts\/types"/g) ?? [];
-    expect(matches.length, out).toBe(1);
-    // All three named imports should be on that single line.
-    expect(out).toMatch(/import \{[^}]*Vector3[^}]*\} from "@rbxts\/types"/);
-    expect(out).toMatch(/import \{[^}]*Color3[^}]*\} from "@rbxts\/types"/);
-    expect(out).toMatch(/import \{[^}]*CFrame[^}]*\} from "@rbxts\/types"/);
+    expect(out).not.toContain('@rbxts/types');
+    expect(out).toContain('new Vector3(1, 2, 3)');
+    expect(out).toContain('Color3.fromRGB(255, 0, 0)');
+    expect(out).toContain('new CFrame(0, 0, 0)');
   });
 });
 
@@ -453,11 +465,14 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
   it('rbxts mode emits `for (const v of arr)` for single-binding iteration', async () => {
     // roblox-ts compiles `for-of` on arrays to Lua ipairs-style. Single-
     // binding source maps to value-only TS iteration (no destructure).
+    // The iterable is cast to `any[]` so the destructured element type
+    // is `any` rather than `unknown` — `unknown` would trip TS18046 on
+    // every property access in the loop body.
     const out = await emit(
       `local function f(xs: { number }) for _, x in xs do print(x) end end`,
       'rbxts',
     );
-    expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs\)\)/);
+    expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs as any\[\]\)\)/);
   });
 
   it('rbxts mode skips the `declare const X: any;` preamble', async () => {

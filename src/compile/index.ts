@@ -818,6 +818,16 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
       for (const v of stat.vars) ctx.defineLocal(v.name, 'unknown');
       return compileBlockBody(stat.body, ctx);
     });
+    // Cast the iterable to `Array<any>` so the destructured value type
+    // is `any` (not `unknown`). Without the cast, ipairs(any) infers
+    // the element type as `unknown`, which then fails every body
+    // access with TS18046 ("X is of type 'unknown'"). Same trick as
+    // for-of method-result casts: roblox-ts accepts `any` in this
+    // position, real Roblox runtime doesn't care.
+    const castedIterable = factory.createAsExpression(
+      iterableExpr,
+      factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword)),
+    );
     if (stat.vars.length === 1) {
       // `for v in arr do` — single binding, value-only iteration.
       return [
@@ -830,7 +840,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
             )],
             ts.NodeFlags.Const,
           ),
-          iterableExpr,
+          castedIterable,
           factory.createBlock(bodyStatements, true),
         ),
       ];
@@ -855,7 +865,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
         factory.createCallExpression(
           factory.createIdentifier('ipairs'),
           undefined,
-          [iterableExpr],
+          [castedIterable],
         ),
         factory.createBlock(bodyStatements, true),
       ),
@@ -1382,8 +1392,24 @@ function buildAssignmentStatement(
     );
   }
   return factory.createExpressionStatement(
-    factory.createAssignment(compileExpr(target, ctx), valueExpr),
+    factory.createAssignment(compileLValue(target, ctx), valueExpr),
   );
+}
+
+/** Compile a Luau expression intended as an assignment LHS. Identical
+ *  to compileExpr for most shapes, BUT skips the rbxts-mode `as any`
+ *  cast on `.Parent` access — TS rejects `x.Parent as any = y` as a
+ *  syntactically invalid lvalue. The cast is only needed for read
+ *  positions to absorb @rbxts/types' `Instance | undefined` narrowing;
+ *  on write the property exists at runtime so plain access works. */
+function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
+  if (target.type === 'IndexName') {
+    return factory.createPropertyAccessExpression(
+      compileExpr(target.expr, ctx),
+      factory.createIdentifier(propertyName(target.index)),
+    );
+  }
+  return compileExpr(target, ctx);
 }
 
 function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
@@ -2101,10 +2127,43 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           ),
         );
       }
-      return factory.createPropertyAccessExpression(
+      // rbxts mode: property access on `game` / `workspace` / `script` /
+      // `plugin` returns Instance-typed values. Real Roblox scripts read
+      // service or child accesses freely; @rbxts/types only exposes the
+      // declared properties (Workspace.Camera etc.), missing every user
+      // folder (`game.MyFolder`, `workspace.Tycoons`, etc.). Cast the
+      // root to `any` so the entire access chain is dynamically typed.
+      // Subsequent `.Parent` / FindFirstChild casts compose with this.
+      if (
+        ctx.compatMode === 'rbxts'
+        && expr.expr.type === 'Global'
+        && RBX_DYNAMIC_ROOTS.has((expr.expr as { name: string }).name)
+      ) {
+        return factory.createPropertyAccessExpression(
+          factory.createAsExpression(
+            compileExpr(expr.expr, ctx),
+            factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+          ),
+          factory.createIdentifier(propertyName(expr.index)),
+        );
+      }
+      const access = factory.createPropertyAccessExpression(
         compileExpr(expr.expr, ctx),
         factory.createIdentifier(propertyName(expr.index)),
       );
+      // rbxts mode: `.Parent` access on Instance returns `Instance |
+      // undefined` per @rbxts/types. Real Roblox scripts treat parent
+      // chains as non-null (runtime errors if a chain link is missing)
+      // AND access children whose specific types aren't statically
+      // known. Cast to `any` so the result absorbs both — non-null
+      // AND wide enough that subsequent property access type-checks.
+      if (ctx.compatMode === 'rbxts' && expr.index === 'Parent') {
+        return factory.createAsExpression(
+          access,
+          factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+        );
+      }
+      return access;
     }
     case 'IndexExpr': {
       // Lua tables are 1-indexed; JS arrays are 0-indexed. For numeric
@@ -2613,18 +2672,18 @@ const YIELDING_METHODS = new Set([
 ]);
 
 function isYieldingCall(expr: Extract<Expr, { type: 'Call' }>, ctx?: CompileContext): boolean {
+  // rbxts mode targets Lua (via roblox-ts), where yields are implicit —
+  // `wait()` / `task.wait()` / `pcall()` block naturally without needing
+  // an async/await dance. Skip the JS-async wrapping entirely so the
+  // emit reads as straightforward calls and roblox-ts compiles them to
+  // Lua identity-transform. Top-level await in particular trips TS1378
+  // since roblox-ts's tsconfig doesn't enable es2022 module support.
+  if (ctx?.compatMode === 'rbxts') return false;
   // Old admin scripts snapshot Lua globals into locals at startup
   // (`local wait,pcall,...=wait,pcall,...`). The reference type flips
   // from Global to Local but the binding still points at the yielding
   // implementation, so the await wrap must still fire.
   if ((expr.func.type === 'Global' || expr.func.type === 'Local') && YIELDING_FREE_FUNCS.has(expr.func.name)) {
-    // In rbxts mode, `require` is roblox-ts's synchronous global —
-    // the resulting Lua require call is blocking, so the TS side
-    // should NOT use `await`. Top-level `await require(...)` also
-    // breaks roblox-ts's TS target (TS1378). The other yielders
-    // (wait/pcall/xpcall) still need await because their JS lowering
-    // is async; require is the sole exception.
-    if (ctx?.compatMode === 'rbxts' && expr.func.name === 'require') return false;
     return true;
   }
   if (expr.func.type === 'IndexName' && expr.func.expr.type === 'Global') {
@@ -2817,11 +2876,69 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
   } else {
     call = factory.createCallExpression(compileExpr(expr.func, ctx), undefined, args);
   }
+  // rbxts mode: methods that return `Instance | undefined` in @rbxts/types
+  // (FindFirstChild family, FindFirstAncestor family) plus methods that
+  // return base `Instance` (`WaitForChild` — the returned child is a
+  // specific subclass at runtime but typed as plain Instance) get cast
+  // to `any`. Absorbs both nullability AND the loose-Instance typing
+  // that triggers TS2339 "Property X does not exist on Instance" at
+  // every subsequent property access. Real Roblox code knows the
+  // child's actual type at the call site and proceeds without checks.
+  if (
+    ctx.compatMode === 'rbxts'
+    && expr.self
+    && expr.func.type === 'IndexName'
+    && INSTANCE_LOOSE_METHODS.has(expr.func.index)
+  ) {
+    call = factory.createAsExpression(
+      call,
+      factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+    );
+  }
+  // rbxts mode: `require(ModuleScript)` returns `unknown` per @rbxts/types
+  // because the loaded module's exports type isn't known statically.
+  // Cast to `any` so `let Module = require(...); Module.Foo()` works —
+  // real Roblox scripts never check the require result's shape; they
+  // know which module they're loading.
+  if (
+    ctx.compatMode === 'rbxts'
+    && expr.func.type === 'Global'
+    && expr.func.name === 'require'
+  ) {
+    call = factory.createAsExpression(
+      call,
+      factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+    );
+  }
   if (isYieldingCall(expr, ctx)) {
     return factory.createAwaitExpression(call);
   }
   return call;
 }
+
+/** Instance methods whose @rbxts/types return type is too narrow for how
+ *  real Roblox scripts use them — either nilable (`Instance | undefined`)
+ *  for FindFirst*, or base-`Instance` for WaitForChild where the actual
+ *  child is a specific subclass. The rbxts-mode emit wraps each result
+ *  in `as any` so subsequent property access type-checks. */
+/** Roblox-side Lua globals whose typed shape (per @rbxts/types) misses
+ *  the user-folder children real scripts access. Cast the root to `any`
+ *  before any property access so `game.MyFolder`, `workspace.Tycoons`,
+ *  `script.Helpers`, etc. type-check. Subsequent `.Parent` and
+ *  FindFirstChild casts compose. */
+const RBX_DYNAMIC_ROOTS = new Set(['game', 'workspace', 'script', 'plugin']);
+
+const INSTANCE_LOOSE_METHODS = new Set([
+  'FindFirstChild',
+  'FindFirstChildOfClass',
+  'FindFirstChildWhichIsA',
+  'FindFirstAncestor',
+  'FindFirstAncestorOfClass',
+  'FindFirstAncestorWhichIsA',
+  'FindFirstDescendant',
+  'WaitForChild',
+  'GetAttribute',
+]);
 
 function compileTableExpr(
   expr: Extract<Expr, { type: 'Table' }>,
@@ -3166,6 +3283,13 @@ export async function compile(
   // `@rbxts/roact`, etc. Each macro that fired called `ctx.useImport(module, name)`;
   // the bookkeeping is reified into one import declaration per module.
   for (const { module, names } of ctx.extraImportEntries()) {
+    // Skip `@rbxts/types` in rbxts mode — the package declares every
+    // Roblox class as a TS-level global, not as named exports. Importing
+    // them surfaces TS2306 "File '...roblox.d.ts' is not a module".
+    // Macros still register `useImport('@rbxts/types', X)` for the
+    // intent-tracking value (telling us the script depends on X); we
+    // just don't emit the import line.
+    if (ctx.compatMode === 'rbxts' && module === '@rbxts/types') continue;
     allStatements.push(buildNamedImport(module, names));
   }
   // `declare const X: any;` for every Roblox / host-environment global the

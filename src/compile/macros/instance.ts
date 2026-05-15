@@ -12,24 +12,22 @@ function isValidIdentifier(name: string): boolean {
 }
 
 // ─── Instance.new ─────────────────────────────────────────────────────────
+//
+// roblox-ts wires `new Instance("ClassName")` specially: the constructor
+// takes a string literal and the result is typed as the corresponding
+// subclass. The subclass names themselves (Part, ClickDetector, Tool,
+// etc.) are declared as INTERFACES in @rbxts/types — not classes — so
+// `new Part(...)` fires TS2693 ("only refers to a type"). Emit the
+// `new Instance("X", parent?)` form so roblox-ts's class-resolver
+// handles it.
 registerMacro(
   'Instance.new',
-  ({ ctx, call, compiledArgs }) => {
-    // Need a literal-string first argument to resolve the class name.
-    const first = call.args[0];
-    if (!first || first.type !== 'ConstantString') return undefined;
-    const className = (first as { value: string }).value;
-    if (!isValidIdentifier(className)) return undefined;
-
-    ctx.useImport('@rbxts/types', className);
-
-    // Forward any remaining arguments (e.g. `Instance.new("Part", parent)`
-    // becomes `new Part(parent)`).
-    const ctorArgs = compiledArgs.slice(1);
+  ({ compiledArgs }) => {
+    if (compiledArgs.length === 0) return undefined;
     return factory.createNewExpression(
-      factory.createIdentifier(className),
+      factory.createIdentifier('Instance'),
       undefined,
-      ctorArgs,
+      compiledArgs,
     );
   },
   'rbxts',
@@ -49,7 +47,14 @@ function gameGetService({
   if (!isValidIdentifier(serviceName)) return undefined;
 
   ctx.useImport('@rbxts/services', serviceName);
-  return factory.createIdentifier(serviceName);
+  // Cast the service reference to `any` so subsequent property access
+  // (`ReplicatedStorage.MyFolder`, `ServerScriptService.PlayerData`,
+  // etc. — runtime-named children) type-checks under roblox-ts strict
+  // mode. Without this each user-folder access fires TS2339.
+  return factory.createAsExpression(
+    factory.createIdentifier(serviceName),
+    factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+  );
 }
 
 registerMacro(
