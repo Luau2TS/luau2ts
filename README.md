@@ -89,7 +89,7 @@ console.log(result.source);
 
 ## Docs
 
-Full guide and API reference at **[luau2ts.dev](https://luau2ts.com)**.
+Full guide and API reference at **[luau2ts.com](https://luau2ts.com)**.
 
 Highlights:
 - [Quick start](https://luau2ts.com/docs/quick-start)
