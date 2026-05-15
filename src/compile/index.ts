@@ -239,13 +239,18 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
   }
 
   // Single RHS call with multiple LHS targets → destructuring (multi-return).
+  // In rbxts mode the function's return is already wrapped as LuaTuple<[…]>,
+  // which roblox-ts destructures natively (`let [a, b] = f()` ⇄ Lua
+  // `local a, b = f()`). Drop the multiret wrap so the output stays clean.
   if (stat.vars.length > 1 && stat.values.length === 1 && stat.values[0]?.type === 'Call') {
     const rawInit = compileExpr(stat.values[0]!, ctx);
-    const init = factory.createCallExpression(
-      factory.createIdentifier(ctx.use('multiret')),
-      undefined,
-      [rawInit],
-    );
+    const init = ctx.compatMode === 'rbxts'
+      ? rawInit
+      : factory.createCallExpression(
+          factory.createIdentifier(ctx.use('multiret')),
+          undefined,
+          [rawInit],
+        );
     const anyShadow = stat.vars.some((v) => ctx.hasLocalInCurrentScope(v.name));
     for (const v of stat.vars) ctx.assignLocal(v.name, typeFromAnnotation(v.annotation));
     if (anyShadow) {
@@ -760,6 +765,50 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     }
   }
 
+  // rbxts mode: emit `for (const [vars] of pairs(value)) { … }`. `pairs` is
+  // a Roblox/Luau global that roblox-ts has declared in @rbxts/types, so the
+  // emitted TS round-trips back to Lua-native iteration without any
+  // luau2ts/runtime helpers. Covers the bare-table case (Luau's no-pairs
+  // shortcut) too — `for k, v in t do` ≡ `for k, v in pairs(t) do`.
+  if (ctx.compatMode === 'rbxts') {
+    ctx.useAmbient('pairs');
+    const iterableExpr = stat.values.length === 1
+      ? compileExpr(stat.values[0]!, ctx)
+      : factory.createArrayLiteralExpression(stat.values.map((v) => compileExpr(v, ctx)));
+    const seenForIn = new Set<string>();
+    const forInNames = stat.vars.map((v, i) => {
+      let name = safeIdentifier(v.name);
+      if (seenForIn.has(name)) name = ctx.freshIdentifier(`${name}_skip_${i}`);
+      seenForIn.add(name);
+      return name;
+    });
+    const bodyStatements = ctx.withScope(() => {
+      for (const v of stat.vars) ctx.defineLocal(v.name, 'unknown');
+      return compileBlockBody(stat.body, ctx);
+    });
+    const binding = stat.vars.length === 1
+      ? factory.createIdentifier(forInNames[0]!)
+      : factory.createArrayBindingPattern(
+          forInNames.map((name) =>
+            factory.createBindingElement(undefined, undefined, factory.createIdentifier(name)),
+          ),
+        );
+    return [
+      factory.createForOfStatement(
+        undefined,
+        factory.createVariableDeclarationList(
+          [factory.createVariableDeclaration(binding, undefined, undefined, undefined)],
+          ts.NodeFlags.Const,
+        ),
+        factory.createCallExpression(
+          factory.createIdentifier('pairs'),
+          undefined,
+          [iterableExpr],
+        ),
+        factory.createBlock(bodyStatements, true),
+      ),
+    ];
+  }
 
   const iterTriple = factory.createIdentifier(ctx.freshIdentifier('__iter'));
   const stateName = factory.createIdentifier(ctx.freshIdentifier('__state'));
@@ -1093,6 +1142,42 @@ function compileForInFastPath(
   // the key rather than its `.toString()` string artifact. The runtime
   // installs a key reifier; without it pairKeys behaves identically to
   // Object.keys (with proper numeric-index handling).
+  //
+  // rbxts mode skips the helpers entirely: roblox-ts has a global `pairs`
+  // in @rbxts/types that returns the standard Lua (k, v) iterator, so we
+  // just defer to it via `for (const [k, v] of pairs(t)) { … }`.
+  if (ctx.compatMode === 'rbxts') {
+    ctx.useAmbient('pairs');
+    const seenP = new Set<string>();
+    const pNames = stat.vars.map((v, i) => {
+      let n = safeIdentifier(v.name);
+      if (seenP.has(n)) n = ctx.freshIdentifier(`${n}_skip_${i}`);
+      seenP.add(n);
+      return n;
+    });
+    const binding = stat.vars.length === 1
+      ? factory.createIdentifier(pNames[0]!)
+      : factory.createArrayBindingPattern(
+          pNames.map((n) =>
+            factory.createBindingElement(undefined, undefined, factory.createIdentifier(n)),
+          ),
+        );
+    return [
+      factory.createForOfStatement(
+        undefined,
+        factory.createVariableDeclarationList(
+          [factory.createVariableDeclaration(binding, undefined, undefined, undefined)],
+          ts.NodeFlags.Const,
+        ),
+        factory.createCallExpression(
+          factory.createIdentifier('pairs'),
+          undefined,
+          [iterable],
+        ),
+        block,
+      ),
+    ];
+  }
   const pairKeysFn = ctx.use('pairKeys');
   const pairValueFn = ctx.use('pairValue');
   if (stat.vars.length === 1) {
@@ -1219,9 +1304,22 @@ function buildAssignmentStatement(
         ),
       );
     }
-    // Runtime key: route through the helper so we don't generate
-    // `luaIndex(t, k) = v`. The helper also handles the array-vs-dict
-    // dynamic 1-index correction symmetric with luaIndex on reads.
+    // Runtime key: in rbxts mode emit native bracket assignment — roblox-ts
+    // preserves variable indices verbatim when compiling TS to Lua, so a
+    // Luau `t[k]` round-trips as Lua `t[k]`. In native mode we need the
+    // luaIndexSet helper because the JS runtime needs to translate 1-based
+    // Luau idioms (and `luaIndex(t, k) = v` isn't a valid TS lvalue).
+    if (ctx.compatMode === 'rbxts') {
+      return factory.createExpressionStatement(
+        factory.createAssignment(
+          factory.createElementAccessExpression(
+            compileExpr(target.expr, ctx),
+            compileExpr(indexExpr, ctx),
+          ),
+          valueExpr,
+        ),
+      );
+    }
     const luaIndexSetFn = ctx.use('luaIndexSet');
     return factory.createExpressionStatement(
       factory.createCallExpression(
@@ -1256,11 +1354,14 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
   // Single RHS call with multiple LHS → destructuring assignment.
   if (stat.vars.length > 1 && stat.values.length === 1 && stat.values[0]?.type === 'Call') {
     const targets = stat.vars.map((v) => compileExpr(v, ctx));
-    const valueExpr = factory.createCallExpression(
-      factory.createIdentifier(ctx.use('multiret')),
-      undefined,
-      [compileExpr(stat.values[0]!, ctx)],
-    );
+    const rawRhs = compileExpr(stat.values[0]!, ctx);
+    const valueExpr = ctx.compatMode === 'rbxts'
+      ? rawRhs
+      : factory.createCallExpression(
+          factory.createIdentifier(ctx.use('multiret')),
+          undefined,
+          [rawRhs],
+        );
     for (const target of stat.vars) {
       if (target.type === 'Local') ctx.assignLocal(target.name, 'unknown');
     }
@@ -1837,7 +1938,18 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       // overriding local.
       if (!ctx.getLocalJsName(expr.name)) {
         if (RUNTIME_AVAILABLE_GLOBALS.has(expr.name)) {
-          ctx.use(expr.name);
+          // In rbxts mode these names (pcall, error, tostring, table, os,
+          // string, math, ...) are real Lua/Roblox globals — roblox-ts has
+          // them declared in `@rbxts/types`. Importing them from our
+          // runtime would shadow the global with a JS impl that roblox-ts
+          // couldn't unpack. Route through useAmbient instead so the bare
+          // identifier survives to the output, with a `declare const X: any`
+          // preamble keeping our own --check-ts happy.
+          if (ctx.compatMode === 'rbxts') {
+            ctx.useAmbient(expr.name);
+          } else {
+            ctx.use(expr.name);
+          }
         } else if (AMBIENT_GLOBALS.has(expr.name)) {
           ctx.useAmbient(expr.name);
         }
@@ -1895,6 +2007,11 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         return factory.createElementAccessExpression(target, lit);
       }
       if (indexExpr.type === 'ConstantString') {
+        return factory.createElementAccessExpression(target, index);
+      }
+      // Runtime key: native bracket access in rbxts mode (roblox-ts preserves
+      // variable indices), helper in native mode (handles 1-based at runtime).
+      if (ctx.compatMode === 'rbxts') {
         return factory.createElementAccessExpression(target, index);
       }
       const luaIndexFn = ctx.use('luaIndex');
@@ -1971,6 +2088,16 @@ function compileUnary(expr: Extract<Expr, { type: 'Unary' }>, ctx: CompileContex
         return factory.createPrefixUnaryExpression(
           ts.SyntaxKind.ExclamationToken,
           factory.createParenthesizedExpression(truthify(inner, ctx, innerType)),
+        );
+      }
+      // rbxts mode: emit `!inner` directly. roblox-ts will lower TS `!` to
+      // Lua `not`, which preserves the Lua-truthy semantics our luaNot
+      // helper was simulating. The intermediate TS won't be JS-truthy
+      // accurate (0 and "" differ), but the target is round-trip Lua.
+      if (ctx.compatMode === 'rbxts') {
+        return factory.createPrefixUnaryExpression(
+          ts.SyntaxKind.ExclamationToken,
+          factory.createParenthesizedExpression(inner),
         );
       }
       const fn = ctx.use('luaNot');
@@ -2179,6 +2306,49 @@ function compileBinary(
     '..': 'luaConcat',
     '==': 'luaEq',
   };
+  // In rbxts mode we route every helper-call binary op through a native
+  // TS operator instead. roblox-ts compiling back to Lua already
+  // dispatches `+`/`*`/`==` on Roblox datatypes via their __add/__mul/__eq
+  // metamethods, and emits Lua `..` for template literals — so the helpers
+  // are pure middleware that adds runtime imports without changing the
+  // final Lua semantics.
+  if (ctx.compatMode === 'rbxts') {
+    const nativeOp: Partial<Record<string, ts.BinaryOperator>> = {
+      '+': ts.SyntaxKind.PlusToken,
+      '-': ts.SyntaxKind.MinusToken,
+      '*': ts.SyntaxKind.AsteriskToken,
+      '/': ts.SyntaxKind.SlashToken,
+      '%': ts.SyntaxKind.PercentToken,
+      '^': ts.SyntaxKind.AsteriskAsteriskToken,
+      '==': ts.SyntaxKind.EqualsEqualsEqualsToken,
+      '~=': ts.SyntaxKind.ExclamationEqualsEqualsToken,
+    };
+    const direct = nativeOp[op];
+    if (direct !== undefined) return factory.createBinaryExpression(left, direct, right);
+    if (op === '//') {
+      // Integer division: `Math.floor(a / b)`. roblox-ts lowers Math.floor
+      // to math.floor and the slash stays as Lua `/`. Same observable
+      // result as Luau's `//`.
+      return factory.createCallExpression(
+        factory.createPropertyAccessExpression(factory.createIdentifier('Math'), 'floor'),
+        undefined,
+        [factory.createBinaryExpression(left, ts.SyntaxKind.SlashToken, right)],
+      );
+    }
+    if (op === '..') {
+      // String concatenation: template literal `${left}${right}`. roblox-ts
+      // emits Lua `..` for template literals, and template-string coercion
+      // (calling .toString()/tostring on each interpolant) matches Lua's
+      // implicit tostring conversion in `..`.
+      return factory.createTemplateExpression(
+        factory.createTemplateHead(''),
+        [
+          factory.createTemplateSpan(left, factory.createTemplateMiddle('')),
+          factory.createTemplateSpan(right, factory.createTemplateTail('')),
+        ],
+      );
+    }
+  }
   if (op === '~=') {
     const fn = ctx.use('luaEq');
     return factory.createPrefixUnaryExpression(
@@ -2233,12 +2403,20 @@ function compileLogicalBinary(
   }
   // Non-repeatable LHS — bind it once via a single-expression arrow IIFE
   // so the truthiness test and the chosen-operand both reference the
-  // same evaluation: `(__l => isTruthy(__l) ? right : __l)(left)`.
-  const isTruthyFn = ctx.use('isTruthy');
+  // same evaluation: `(__l => isTruthy(__l) ? right : __l)(left)`. In
+  // rbxts mode, drop the isTruthy wrap; roblox-ts re-derives Lua-truthy
+  // when it compiles the ternary back to Lua.
   const leftId = factory.createIdentifier('__l');
   const needsAsync = nodeContainsAwait(right);
+  const truthCheck = ctx.compatMode === 'rbxts'
+    ? leftId
+    : factory.createCallExpression(
+        factory.createIdentifier(ctx.use('isTruthy')),
+        undefined,
+        [leftId],
+      );
   const choose = factory.createConditionalExpression(
-    factory.createCallExpression(factory.createIdentifier(isTruthyFn), undefined, [leftId]),
+    truthCheck,
     factory.createToken(ts.SyntaxKind.QuestionToken),
     op === 'and' ? right : leftId,
     factory.createToken(ts.SyntaxKind.ColonToken),

@@ -147,6 +147,12 @@ export function truthify(
   }
   if (ts.isNumericLiteral(expr) || ts.isStringLiteral(expr)) return factory.createTrue();
 
+  // In rbxts mode we emit the bare expression. JS truthiness is laxer than
+  // Lua's (0 and "" are JS-falsy, Lua-truthy), but roblox-ts compiling the
+  // output back to Lua re-derives Lua-truthy semantics. The intermediate
+  // TS isn't directly executable under plain JS, but it doesn't need to be
+  // — the target is the roblox-ts round-trip, not Node.
+  if (ctx.compatMode === 'rbxts') return expr;
   const fn = ctx.use('isTruthy');
   return factory.createCallExpression(factory.createIdentifier(fn), undefined, [expr]);
 }
