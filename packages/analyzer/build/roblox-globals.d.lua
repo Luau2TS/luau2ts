@@ -51,6 +51,11 @@ declare class Vector2
     Lerp: (self: Vector2, goal: Vector2, alpha: number) -> Vector2
     Min: (self: Vector2, ...Vector2) -> Vector2
     Max: (self: Vector2, ...Vector2) -> Vector2
+    __add: (self: Vector2, other: any) -> Vector2
+    __sub: (self: Vector2, other: any) -> Vector2
+    __mul: (self: Vector2, other: any) -> Vector2
+    __div: (self: Vector2, other: any) -> Vector2
+    __unm: (self: Vector2) -> Vector2
 end
 declare Vector2: {
     new: (x: number?, y: number?) -> Vector2,
@@ -73,6 +78,14 @@ declare class Vector3
     Max: (self: Vector3, ...Vector3) -> Vector3
     FuzzyEq: (self: Vector3, other: Vector3, epsilon: number?) -> boolean
     Angle: (self: Vector3, other: Vector3, axis: Vector3?) -> number
+    -- Vector3 supports +/-/*/÷ with both Vector3 (componentwise) and
+    -- number (uniform scaling). Use `any` on `other` so both shapes
+    -- pass the analyzer's overload-resolution check.
+    __add: (self: Vector3, other: any) -> Vector3
+    __sub: (self: Vector3, other: any) -> Vector3
+    __mul: (self: Vector3, other: any) -> Vector3
+    __div: (self: Vector3, other: any) -> Vector3
+    __unm: (self: Vector3) -> Vector3
 end
 declare Vector3: {
     new: (x: number?, y: number?, z: number?) -> Vector3,
@@ -128,6 +141,12 @@ declare class CFrame
     ToEulerAnglesYXZ: (self: CFrame) -> (number, number, number)
     ToAxisAngle: (self: CFrame) -> (Vector3, number)
     FuzzyEq: (self: CFrame, other: CFrame, epsilon: number?) -> boolean
+    -- Metamethod overloads. CFrame * CFrame composes; CFrame * Vector3
+    -- transforms a point. Luau's analyzer recognizes __mul/__add/etc.
+    -- by name when declared as class members.
+    __mul: (self: CFrame, other: any) -> any
+    __add: (self: CFrame, other: Vector3) -> CFrame
+    __sub: (self: CFrame, other: Vector3) -> CFrame
 end
 declare CFrame: {
     new: (...any) -> CFrame,

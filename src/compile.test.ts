@@ -817,4 +817,40 @@ describe('compile — type checking', () => {
     expect(tsErrors.length).toBeGreaterThan(0);
     expect(luauErrors.length).toBeGreaterThan(0);
   });
+
+  it('dynamic Instance child access routes to warnings, not errors', async () => {
+    // Real Roblox scripts access runtime-resolved children — the
+    // analyzer correctly flags `instance.SomeRuntimeChild` as
+    // UnknownProperty because it can't statically know that child
+    // exists. We demote those diagnostics to warnings so
+    // `errors.length === 0` doesn't break for scripts that use
+    // perfectly-normal Roblox idioms.
+    const r = await _compile(
+      `local function f(p: Instance) return p.SomeRuntimeChild end`,
+      { pretty: false, preEmitCheck: true, postEmitCheck: false },
+    );
+    const blocking = r.errors.filter((e) =>
+      e.message.includes('UnknownProperty') && e.message.includes('Instance'),
+    );
+    expect(blocking).toEqual([]);
+    // The diagnostics still surface — just on the warnings side.
+    const warned = r.warnings.filter((w) =>
+      w.message.includes('UnknownProperty') && w.message.includes('Instance'),
+    );
+    expect(warned.length).toBeGreaterThan(0);
+  });
+
+  it('lint-style warnings (LocalUnused, etc.) route to warnings', async () => {
+    // Layer-B severity:'warning' diagnostics go to result.warnings.
+    // Without this split, lint warnings inflate errors.length and look
+    // identical to real type bugs.
+    const r = await _compile(
+      'local UnusedVariable = 42\n',
+      { pretty: false, preEmitCheck: true, postEmitCheck: false },
+    );
+    const lintBlocking = r.errors.filter((e) =>
+      e.message.includes('Unused') || e.message.includes('LocalUnused'),
+    );
+    expect(lintBlocking).toEqual([]);
+  });
 });

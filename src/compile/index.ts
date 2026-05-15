@@ -2975,8 +2975,15 @@ export interface CompileResult {
   source: string;
   /** Helper names the output imports from luau2ts/runtime. */
   helpers: string[];
-  /** Parser errors, if any (compiler returns parser-error output even so). */
+  /** Parser errors plus Layer-A and Layer-B *error*-severity diagnostics.
+   *  Lint-style warnings live in `warnings` so callers that key on
+   *  `errors.length === 0` don't conflate "unused local" with a real
+   *  type bug. */
   errors: ParseResult['errors'];
+  /** Layer-B warnings (LocalUnused, LocalShadow, ImportUnused, etc.).
+   *  Same shape as errors; useful for users who want to surface them
+   *  but not gate on them. */
+  warnings: ParseResult['errors'];
   /** Source map JSON when sourceMap was requested. */
   sourceMap?: SourceMap;
 }
@@ -2988,6 +2995,10 @@ export async function compile(
   const sourceFileName = options.sourceFile ?? 'input.luau';
   const parsed = await parse(source);
   const ctx = new CompileContext(options.compatMode ?? 'native');
+  // Layer-B lint warnings (LocalUnused, LocalShadow, etc.) collected
+  // separately so callers gating on `errors.length === 0` can ignore
+  // them. Same shape as the errors array.
+  const warnings: ParseResult['errors'] = [];
   // Route the top-level body through compileBlockBody so the class-shape
   // detector (R.9) sees it. Synthesize a Block-shaped wrapper since the
   // root body is a flat statement array.
@@ -3290,16 +3301,39 @@ export async function compile(
     if (analyzerMod) {
       const diags = await analyzerMod.analyze(source);
       for (const d of diags) {
-        // Normalize the analyzer's flat {line, col} into the
-        // parser's nested loc shape so the union of errors in
-        // CompileResult stays uniform.
-        parsed.errors.push({
+        // Normalize the analyzer's flat {line, col} into the parser's
+        // nested loc shape. Route by severity — errors join the main
+        // errors list; lint-style warnings (LocalUnused, LocalShadow,
+        // SameLineStatement, ImportUnused, etc.) go to `warnings` so
+        // callers gating on `errors.length === 0` don't pick them up.
+        //
+        // ALSO route `UnknownProperty` errors of the
+        // "Key 'X' not found in external type '<RobloxClass>'" shape to
+        // `warnings`. Luau's `declare class` doesn't support string
+        // indexers, so we can't express "any property access on
+        // Instance is allowed" via the type. Real Roblox scripts
+        // access children dynamically — `script.Parent.Drop`,
+        // `ServerScriptService.PlayerData`, `model.PartName`, etc. —
+        // and the analyzer correctly notes it doesn't statically know
+        // those exist. Surfacing each as an error drowns out genuine
+        // type errors; demote to warning.
+        //
+        // The regex matches any "external type 'Word'" target — all
+        // Roblox classes in our generated definitions live in the
+        // external-type space, so this covers Instance + every
+        // subclass + every Service uniformly.
+        const isRobloxDynamicAccess =
+          d.code === 'UnknownProperty'
+          && /not found in (?:external )?type '[A-Z]\w*'/.test(d.message);
+        const diag = {
           message: `[luau:${d.code}] ${d.message}`,
           loc: {
             start: { line: d.line, col: d.col },
             end: { line: d.endLine, col: d.endCol },
           },
-        });
+        };
+        if (d.severity === 'warning' || isRobloxDynamicAccess) warnings.push(diag);
+        else parsed.errors.push(diag);
       }
     }
   }
@@ -3343,6 +3377,7 @@ export async function compile(
     source: printed,
     helpers,
     errors: parsed.errors,
+    warnings,
     ...(sourceMap ? { sourceMap } : {}),
   };
 }

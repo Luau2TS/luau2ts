@@ -295,6 +295,12 @@ function emitClass(c, lines, serviceNames) {
       lines.push(`    ${svc}: ${svc}`);
     }
   }
+  // Note: Luau's `declare class` doesn't accept a string-indexer
+  // member (`[name: string]: any`). Real Roblox scripts that access
+  // runtime-named children (`script.Parent.SomeChild`) fire
+  // `UnknownProperty` on Instance because of this — we filter those
+  // out at the analyzer-result level (see compile/index.ts) rather
+  // than try to express the indexer here.
   lines.push('end');
   lines.push('');
 }
