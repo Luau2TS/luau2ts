@@ -756,7 +756,15 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
   // single-call RHS of `ipairs(arr)` or `pairs(t)` — we emit the much
   // shorter TS-native equivalents instead.
 
-  if (stat.values.length === 1 && stat.values[0]!.type === 'Call') {
+  // Fast path for explicit `ipairs(arr)` / `pairs(t)` — native-only.
+  // rbxts mode handles every for-in form below (`for-of` for arrays,
+  // `ipairs(arr)` global for two-binding); the fast path's C-style
+  // emit (`arr.length`) doesn't survive roblox-ts which uses `.size()`.
+  if (
+    ctx.compatMode !== 'rbxts'
+    && stat.values.length === 1
+    && stat.values[0]!.type === 'Call'
+  ) {
     const call = stat.values[0] as Extract<Expr, { type: 'Call' }>;
     const callee = call.func;
     if (callee.type === 'Global' && (callee.name === 'ipairs' || callee.name === 'pairs') && call.args.length === 1) {
@@ -779,9 +787,26 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
   // the one roblox-ts is happiest with — accept the trade-off; users
   // who really want dict iteration can write the for-of explicitly.
   if (ctx.compatMode === 'rbxts') {
-    const iterableExpr = stat.values.length === 1
-      ? compileExpr(stat.values[0]!, ctx)
-      : factory.createArrayLiteralExpression(stat.values.map((v) => compileExpr(v, ctx)));
+    // Source forms like `for _, v in ipairs(arr) do` already call
+    // ipairs(); our emit below also wraps in ipairs() so we'd produce
+    // `ipairs(ipairs(arr))`. Unwrap the explicit call so the wrap
+    // doesn't double up. Same for pairs() (used in dict iteration).
+    let iterableSource: Expr | null = null;
+    if (
+      stat.values.length === 1
+      && stat.values[0]!.type === 'Call'
+      && stat.values[0]!.func.type === 'Global'
+      && ((stat.values[0]!.func as { name: string }).name === 'ipairs'
+        || (stat.values[0]!.func as { name: string }).name === 'pairs')
+      && (stat.values[0]! as { args: Expr[] }).args.length === 1
+    ) {
+      iterableSource = (stat.values[0]! as { args: Expr[] }).args[0]!;
+    }
+    const iterableExpr = iterableSource
+      ? compileExpr(iterableSource, ctx)
+      : stat.values.length === 1
+        ? compileExpr(stat.values[0]!, ctx)
+        : factory.createArrayLiteralExpression(stat.values.map((v) => compileExpr(v, ctx)));
     const seenForIn = new Set<string>();
     const forInNames = stat.vars.map((v, i) => {
       let name = safeIdentifier(v.name);
@@ -1761,14 +1786,15 @@ function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.Par
     const isOptional = i >= optionalFrom;
     // Native mode: leave unannotated params untyped (TS infers).
     // rbxts mode: roblox-ts requires `strict: true` which rejects
-    // implicit-any params (TS7006), so fall back to `unknown` (not
-    // `any` — roblox-ts also rejects that). The user can annotate
-    // explicitly for stricter typing.
+    // implicit-any params (TS7006); annotate explicitly as `any`.
+    // `unknown` would satisfy strict but trip TS18046 ("'X' is of
+    // type 'unknown'") on every property access in the body —
+    // `any` is the more useful default.
     let ty: ts.TypeNode | undefined;
     if (local.annotation) {
       ty = compileType(local.annotation);
     } else if (ctx.compatMode === 'rbxts') {
-      ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+      ty = factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
     }
     // In rbxts mode the default value is `undefined` to match the
     // nil-as-undefined choice (roblox-ts rejects `null` literally).
@@ -2591,7 +2617,16 @@ function isYieldingCall(expr: Extract<Expr, { type: 'Call' }>, ctx?: CompileCont
   // (`local wait,pcall,...=wait,pcall,...`). The reference type flips
   // from Global to Local but the binding still points at the yielding
   // implementation, so the await wrap must still fire.
-  if ((expr.func.type === 'Global' || expr.func.type === 'Local') && YIELDING_FREE_FUNCS.has(expr.func.name)) return true;
+  if ((expr.func.type === 'Global' || expr.func.type === 'Local') && YIELDING_FREE_FUNCS.has(expr.func.name)) {
+    // In rbxts mode, `require` is roblox-ts's synchronous global —
+    // the resulting Lua require call is blocking, so the TS side
+    // should NOT use `await`. Top-level `await require(...)` also
+    // breaks roblox-ts's TS target (TS1378). The other yielders
+    // (wait/pcall/xpcall) still need await because their JS lowering
+    // is async; require is the sole exception.
+    if (ctx?.compatMode === 'rbxts' && expr.func.name === 'require') return false;
+    return true;
+  }
   if (expr.func.type === 'IndexName' && expr.func.expr.type === 'Global') {
     if (expr.func.expr.name === 'task' && YIELDING_TASK_FUNCS.has(expr.func.index)) return true;
   }

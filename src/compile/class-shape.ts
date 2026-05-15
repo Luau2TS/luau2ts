@@ -556,17 +556,17 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
 }
 
 /** Build a typed parameter declaration from a Luau Local arg. Pulls the
- *  TS type from the annotation when present; falls back to `unknown` so
- *  roblox-ts's strict mode doesn't trip on implicit `any` (TS7006) and
- *  also so it doesn't trip its own "Using values of type `any` is not
- *  supported!" rejection. Nilable annotations (`T?`) keep the union but
- *  the param doesn't get a `= null` default — class methods inherit
- *  positional optionality from their interface, not from per-param
- *  defaults. */
+ *  TS type from the annotation when present; falls back to `any` so
+ *  roblox-ts's strict mode doesn't trip on implicit `any` (TS7006).
+ *  Using `unknown` instead would satisfy strict-mode but then cause
+ *  TS18046 ("'X' is of type 'unknown'") on every property access in
+ *  the body — `any` lets the access through and roblox-ts's "any
+ *  banned" rule only fires in narrow contexts (assignment targets,
+ *  not method bodies). */
 function paramDecl(a: { name: string; annotation?: import('../parser/index.js').TypeNode | null }): ts.ParameterDeclaration {
   const ty = a.annotation
     ? compileType(a.annotation)
-    : factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+    : factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
   return factory.createParameterDeclaration(undefined, undefined, a.name, undefined, ty);
 }
 

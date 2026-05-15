@@ -219,14 +219,23 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     expect(out).toContain('s.split(",")');
   });
 
-  it('math.floor(x) → Math.floor(x)', async () => {
+  it('math.floor(x) keeps lowercase `math.floor` (roblox-ts has it as a Lua global)', async () => {
+    // Previously rewrote to JS-side `Math.floor`, but @rbxts/types
+    // declares `math` (lowercase) as a typed Lua-global namespace.
+    // `Math.floor` would surface TS2304 "Cannot find name 'Math'" in
+    // roblox-ts strict mode. Keeping `math.floor` round-trips back to
+    // Lua as the identity transform.
     const out = await emit('local f = math.floor(x)', 'rbxts');
-    expect(out).toContain('Math.floor(x)');
+    expect(out).toContain('math.floor(x)');
+    expect(out).not.toContain('Math.floor(');
   });
 
-  it('math.clamp(x, lo, hi) → Math.min(Math.max(x, lo), hi)', async () => {
+  it('math.clamp(x, lo, hi) keeps the real math.clamp call', async () => {
+    // roblox-ts has a real `math.clamp` (Roblox Luau extension over
+    // standard Lua); use it directly instead of decomposing into
+    // min/max.
     const out = await emit('local c = math.clamp(x, 0, 1)', 'rbxts');
-    expect(out).toContain('Math.min(Math.max(x, 0), 1)');
+    expect(out).toContain('math.clamp(x, 0, 1)');
   });
 
   it('native mode keeps stdlib calls as namespace calls', async () => {
@@ -305,11 +314,13 @@ describe('class-shape recognition (R.9, rbxts mode only)', () => {
     `;
     const out = await emit(src, 'rbxts');
     expect(out).toMatch(/class Class \{/);
-    // Constructor params get explicit type annotations (defaulting to
-    // `unknown` when the source had none) so roblox-ts's strict mode
-    // doesn't trip on implicit-any (TS7006) or on its own ban on
-    // `any`-typed values.
-    expect(out).toMatch(/constructor\(x: unknown, y: unknown\)/);
+    // Constructor params get explicit `: any` annotations when the
+    // source had none. roblox-ts strict mode rejects implicit-any
+    // (TS7006); `unknown` would satisfy that but then trip TS18046 on
+    // body accesses (`this.x = x` with x: unknown). `any` is the
+    // pragmatic default — roblox-ts's "any banned" rule only fires
+    // in narrow contexts, not at param positions.
+    expect(out).toMatch(/constructor\(x: any, y: any\)/);
     expect(out).toContain('getX()');
     // The metatable plumbing should be gone.
     expect(out).not.toContain('setmetatable');
@@ -393,18 +404,19 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
     expect(out).not.toMatch(/= null/);
   });
 
-  it('rbxts mode defaults unannotated method params to `: unknown` (not `any`)', async () => {
+  it('rbxts mode defaults unannotated method params to `: any`', async () => {
     const out = await emit(
       `local C = setmetatable({}, {__index = nil})
        function C.new(x, y) local self = setmetatable({}, C); self.x = x; self.y = y; return self end
        function C:get() return self.x end`,
       'rbxts',
     );
-    // Class constructor + method params default to `unknown`. roblox-ts
-    // rejects both implicit-any (TS7006) AND explicit `any`-typed values
-    // ("Using values of type `any` is not supported!"), so `unknown` is
-    // the only safe pick.
-    expect(out).toMatch(/constructor\(x: unknown, y: unknown\)/);
+    // Class constructor + method params default to `any` so roblox-ts's
+    // strict mode doesn't trip on implicit-any (TS7006). `unknown` would
+    // satisfy TS7006 but then trigger TS18046 on every property access
+    // in the body. roblox-ts's own "any banned" check only fires in
+    // narrow contexts (not method param positions).
+    expect(out).toMatch(/constructor\(x: any, y: any\)/);
   });
 
   it('rbxts mode does NOT synthesize a `static new(...)` forwarder', async () => {

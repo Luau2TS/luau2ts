@@ -242,17 +242,29 @@ registerMacro(
 );
 
 // ─── math.* — direct JS Math passthrough ──────────────────────────────────
+//
+// roblox-ts has `math` declared as a typed Lua-global namespace in
+// @rbxts/types (lua.d.ts). Keep the lowercase `math.<fn>` form so the
+// emit type-checks under roblox-ts AND survives the round-trip back
+// to Lua as the identity transform. Using `Math` (the JS global)
+// would produce TS2304 ("Cannot find name 'Math'") under rbxts mode.
+//
+// In native mode the JS global Math is the correct target — the host
+// runtime is JS, not Lua.
 
 function emitMathPassthrough(name: string) {
-  return ({ compiledArgs }: MacroArgs) =>
-    factory.createCallExpression(
+  return ({ ctx, compiledArgs }: MacroArgs) => {
+    const mathName = ctx.compatMode === 'rbxts' ? 'math' : 'Math';
+    if (mathName === 'math') ctx.useAmbient('math');
+    return factory.createCallExpression(
       factory.createPropertyAccessExpression(
-        factory.createIdentifier('Math'),
+        factory.createIdentifier(mathName),
         factory.createIdentifier(name),
       ),
       undefined,
       compiledArgs,
     );
+  };
 }
 
 for (const m of [
@@ -268,12 +280,24 @@ for (const m of [
 // separately as expression-level rewrites would need a different hook. Our
 // `math` namespace export already exposes them, so they pass through.
 
-// `math.clamp(x, lo, hi)` → `Math.min(Math.max(x, lo), hi)`
+// `math.clamp(x, lo, hi)` → `Math.min(Math.max(x, lo), hi)` in native;
+// in rbxts mode roblox-ts has a real `math.clamp`, so keep the call.
 registerMacro(
   'math.clamp',
-  ({ compiledArgs }: MacroArgs) => {
+  ({ ctx, compiledArgs }: MacroArgs) => {
     const [x, lo, hi] = compiledArgs;
     if (!x || !lo || !hi) return undefined;
+    if (ctx.compatMode === 'rbxts') {
+      ctx.useAmbient('math');
+      return factory.createCallExpression(
+        factory.createPropertyAccessExpression(
+          factory.createIdentifier('math'),
+          factory.createIdentifier('clamp'),
+        ),
+        undefined,
+        [x, lo, hi],
+      );
+    }
     return factory.createCallExpression(
       factory.createPropertyAccessExpression(
         factory.createIdentifier('Math'),
