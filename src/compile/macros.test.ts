@@ -173,9 +173,15 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     expect(out).toContain('arr.push(x)');
   });
 
-  it('table.insert(t, i, v) → t.splice(i-1, 0, v)', async () => {
+  it('table.insert(t, i, v) → t.insert(i - 1, v)', async () => {
+    // roblox-ts's Array<T> exposes `insert(index, value)` (0-indexed,
+    // matching JS conventions). We emit that instead of going through
+    // `table` (which doesn't even expose `.insert` in @rbxts/types) or
+    // through `.splice` (also missing on Array<T>).
     const out = await emit('table.insert(arr, 2, x)', 'rbxts');
-    expect(out).toContain('arr.splice(2 - 1, 0, x)');
+    expect(out).toContain('arr.insert(2 - 1, x)');
+    expect(out).not.toContain('table.insert');
+    expect(out).not.toContain('.splice(');
   });
 
   it('table.remove(t) → t.pop()', async () => {
@@ -299,7 +305,11 @@ describe('class-shape recognition (R.9, rbxts mode only)', () => {
     `;
     const out = await emit(src, 'rbxts');
     expect(out).toMatch(/class Class \{/);
-    expect(out).toMatch(/constructor\(x, y\)/);
+    // Constructor params get explicit type annotations (defaulting to
+    // `unknown` when the source had none) so roblox-ts's strict mode
+    // doesn't trip on implicit-any (TS7006) or on its own ban on
+    // `any`-typed values.
+    expect(out).toMatch(/constructor\(x: unknown, y: unknown\)/);
     expect(out).toContain('getX()');
     // The metatable plumbing should be gone.
     expect(out).not.toContain('setmetatable');
@@ -351,5 +361,150 @@ describe('macros — re-export grouping', () => {
     expect(out).toMatch(/import \{[^}]*Vector3[^}]*\} from "@rbxts\/types"/);
     expect(out).toMatch(/import \{[^}]*Color3[^}]*\} from "@rbxts\/types"/);
     expect(out).toMatch(/import \{[^}]*CFrame[^}]*\} from "@rbxts\/types"/);
+  });
+});
+
+describe('rbxts mode roundtrip-readiness (R.14)', () => {
+  // These tests guard the rbxts-mode emit against regressing on the
+  // strict-mode rules roblox-ts enforces: no `null`, no `any`, no `self`
+  // identifier, no `static new` collisions, no `luau2ts/runtime` imports.
+  // Each behavior is also covered by macros.test.ts at a finer grain; the
+  // cluster here exists so a single broken assumption surfaces clearly
+  // instead of getting buried in the macro-level tests.
+
+  it('rbxts mode lowers `nil` literals to `undefined` (not `null`)', async () => {
+    // roblox-ts rejects `null` outright ("null is not supported — use
+    // undefined"). The native-mode null mapping (matched against
+    // `T | null` annotations) is wrong for the rbxts target.
+    const out = await emit('local x = nil', 'rbxts');
+    expect(out).toContain('let x = undefined');
+    expect(out).not.toContain('let x = null');
+  });
+
+  it('rbxts mode lowers `T?` annotations to `T | undefined`', async () => {
+    const out = await emit('local function f(name: string?) end', 'rbxts');
+    expect(out).toMatch(/name: string \| undefined/);
+    expect(out).not.toMatch(/name: string \| null/);
+  });
+
+  it('rbxts mode defaults optional params to `= undefined`', async () => {
+    const out = await emit('local function f(a: string, b: string?) end', 'rbxts');
+    expect(out).toMatch(/b: string \| undefined = undefined/);
+    expect(out).not.toMatch(/= null/);
+  });
+
+  it('rbxts mode defaults unannotated method params to `: unknown` (not `any`)', async () => {
+    const out = await emit(
+      `local C = setmetatable({}, {__index = nil})
+       function C.new(x, y) local self = setmetatable({}, C); self.x = x; self.y = y; return self end
+       function C:get() return self.x end`,
+      'rbxts',
+    );
+    // Class constructor + method params default to `unknown`. roblox-ts
+    // rejects both implicit-any (TS7006) AND explicit `any`-typed values
+    // ("Using values of type `any` is not supported!"), so `unknown` is
+    // the only safe pick.
+    expect(out).toMatch(/constructor\(x: unknown, y: unknown\)/);
+  });
+
+  it('rbxts mode does NOT synthesize a `static new(...)` forwarder', async () => {
+    // roblox-ts reserves `new` as a class member name (it auto-generates
+    // the Lua-side `Class.new()` factory from `new Class()` TS calls), so
+    // an explicit `static new(...)` collides with "Cannot use class field
+    // reserved for compiler internal usage."
+    const out = await emit(
+      `local C = setmetatable({}, {__index = nil})
+       function C.new() local self = setmetatable({}, C); return self end
+       function C:m() end`,
+      'rbxts',
+    );
+    expect(out).toContain('class C');
+    expect(out).not.toMatch(/static new\(/);
+  });
+
+  it('rbxts mode rewrites value-position `<Class>.new` to an arrow forwarder', async () => {
+    // `return { new = MyClass.new }` is a non-call reference that the
+    // <Class>.new macro doesn't touch (it fires on call sites only).
+    // Synthesize a forwarder arrow so the property's value-shape
+    // (a callable that constructs) is preserved.
+    const out = await emit(
+      `local C = setmetatable({}, {__index = nil})
+       function C.new() local self = setmetatable({}, C); return self end
+       function C:m() end
+       return { new = C.new }`,
+      'rbxts',
+    );
+    expect(out).toMatch(/new: \(\.\.\.args: unknown\[\]\) =>/);
+    expect(out).toMatch(/new \(C as new \(/);
+  });
+
+  it('rbxts mode emits `for (const v of arr)` for single-binding iteration', async () => {
+    // roblox-ts compiles `for-of` on arrays to Lua ipairs-style. Single-
+    // binding source maps to value-only TS iteration (no destructure).
+    const out = await emit(
+      `local function f(xs: { number }) for _, x in xs do print(x) end end`,
+      'rbxts',
+    );
+    expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs\)\)/);
+  });
+
+  it('rbxts mode skips the `declare const X: any;` preamble', async () => {
+    // The preamble keeps our internal --check-ts happy in native mode,
+    // but in rbxts mode it shadows @rbxts/types' typed globals with
+    // `any`, which (a) is itself a roblox-ts error and (b) breaks
+    // roblox-ts's for-of iteration analysis (it needs the real typed
+    // pairs/ipairs return).
+    const out = await emit('error("nope")', 'rbxts');
+    expect(out).not.toMatch(/declare const error:/);
+    // The bare reference still survives — roblox-ts resolves it via
+    // @rbxts/types at compile time.
+    expect(out).toContain('error("nope"');
+  });
+
+  it('rbxts mode emits no `luau2ts/runtime` imports', async () => {
+    // Mixed bag of operations that all routed through helpers in
+    // native mode (isTruthy, luaAdd, luaIndex, genericIter, multiret,
+    // luaNot, luaEq, error, pcall, setmetatable, …). In rbxts mode
+    // every one of them collapses to a native TS operator / global, so
+    // the import line should be entirely absent.
+    const out = await emit(
+      `local t = {}
+       local k = "foo"
+       t[k] = 42
+       if t[k] then
+         t[k] = t[k] + 1
+       end
+       for k, v in t do print(k, v) end
+       return t`,
+      'rbxts',
+    );
+    expect(out).not.toContain("from 'luau2ts/runtime'");
+    expect(out).not.toContain('from "luau2ts/runtime"');
+  });
+
+  it('rbxts mode collapses `x = x or default` to `x ?? default`', async () => {
+    // The IIFE-with-isTruthy form we use in native mode is unnecessary
+    // in rbxts — TS's `??` short-circuits naturally, and roblox-ts
+    // re-derives Lua-truthy semantics when compiling back.
+    const out = await emit('local function f(x: string?) return x or "default" end', 'rbxts');
+    expect(out).toMatch(/return x \?\? "default"/);
+    expect(out).not.toContain('isTruthy');
+  });
+
+  it('rbxts mode emits a class field per setmetatable init key', async () => {
+    // Fields harvested from the `.new` factory's setmetatable init get
+    // declared at the class top (so `this.x` resolves) AND assigned in
+    // the constructor body (so the init expression can reference the
+    // ctor's params).
+    const out = await emit(
+      `local C = setmetatable({}, {__index = nil})
+       function C.new(name: string) local self = setmetatable({ name = name, count = 0 }, C); return self end
+       function C:m() return self.name end`,
+      'rbxts',
+    );
+    expect(out).toMatch(/name: any;/);
+    expect(out).toMatch(/count: any;/);
+    expect(out).toMatch(/this\.name = name/);
+    expect(out).toMatch(/this\.count = 0/);
   });
 });

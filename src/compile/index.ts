@@ -33,7 +33,7 @@ import './macros/instance.js';
 import './macros/stdlib.js';
 import './rbxts-runtime.js';
 import { detectClasses, compileClassPattern, type ClassPattern } from './class-shape.js';
-import { compileType, compileTypePack, setAliasArities } from './type.js';
+import { compileType, compileTypePack, setAliasArities, setTypeCompatMode } from './type.js';
 import {
   buildSourceMap,
   inlineSourceMapURL,
@@ -569,7 +569,7 @@ function compileFunctionStat(stat: FunctionStat, ctx: CompileContext): ts.Statem
       undefined,
       factory.createIdentifier(safeIdentifier(stat.name.name)),
       undefined,
-      paramsFromLocals(stat.func.args),
+      paramsFromLocals(stat.func.args, ctx),
       stat.func.returnAnnotation ? compileTypePack(stat.func.returnAnnotation) : undefined,
       fn.body,
     );
@@ -765,13 +765,20 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     }
   }
 
-  // rbxts mode: emit `for (const [vars] of pairs(value)) { … }`. `pairs` is
-  // a Roblox/Luau global that roblox-ts has declared in @rbxts/types, so the
-  // emitted TS round-trips back to Lua-native iteration without any
-  // luau2ts/runtime helpers. Covers the bare-table case (Luau's no-pairs
-  // shortcut) too — `for k, v in t do` ≡ `for k, v in pairs(t) do`.
+  // rbxts mode: emit `for (const v of value) { … }` (single var) or
+  // `for (const [i, v] of (value as ReadonlyArray<defined>).entries()) { … }`
+  // (multi var). roblox-ts compiles both forms to Lua ipairs-style
+  // iteration and preserves the element type, so the body's `v` keeps
+  // whatever element type the source array carried — important because
+  // roblox-ts rejects operations on `any` / `unknown`.
+  //
+  // Dict iteration via pairs() would be more faithful for table-style
+  // sources, but pairs() over an `any`-typed iterable crashes rbxtsc,
+  // and pairs() over a properly-typed object yields keys that include
+  // method names. Array iteration is the more common Luau pattern AND
+  // the one roblox-ts is happiest with — accept the trade-off; users
+  // who really want dict iteration can write the for-of explicitly.
   if (ctx.compatMode === 'rbxts') {
-    ctx.useAmbient('pairs');
     const iterableExpr = stat.values.length === 1
       ? compileExpr(stat.values[0]!, ctx)
       : factory.createArrayLiteralExpression(stat.values.map((v) => compileExpr(v, ctx)));
@@ -786,13 +793,33 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
       for (const v of stat.vars) ctx.defineLocal(v.name, 'unknown');
       return compileBlockBody(stat.body, ctx);
     });
-    const binding = stat.vars.length === 1
-      ? factory.createIdentifier(forInNames[0]!)
-      : factory.createArrayBindingPattern(
-          forInNames.map((name) =>
-            factory.createBindingElement(undefined, undefined, factory.createIdentifier(name)),
+    if (stat.vars.length === 1) {
+      // `for v in arr do` — single binding, value-only iteration.
+      return [
+        factory.createForOfStatement(
+          undefined,
+          factory.createVariableDeclarationList(
+            [factory.createVariableDeclaration(
+              factory.createIdentifier(forInNames[0]!),
+              undefined, undefined, undefined,
+            )],
+            ts.NodeFlags.Const,
           ),
-        );
+          iterableExpr,
+          factory.createBlock(bodyStatements, true),
+        ),
+      ];
+    }
+    // Two-binding `for k, v in arr do` — use ipairs(). roblox-ts has
+    // ipairs<T>(t: Array<T>) declared in @rbxts/types returning typed
+    // [number, T] pairs, which the destructure picks up faithfully.
+    // arr.entries() isn't available in roblox-ts's Array type because
+    // Lua has no native entries() iterator.
+    const binding = factory.createArrayBindingPattern(
+      forInNames.map((name) =>
+        factory.createBindingElement(undefined, undefined, factory.createIdentifier(name)),
+      ),
+    );
     return [
       factory.createForOfStatement(
         undefined,
@@ -801,7 +828,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
           ts.NodeFlags.Const,
         ),
         factory.createCallExpression(
-          factory.createIdentifier('pairs'),
+          factory.createIdentifier('ipairs'),
           undefined,
           [iterableExpr],
         ),
@@ -1633,7 +1660,7 @@ function compileFunctionShape(
     );
   }
   const realArgs = implicitSelf ? fn.args.slice(1) : fn.args;
-  for (const p of paramsFromLocals(realArgs)) {
+  for (const p of paramsFromLocals(realArgs, ctx)) {
     params.push(p);
   }
   if (fn.vararg) {
@@ -1710,7 +1737,7 @@ function compileFunctionShape(
   };
 }
 
-function paramsFromLocals(locals: readonly Local[]): ts.ParameterDeclaration[] {
+function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.ParameterDeclaration[] {
   const seen = new Set<string>();
   const out: ts.ParameterDeclaration[] = [];
   // Detect a trailing run of nilable annotations and mark them optional.
@@ -1732,14 +1759,31 @@ function paramsFromLocals(locals: readonly Local[]): ts.ParameterDeclaration[] {
     // a default value keeps the param call-site-optional, while the in-body
     // type stays the declared `T | null` without `| undefined` widening.
     const isOptional = i >= optionalFrom;
+    // Native mode: leave unannotated params untyped (TS infers).
+    // rbxts mode: roblox-ts requires `strict: true` which rejects
+    // implicit-any params (TS7006), so fall back to `unknown` (not
+    // `any` — roblox-ts also rejects that). The user can annotate
+    // explicitly for stricter typing.
+    let ty: ts.TypeNode | undefined;
+    if (local.annotation) {
+      ty = compileType(local.annotation);
+    } else if (ctx.compatMode === 'rbxts') {
+      ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+    }
+    // In rbxts mode the default value is `undefined` to match the
+    // nil-as-undefined choice (roblox-ts rejects `null` literally).
     out.push(
       factory.createParameterDeclaration(
         undefined,
         undefined,
         factory.createIdentifier(name),
         undefined,
-        local.annotation ? compileType(local.annotation) : undefined,
-        isOptional ? factory.createNull() : undefined,
+        ty,
+        isOptional
+          ? (ctx.compatMode === 'rbxts'
+              ? factory.createIdentifier('undefined')
+              : factory.createNull())
+          : undefined,
       ),
     );
   });
@@ -1904,12 +1948,15 @@ function isPrimitiveStaticType(type: StaticValueType): boolean {
 function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
   switch (expr.type) {
     case 'ConstantNil':
-      // Lower `nil` to `null`. We previously emitted `undefined`, but every
-      // nilable type annotation (`T?`) compiles to `T | null` — so passing,
-      // assigning, or returning `nil` widened the slot to `T | null | undefined`
-      // and tsc rejected it against the declared `T | null`. Picking `null`
-      // keeps expression-side and type-side `nil` lowering aligned.
-      return factory.createNull();
+      // Lower `nil` to `null` in native mode (every nilable annotation
+      // `T?` compiles to `T | null`, so passing/returning `nil` stays
+      // aligned with the declared types). In rbxts mode, lower to
+      // `undefined` instead — roblox-ts explicitly rejects `null` with
+      // "null is not supported, use undefined" and asymmetric type
+      // alignment is less important than passing the round-trip check.
+      return ctx.compatMode === 'rbxts'
+        ? factory.createIdentifier('undefined')
+        : factory.createNull();
     case 'ConstantBool':
       return expr.value ? factory.createTrue() : factory.createFalse();
     case 'ConstantInteger':
@@ -1969,14 +2016,70 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       return compileUnary(expr, ctx);
     case 'Call':
       return compileCall(expr, ctx);
-    case 'IndexName':
+    case 'IndexName': {
       // Property names allow reserved words (`obj.new` is fine) — use
       // propertyName, not safeIdentifier, so `Instance.new("Part")` stays
       // as-written instead of becoming `Instance.new_("Part")`.
+      //
+      // Special case: value-position `<DetectedClass>.new` in rbxts mode.
+      // The class macro rewrites `<Class>.new(args)` CALL sites to
+      // `new <Class>(args)`, but bare references like
+      // `return { new = MyClass.new }` aren't calls and fall through to
+      // here. roblox-ts doesn't expose `.new` as a real property on the
+      // TS class, so the bare access fails type-check. Synthesize a
+      // forwarding arrow `(...args: unknown[]) => new <Class>(...args)`
+      // so the value-shape stays the same (a callable that constructs).
+      if (
+        ctx.compatMode === 'rbxts'
+        && expr.index === 'new'
+        && (expr.expr.type === 'Global' || expr.expr.type === 'Local')
+        && ctx.isDetectedClass((expr.expr as { name: string }).name)
+      ) {
+        const className = (expr.expr as { name: string }).name;
+        const argsId = factory.createIdentifier('args');
+        return factory.createArrowFunction(
+          undefined,
+          undefined,
+          [factory.createParameterDeclaration(
+            undefined,
+            factory.createToken(ts.SyntaxKind.DotDotDotToken),
+            argsId,
+            undefined,
+            factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+          )],
+          undefined,
+          factory.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+          // Cast the class to a constructor signature so TS / roblox-ts
+          // accept the spread invocation regardless of the real ctor's
+          // declared arity.
+          factory.createNewExpression(
+            factory.createParenthesizedExpression(
+              factory.createAsExpression(
+                factory.createIdentifier(className),
+                factory.createConstructorTypeNode(
+                  undefined,
+                  undefined,
+                  [factory.createParameterDeclaration(
+                    undefined,
+                    factory.createToken(ts.SyntaxKind.DotDotDotToken),
+                    'args',
+                    undefined,
+                    factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+                  )],
+                  factory.createTypeReferenceNode(className, undefined),
+                ),
+              ),
+            ),
+            undefined,
+            [factory.createSpreadElement(argsId)],
+          ),
+        );
+      }
       return factory.createPropertyAccessExpression(
         compileExpr(expr.expr, ctx),
         factory.createIdentifier(propertyName(expr.index)),
       );
+    }
     case 'IndexExpr': {
       // Lua tables are 1-indexed; JS arrays are 0-indexed. For numeric
       // literals we statically translate (`arr[1]` → `arr[0]`). For runtime
@@ -2928,6 +3031,7 @@ export async function compile(
     walkAliases(parsed.root);
   }
   setAliasArities(aliasArities);
+  setTypeCompatMode(ctx.compatMode);
 
   const stmts: ts.Statement[] = rootBlock ? compileBlockBody(rootBlock, ctx) : [];
   // Luau ModuleScripts end with `return <export-value>` — the value is
@@ -3021,7 +3125,16 @@ export async function compile(
   // `declare const X: any;` for every Roblox / host-environment global the
   // script referenced. Pure type-only; emits nothing at runtime, but lets
   // tsc resolve the names without surfacing "Cannot find name" cascades.
-  if (ambientGlobalsUsed.size > 0) {
+  //
+  // Skip entirely in rbxts mode — `pairs`, `error`, `task`, `os`, `table`,
+  // `game`, `workspace`, etc. are declared by @rbxts/types as typed globals
+  // there, and an `: any` declaration here would shadow those with `any`,
+  // which then breaks roblox-ts's for-of iteration analysis (it relies on
+  // pairs() / ipairs() having their real typed return shape). Our internal
+  // --check-ts won't resolve these names anymore, but rbxts users invoke
+  // roblox-ts on the output; that pipeline has the right types via
+  // typeRoots: ["node_modules/@rbxts"].
+  if (ctx.compatMode !== 'rbxts' && ambientGlobalsUsed.size > 0) {
     for (const name of [...ambientGlobalsUsed].sort()) {
       allStatements.push(
         factory.createVariableStatement(
@@ -3116,7 +3229,18 @@ export async function compile(
   // @types. strict:false so any-laden translations of untyped Luau
   // don't drown the user in noise; users who want strict can run
   // tsc --strict on the output.
-  const runLayerA = options.typeCheck === true || options.postEmitCheck !== false;
+  // Layer A defaults: on for native mode, off for rbxts mode. In rbxts
+  // mode we drop the ambient `declare const X: any;` preamble so the
+  // emitted file relies on @rbxts/types' typed globals at the roblox-ts
+  // step — but our internal tsc check doesn't know about @rbxts/types,
+  // so the same names (pairs, error, task, os, ...) would all fail with
+  // "Cannot find name." Skip the check by default; users can opt back
+  // in via `--check-ts` / `typeCheck: true` if their toolchain wires
+  // @rbxts/types into the tsc resolution.
+  const layerADefault = ctx.compatMode === 'rbxts' ? false : true;
+  const runLayerA = options.typeCheck === true
+    || (options.postEmitCheck !== false && options.postEmitCheck !== undefined)
+    || (options.postEmitCheck === undefined && layerADefault);
   if (runLayerA) {
     const postEmitDiags = runPostEmitCheck(printed, sourceFileName);
     for (const d of postEmitDiags) parsed.errors.push(d);

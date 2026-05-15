@@ -6,23 +6,27 @@ const { factory } = ts;
 // ─── table.* ───────────────────────────────────────────────────────────────
 
 // `table.insert(t, v)` → `t.push(v)`
-// `table.insert(t, i, v)` → `t.splice(i-1, 0, v)` (1-indexed → 0-indexed)
+// `table.insert(t, i, v)` → `t.insert(i - 1, v)`. roblox-ts's Array<T>
+//   interface exposes its own `insert(index, value)` method (0-indexed,
+//   matching JS conventions), so a positional insert maps cleanly. The
+//   `i - 1` shift mirrors what we do for literal numeric indices on
+//   read access — the round-trip back to Lua adds the 1 back via
+//   roblox-ts's index translation.
 registerMacro(
   'table.insert',
   ({ compiledArgs }: MacroArgs) => {
     const [target, second, third] = compiledArgs;
     if (!target) return undefined;
     if (third !== undefined) {
-      // 3-arg form: insert at position.
       const indexExpr = factory.createBinaryExpression(
         second!,
         factory.createToken(ts.SyntaxKind.MinusToken),
         factory.createNumericLiteral(1),
       );
       return factory.createCallExpression(
-        factory.createPropertyAccessExpression(target, factory.createIdentifier('splice')),
+        factory.createPropertyAccessExpression(target, factory.createIdentifier('insert')),
         undefined,
-        [indexExpr, factory.createNumericLiteral(0), third],
+        [indexExpr, third],
       );
     }
     if (second === undefined) return undefined;

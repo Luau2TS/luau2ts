@@ -31,6 +31,22 @@ export function setAliasArities(map: Map<string, { generics: number; hasPack: bo
   aliasArities = map;
 }
 
+/** Module-scoped mode flag: set by compile() before every run. Lets the
+ *  type compiler emit `undefined` for `nil` in rbxts mode (where roblox-ts
+ *  rejects `null` outright) while keeping the original `null` mapping in
+ *  native mode (where every nilable annotation `T?` is `T | null`). */
+let currentCompatMode: 'native' | 'rbxts' = 'native';
+
+export function setTypeCompatMode(mode: 'native' | 'rbxts'): void {
+  currentCompatMode = mode;
+}
+
+function nilTypeNode(): ts.TypeNode {
+  return currentCompatMode === 'rbxts'
+    ? factory.createKeywordTypeNode(ts.SyntaxKind.UndefinedKeyword)
+    : factory.createLiteralTypeNode(factory.createNull());
+}
+
 export function compileType(t: TypeNode | null | undefined): ts.TypeNode {
   if (!t) return factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
   switch (t.type) {
@@ -38,8 +54,8 @@ export function compileType(t: TypeNode | null | undefined): ts.TypeNode {
       return compileTypeReference(t);
     case 'TypeOptional':
       // Bare `?` — only appears as part of `T?` desugared into `T | nil` by
-      // the parser, so this case usually rides inside a TypeUnion. Emit `null`.
-      return factory.createLiteralTypeNode(factory.createNull());
+      // the parser, so this case usually rides inside a TypeUnion.
+      return nilTypeNode();
     case 'TypeUnion':
       return factory.createUnionTypeNode(t.types.map(compileType));
     case 'TypeIntersection':
@@ -95,7 +111,7 @@ export function compileType(t: TypeNode | null | undefined): ts.TypeNode {
 }
 
 function compileTypeReference(t: TypeReferenceNode): ts.TypeNode {
-  if (t.name === 'nil') return factory.createLiteralTypeNode(factory.createNull());
+  if (t.name === 'nil') return nilTypeNode();
 
   const kw = PRIMITIVE_TYPE_NAMES[t.name];
   if (kw !== undefined && !t.prefix && t.parameters.length === 0) {

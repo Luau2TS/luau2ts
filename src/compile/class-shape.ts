@@ -9,6 +9,7 @@ import type {
   Stat,
 } from '../parser/index.js';
 import type { CompileContext } from './context.js';
+import { compileType } from './type.js';
 
 const { factory } = ts;
 
@@ -296,9 +297,7 @@ export function compileClassPattern(
   const ctorFn = pattern.constructor ?? pattern.ctorFactory;
   if (ctorFn) {
     const fnExpr = ctorFn.func;
-    const params = (fnExpr.args ?? []).map((a) =>
-      factory.createParameterDeclaration(undefined, undefined, a.name),
-    );
+    const params = (fnExpr.args ?? []).map((a) => paramDecl(a));
     const body = ctorBody(fnExpr.body, pattern, ctx, compileBlockBody, compileExpr);
     // Prepend the harvested field-init statements so constructor params
     // are in scope when their values flow into `this.X`.
@@ -317,7 +316,14 @@ export function compileClassPattern(
   // rewrites *call* sites to `new Class(...)`; this static handles the
   // bare-reference case (e.g. `export default { new: Class.new }`) and
   // older code that hasn't been ported.
-  if (pattern.ctorFactory && !members.some((m) =>
+  //
+  // Skip in rbxts mode — roblox-ts reserves `new` as a class member name
+  // (it auto-generates a `Class.new()` Lua factory from `new Class()` TS
+  // calls), so emitting our own collides with TS roblox-ts: "Cannot use
+  // class field reserved for compiler internal usage." Value-position
+  // `<Class>.new` references aren't roblox-ts-clean to begin with; the
+  // user should refactor to `() => new Class(...)`.
+  if (ctx.compatMode !== 'rbxts' && pattern.ctorFactory && !members.some((m) =>
     ts.isMethodDeclaration(m)
       && m.modifiers?.some((mod) => mod.kind === ts.SyntaxKind.StaticKeyword)
       && ts.isIdentifier(m.name) && m.name.text === 'new',
@@ -368,9 +374,7 @@ export function compileClassPattern(
     if (nameExpr.type !== 'IndexName') continue;
     const methodName = nameExpr.index;
     const fnExpr = method.func;
-    const params = (fnExpr.args ?? []).map((a) =>
-      factory.createParameterDeclaration(undefined, undefined, a.name),
-    );
+    const params = (fnExpr.args ?? []).map((a) => paramDecl(a));
     // Variadic `function obj:method(...)` carries a `vararg` flag on the
     // FunctionExpr; surface it as a `...__varargs: unknown[]` rest param
     // so body uses of `__varargs[…]` resolve. compileFunctionShape does
@@ -549,6 +553,21 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
     return ts.visitEachChild(node, topLevel, undefined);
   }
   return topLevel(stat) as ts.Statement;
+}
+
+/** Build a typed parameter declaration from a Luau Local arg. Pulls the
+ *  TS type from the annotation when present; falls back to `unknown` so
+ *  roblox-ts's strict mode doesn't trip on implicit `any` (TS7006) and
+ *  also so it doesn't trip its own "Using values of type `any` is not
+ *  supported!" rejection. Nilable annotations (`T?`) keep the union but
+ *  the param doesn't get a `= null` default — class methods inherit
+ *  positional optionality from their interface, not from per-param
+ *  defaults. */
+function paramDecl(a: { name: string; annotation?: import('../parser/index.js').TypeNode | null }): ts.ParameterDeclaration {
+  const ty = a.annotation
+    ? compileType(a.annotation)
+    : factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+  return factory.createParameterDeclaration(undefined, undefined, a.name, undefined, ty);
 }
 
 /** Walk the `.new` factory body looking for the canonical
