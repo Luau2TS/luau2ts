@@ -41,12 +41,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "typescript": "^5.5.0"
+    "typescript": "^6.0.3"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
-    "@vitest/coverage-v8": "^2.0.0",
-    "vitest": "^2.0.0"
+    "@types/node": "^25.8.0",
+    "@vitest/coverage-v8": "^4.1.6",
+    "vitest": "^4.1.6"
   },
   "keywords": [
     "luau",
