@@ -2312,17 +2312,17 @@ export interface CompileOptions {
   /** Run TypeScript's compiler API on the emitted .ts source (Layer A
    *  post-emit type check). Diagnostics land in `CompileResult.errors`
    *  with `[ts:CODE]` prefix. Uses the bundled `typescript` package,
-   *  no extra install. Off by default. */
+   *  no extra install. Defaults to `true`; set to `false` to skip
+   *  (useful for batch compilation where ~500ms-per-file matters). */
   postEmitCheck?: boolean;
   /** Run Luau.Analysis on the input source via @luau2ts/analyzer
-   *  (Layer B pre-emit type check). Requires the optional
-   *  `@luau2ts/analyzer` package to be installed. Diagnostics land in
-   *  `CompileResult.errors` with `[luau:CODE]` prefix. If the analyzer
-   *  is not installed, a single soft warning is emitted and the option
-   *  no-ops. Off by default. */
+   *  (Layer B pre-emit type check). Diagnostics land in
+   *  `CompileResult.errors` with `[luau:CODE]` prefix. Defaults to
+   *  `true` when `@luau2ts/analyzer` is available on the resolution
+   *  path; otherwise no-ops silently. Set to `false` to skip. */
   preEmitCheck?: boolean;
-  /** Shorthand for `{ preEmitCheck: true, postEmitCheck: true }`. Runs
-   *  both layers. */
+  /** Explicitly enable both layers, even if `postEmitCheck` /
+   *  `preEmitCheck` were set to false individually. */
   typeCheck?: boolean;
 }
 
@@ -2475,24 +2475,59 @@ export async function compile(
     }
   }
 
-  // Layer A: post-emit TypeScript type check. Runs the bundled tsc over
-  // the emitted .ts source via an in-memory CompilerHost so we don't
-  // touch the filesystem or pull in external @types. strict:false so
-  // any-laden translations of untyped Luau don't drown the user in
-  // noise; users who want strict can run tsc --strict on the output.
-  if (options.postEmitCheck || options.typeCheck) {
+  // Layer A: post-emit TypeScript type check. Defaults to on; set
+  // postEmitCheck: false (or --no-check-ts at the CLI) to skip. Runs
+  // the bundled tsc over the emitted .ts source via an in-memory
+  // CompilerHost so we don't touch the filesystem or pull in external
+  // @types. strict:false so any-laden translations of untyped Luau
+  // don't drown the user in noise; users who want strict can run
+  // tsc --strict on the output.
+  const runLayerA = options.typeCheck === true || options.postEmitCheck !== false;
+  if (runLayerA) {
     const postEmitDiags = runPostEmitCheck(printed, sourceFileName);
     for (const d of postEmitDiags) parsed.errors.push(d);
   }
 
-  // Layer B: pre-emit Luau check. Will ship in @luau2ts/analyzer; until
-  // then, emit a single soft warning when the option is requested.
-  if (options.preEmitCheck || options.typeCheck) {
-    parsed.errors.push({
-      loc: { start: { line: 0, col: 0 }, end: { line: 0, col: 0 } },
-      message:
-        '[luau2ts] preEmitCheck (Luau-side type check) requires @luau2ts/analyzer, which is not yet published. Coming in a future release; see https://github.com/luau2ts/luau2ts/issues for status.',
-    });
+  // Layer B: pre-emit Luau check via @luau2ts/analyzer. Defaults to on
+  // when the package is installed; soft-fails silently otherwise (no
+  // soft warning, since "default-on" means we run when we can and
+  // skip when we can't, similar to Prettier formatting). Users can
+  // force-enable with typeCheck:true to get the soft warning when
+  // they're expecting the analyzer to be there.
+  const runLayerB = options.typeCheck === true || options.preEmitCheck === true || options.preEmitCheck !== false;
+  if (runLayerB) {
+    type AnalyzerMod = {
+      analyze: (
+        source: string,
+      ) => Promise<
+        { message: string; loc: { start: { line: number; col: number }; end: { line: number; col: number } } }[]
+      >;
+    };
+    let analyzerMod: AnalyzerMod | undefined;
+    try {
+      // Resolve the package name through an indirected variable so the
+      // TypeScript checker doesn't try to resolve it at compile time.
+      // The analyzer is an OPTIONAL peer; if it isn't installed we
+      // soft-fail below.
+      const analyzerPath = '@luau2ts' + '/analyzer';
+      analyzerMod = (await import(/* @vite-ignore */ analyzerPath)) as AnalyzerMod;
+    } catch {
+      // Analyzer not installed. If the user explicitly asked for the
+      // check (typeCheck:true or preEmitCheck:true), surface a single
+      // soft warning so they know it's silently skipped. Otherwise
+      // stay quiet because preEmitCheck defaults to "run if available".
+      if (options.typeCheck === true || options.preEmitCheck === true) {
+        parsed.errors.push({
+          loc: { start: { line: 0, col: 0 }, end: { line: 0, col: 0 } },
+          message:
+            '[luau2ts] preEmitCheck requested but @luau2ts/analyzer is not installed. Install with: pnpm add -D @luau2ts/analyzer',
+        });
+      }
+    }
+    if (analyzerMod) {
+      const diags = await analyzerMod.analyze(source);
+      for (const d of diags) parsed.errors.push(d);
+    }
   }
 
   let sourceMap: SourceMap | undefined;

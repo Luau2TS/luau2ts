@@ -5,11 +5,12 @@ import { describe, expect, it } from 'vitest';
 import { compile } from './index.js';
 
 async function emit(src: string, compatMode: 'native' | 'rbxts' = 'native'): Promise<string> {
-  // Test the AST-level emission, not Prettier's formatting decisions
-  // (which we test separately). pretty: false skips the prettier pass so
-  // assertions about double-quoted strings, 4-space indent, etc. stay
-  // stable. See compile.test.ts for the same pattern.
-  const r = await compile(src, { compatMode, pretty: false });
+  // Test the AST-level emission only. pretty:false skips Prettier so
+  // quoting and indentation assertions stay stable. postEmitCheck:false
+  // skips Layer A (the TypeScript type check) which would blow Vitest's
+  // 5s timeout on loops of small compiles. Both paths have their own
+  // dedicated tests.
+  const r = await compile(src, { compatMode, pretty: false, postEmitCheck: false });
   return r.source;
 }
 

@@ -8,9 +8,9 @@ import type { CompatMode } from '../compile/context.js';
 export interface ModeOptions {
   mode: CompatMode;
   sourcemap: boolean;
-  checkTs: boolean;
-  checkLuau: boolean;
-  typeCheck: boolean;
+  checkTs: boolean | undefined;
+  checkLuau: boolean | undefined;
+  typeCheck: boolean | undefined;
 }
 
 function compileOptionsFor(
@@ -22,9 +22,10 @@ function compileOptionsFor(
     compatMode: opts.mode,
   };
   if (opts.sourcemap) out.sourceMap = true;
-  if (opts.checkTs) out.postEmitCheck = true;
-  if (opts.checkLuau) out.preEmitCheck = true;
-  if (opts.typeCheck) out.typeCheck = true;
+  // Forward only EXPLICIT overrides; leave defaults to compile().
+  if (opts.checkTs !== undefined) out.postEmitCheck = opts.checkTs;
+  if (opts.checkLuau !== undefined) out.preEmitCheck = opts.checkLuau;
+  if (opts.typeCheck !== undefined) out.typeCheck = opts.typeCheck;
   return out;
 }
 

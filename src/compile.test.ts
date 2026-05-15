@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { compile as _compile, type CompileOptions } from './compile/index.js';
 
-// Test wrapper: defaults to pretty: false so assertions don't fight
-// Prettier's formatting decisions. The prettier path is exercised in
-// `compile — prettier`. Individual tests can re-enable by passing
-// `{ pretty: true }` explicitly.
+// Test wrapper: defaults to pretty: false (so assertions don't fight
+// Prettier's formatting decisions) and postEmitCheck: false (because
+// Layer A adds ~500ms per call, blowing past Vitest's 5s timeout on
+// any test that compiles in a loop). The Prettier and Layer A paths
+// are exercised by their own dedicated tests. Individual tests can
+// re-enable either by passing `{ pretty: true }` or
+// `{ postEmitCheck: true }` explicitly.
 const compile = (source: string, options?: CompileOptions) =>
-  _compile(source, { pretty: false, ...(options ?? {}) });
+  _compile(source, { pretty: false, postEmitCheck: false, ...(options ?? {}) });
 
 const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
 
@@ -632,8 +635,16 @@ describe('compile — type checking', () => {
     expect(tsErrors).toEqual([]);
   });
 
-  it('postEmitCheck is opt-in (no errors surface without the flag)', async () => {
-    const r = await _compile('local x: number = "hi"');
+  it('postEmitCheck is default-on (TS errors surface without any flag)', async () => {
+    // _compile is the un-wrapped compile from the module, so it sees
+    // the real defaults (postEmitCheck = true unless overridden).
+    const r = await _compile('local x: number = "hi"', { pretty: false });
+    const tsErrors = r.errors.filter((e) => e.message.includes('[ts:'));
+    expect(tsErrors.length).toBeGreaterThan(0);
+  });
+
+  it('postEmitCheck: false disables the check', async () => {
+    const r = await _compile('local x: number = "hi"', { pretty: false, postEmitCheck: false });
     const tsErrors = r.errors.filter((e) => e.message.includes('[ts:'));
     expect(tsErrors).toEqual([]);
   });

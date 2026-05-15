@@ -10,9 +10,10 @@ export interface ParsedArgs {
   output: string | undefined;
   mode: CompatMode;
   sourcemap: boolean;
-  checkLuau: boolean;
-  checkTs: boolean;
-  typeCheck: boolean;
+  /** undefined = use default (on); true / false = explicit override. */
+  checkLuau: boolean | undefined;
+  checkTs: boolean | undefined;
+  typeCheck: boolean | undefined;
   help: boolean;
   version: boolean;
 }
@@ -26,9 +27,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
     output: undefined,
     mode: 'rbxts',
     sourcemap: false,
-    checkLuau: false,
-    checkTs: false,
-    typeCheck: false,
+    checkLuau: undefined,
+    checkTs: undefined,
+    typeCheck: undefined,
     help: false,
     version: false,
   };
@@ -62,13 +63,30 @@ export function parseArgs(argv: string[]): ParsedArgs {
       i += 1;
       continue;
     }
+    if (arg === '--no-check-ts') {
+      result.checkTs = false;
+      i += 1;
+      continue;
+    }
     if (arg === '--check-luau') {
       result.checkLuau = true;
       i += 1;
       continue;
     }
+    if (arg === '--no-check-luau') {
+      result.checkLuau = false;
+      i += 1;
+      continue;
+    }
     if (arg === '--typecheck') {
       result.typeCheck = true;
+      i += 1;
+      continue;
+    }
+    if (arg === '--no-typecheck') {
+      result.typeCheck = false;
+      result.checkTs = false;
+      result.checkLuau = false;
       i += 1;
       continue;
     }
@@ -164,13 +182,17 @@ Flags:
                                                 provides Roblox's Luau API.
       --sourcemap         Emit a .ts.map next to each .ts.
       --check-ts          Run TypeScript's type checker over the emitted
-                          .ts source. Diagnostics print with [ts:CODE]
-                          prefix; non-zero exit on errors.
+                          .ts source (default: ON). Diagnostics print
+                          with [ts:CODE] prefix; non-zero exit on errors.
+      --no-check-ts       Skip the TypeScript post-emit check (faster
+                          batch compiles).
       --check-luau        Run Luau's type checker (Luau.Analysis) over
-                          the input. Requires @luau2ts/analyzer to be
-                          installed; currently emits a soft notice
-                          (analyzer ships in a future release).
-      --typecheck         Shorthand: --check-ts plus --check-luau.
+                          the input via @luau2ts/analyzer (default: ON
+                          when the analyzer package is installed).
+      --no-check-luau     Skip the Luau pre-emit check.
+      --typecheck         Force both layers on (errors if @luau2ts/analyzer
+                          is requested but not installed).
+      --no-typecheck      Skip both layers.
   -h, --help              Show this help text.
   -v, --version           Print the installed luau2ts version.
 `;
