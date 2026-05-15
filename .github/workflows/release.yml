@@ -2,14 +2,15 @@ name: Publish
 run-name: Publish ${{ inputs.version }} (@${{ github.actor }})
 
 # Triggered manually from the Actions tab. Enter the next version
-# (e.g. 0.1.0). The workflow bumps package.json, publishes to npm,
-# and pushes the resulting tag back.
+# (e.g. 0.2.0). The workflow bumps package.json, publishes to npm,
+# pushes the tag back, then creates a styled GitHub release whose
+# body is sourced from CHANGELOG.md.
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to publish (e.g. 0.1.0)'
+        description: 'Version to publish (e.g. 0.2.0)'
         required: true
         type: string
 
@@ -48,6 +49,59 @@ jobs:
           npm publish --access public
           git push
           git push --tags
-          npm owner add luau2ts || true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Extract changelog section for this version
+        run: |
+          node -e "
+            const fs = require('fs');
+            const v = process.env.VERSION;
+            const md = fs.readFileSync('CHANGELOG.md', 'utf8');
+            // Match the section between '## [vVERSION]' and the next '## '.
+            const re = new RegExp(\`## \\\\[\${v.replace(/\\\\./g, '\\\\\\\\.')}\\\\][^\\\\n]*\\\\n([\\\\s\\\\S]*?)(?=\\\\n## |\\$)\`);
+            const m = md.match(re);
+            const section = m ? m[1].trim() : '_No CHANGELOG entry found for this version._';
+            fs.writeFileSync('/tmp/release-body.md', section);
+          "
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - name: Compose release notes
+        run: |
+          cat > /tmp/release-notes.md << 'HEADER'
+          <div align="center">
+            <img src="https://raw.githubusercontent.com/luau2ts/luau2ts/main/static/img/logo.png" alt="luau2ts" width="160" />
+
+          # `luau2ts` v${{ inputs.version }}
+
+          **A Luau-to-TypeScript compiler for Roblox.**
+
+          [Docs](https://luau2ts.com) · [Playground](https://luau2ts.com/playground) · [npm](https://www.npmjs.com/package/luau2ts)
+          </div>
+
+          ---
+
+          HEADER
+          cat /tmp/release-body.md >> /tmp/release-notes.md
+          cat >> /tmp/release-notes.md << 'FOOTER'
+
+          ## Install
+
+          ```bash
+          npm install -g luau2ts@${{ inputs.version }}
+          ```
+
+          ## Try it live
+
+          [luau2ts.com/playground](https://luau2ts.com/playground)
+          FOOTER
+
+      - name: Create GitHub release
+        run: |
+          gh release create v${{ inputs.version }} \
+            --title "v${{ inputs.version }}" \
+            --notes-file /tmp/release-notes.md \
+            --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
