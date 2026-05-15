@@ -5,7 +5,11 @@ import { describe, expect, it } from 'vitest';
 import { compile } from './index.js';
 
 async function emit(src: string, compatMode: 'native' | 'rbxts' = 'native'): Promise<string> {
-  const r = await compile(src, { compatMode });
+  // Test the AST-level emission, not Prettier's formatting decisions
+  // (which we test separately). pretty: false skips the prettier pass so
+  // assertions about double-quoted strings, 4-space indent, etc. stay
+  // stable. See compile.test.ts for the same pattern.
+  const r = await compile(src, { compatMode, pretty: false });
   return r.source;
 }
 

@@ -41,6 +41,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "prettier": "^3.4.0",
     "typescript": "^5.5.0"
   },
   "devDependencies": {

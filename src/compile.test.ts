@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { compile } from './compile/index.js';
+import { compile as _compile, type CompileOptions } from './compile/index.js';
+
+// Test wrapper: defaults to pretty: false so assertions don't fight
+// Prettier's formatting decisions. The prettier path is exercised in
+// `compile — prettier`. Individual tests can re-enable by passing
+// `{ pretty: true }` explicitly.
+const compile = (source: string, options?: CompileOptions) =>
+  _compile(source, { pretty: false, ...(options ?? {}) });
 
 const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
 
@@ -567,7 +574,21 @@ describe('compile — runtime semantics', () => {
 describe('compile — header / sourcemap / comments', () => {
   it('always prepends a single-line "Compiled by" header', async () => {
     const r = await compile('local x = 1');
-    expect(r.source).toMatch(/^\/\/ Compiled by luau2ts v[\d.]+ — do not edit\./);
+    expect(r.source).toMatch(/^\/\/ Compiled by luau2ts v[\d.]+ \(do not edit\)\./);
+  });
+
+  it('pretty-prints output via Prettier by default', async () => {
+    // Compile through the un-wrapped function so Prettier runs.
+    const r = await _compile('local function greet(name)\n  print("hi " .. name)\nend\ngreet("world")');
+    // Prettier flips double-quoted string literals to single-quote (rbx-web .prettierrc).
+    expect(r.source).toContain("greet('world')");
+    // Prettier uses 2-space indents, the TS factory printer uses 4.
+    expect(r.source).toMatch(/\n {2}print\(/);
+    expect(r.source).not.toMatch(/\n {4}print\(/);
+    // Pretty: false skips Prettier and we get the factory printer output back.
+    const raw = await _compile('local function greet(name) print("hi " .. name) end\ngreet("world")', { pretty: false });
+    expect(raw.source).toContain('greet("world")');
+    expect(raw.source).toMatch(/\n {4}print\(/);
   });
 
   it('preserves the source file header comments when requested', async () => {

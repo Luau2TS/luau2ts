@@ -21,6 +21,7 @@ import {
   type TypeNode,
 } from '../parser/index.js';
 import ts from 'typescript';
+import { format as prettierFormat } from 'prettier';
 import { ARITH_DATATYPES, CompileContext, RUNTIME_MODULE, type CompatMode, type StaticValueType } from './context.js';
 import { lookupMacro } from './macros/index.js';
 // Side-effect imports — each module's top-level `registerMacro` calls
@@ -2275,7 +2276,7 @@ const COMPILER_VERSION = (pkgJson as { version: string }).version;
 const COMPILER_NAME = (pkgJson as { name: string }).name;
 // One-line header. The "DO NOT EDIT" warning was redundant — every dev
 // looking at the file already knows what `// Compiled by …` means.
-const COMPILER_HEADER = `// Compiled by ${COMPILER_NAME} v${COMPILER_VERSION} — do not edit.\n`;
+const COMPILER_HEADER = `// Compiled by ${COMPILER_NAME} v${COMPILER_VERSION} (do not edit).\n`;
 
 export interface CompileOptions {
   /** Path of the source file. Used in the source map's `sources` field. */
@@ -2288,14 +2289,18 @@ export interface CompileOptions {
   preserveComments?: boolean;
   /** Emit-shape compatibility mode.
    *
-   *  - `'native'` (default) — emit TS that imports stdlib helpers from
+   *  - `'native'` (default): emit TS that imports stdlib helpers from
    *    `luau2ts/runtime` and pairs with any Roblox runtime that mirrors
    *    Roblox's Luau API surface: `Vector3.new(...)`, `game:GetService(...)`, etc.
-   *  - `'rbxts'` — emit TS that mirrors what roblox-ts accepts as input:
+   *  - `'rbxts'`: emit TS that mirrors what roblox-ts accepts as input:
    *    `new Vector3(...)`, `import { Workspace } from "@rbxts/services"`,
    *    `new ClassName()` for `Instance.new("ClassName")`, etc.
    */
   compatMode?: CompatMode;
+  /** Run Prettier on the emitted TypeScript. Defaults to `true`. Disable
+   *  if you want raw TypeScript-printer output (faster, but the output is
+   *  4-space indented without canonical spacing around blocks). */
+  pretty?: boolean;
 }
 
 export interface CompileResult {
@@ -2422,6 +2427,30 @@ export async function compile(
   // generated and from which version of the compiler. Goes first so it's
   // visible above whatever the source author wrote.
   printed = `${COMPILER_HEADER}\n${printed}`;
+
+  // Pretty-print the final output via Prettier. The TS factory printer
+  // produces correct but ugly TypeScript: 4-space indents, no blank lines
+  // between top-level blocks, no consistent quoting. Prettier with rbx-web's
+  // .prettierrc rules brings it in line with how humans write TS. Source-map
+  // building runs AFTER this step so generated-line numbers match the
+  // final output the user sees.
+  if (options.pretty !== false) {
+    try {
+      printed = await prettierFormat(printed, {
+        parser: 'typescript',
+        semi: true,
+        singleQuote: true,
+        trailingComma: 'all',
+        printWidth: 100,
+        arrowParens: 'always',
+        endOfLine: 'lf',
+      });
+    } catch {
+      // If Prettier can't parse the output (parser bug, unusual syntax),
+      // fall back to the printer's raw output rather than failing the
+      // whole compile. Users can see exactly what we emitted.
+    }
+  }
 
   let sourceMap: SourceMap | undefined;
   if (options.sourceMap || options.inlineSourceMap) {
