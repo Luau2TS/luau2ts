@@ -3579,47 +3579,117 @@ function collectImplicitGlobals(parsed: ParseResult): Set<string> {
 }
 
 /** Post-process the printer output to add blank lines around top-level
- *  blocks (imports, function/class declarations, big control-flow). The
- *  TS factory printer doesn't do this — it just newlines between every
- *  statement — so we insert separators heuristically. The rules are
- *  conservative: only insert a blank line at boundaries between distinct
- *  *kinds* of top-level statements, and never inside a block. */
+ *  blocks. The TS factory printer just newlines between every statement,
+ *  which reads as a wall of code for a 600-line file. Prettier doesn't
+ *  add blank lines either — that's an opinion the user is supposed to
+ *  hold.
+ *
+ *  Rules, applied only at brace depth 0 so we don't disturb function
+ *  bodies:
+ *    1. After an `import` group: blank before the first non-import line.
+ *    2. After a `declare const X: ...;` group: blank before the next
+ *       non-`declare` line.
+ *    3. After a multi-line top-level statement (any statement whose body
+ *       brace closes back to depth 0): blank before the next statement.
+ *    4. Before a `function` or `class` declaration: blank (unless we're
+ *       already separated by blank or at file start).
+ *
+ *  String/template handling is approximate — we only track brace depth
+ *  and skip braces that appear inside string literals on the same line.
+ *  Multi-line template strings are rare in our emit; if they bite us we
+ *  can swap to a real tokenizer. */
 function beautifyOutput(source: string): string {
   const lines = source.split('\n');
   const out: string[] = [];
-  let prev: 'import' | 'class' | 'function' | 'control' | 'simple' | 'blank' | 'start' = 'start';
   let depth = 0;
+  // prevKind never actually takes 'blank' (we only update on non-blank
+  // lines), so omit it from the union.
+  let prevKind: 'import' | 'declare-const' | 'class' | 'function' | 'control' | 'simple' | 'start' = 'start';
+  let prevWasMultiline = false;
+  // Track whether the current statement started multi-line — flipped on
+  // when we first open a brace at depth 0, read off when we close back
+  // to 0 to decide whether the next top-level statement gets a blank.
+  let inMultilineStmt = false;
 
-  function classify(line: string): typeof prev {
+  function classify(line: string):
+    | 'import'
+    | 'declare-const'
+    | 'class'
+    | 'function'
+    | 'control'
+    | 'simple'
+    | 'blank'
+  {
     const trimmed = line.trim();
     if (trimmed === '') return 'blank';
     if (trimmed.startsWith('import ')) return 'import';
+    if (/^declare\s+(?:const|let|var|function|class|type|namespace|module|global)\b/.test(trimmed))
+      return 'declare-const';
     if (/^(?:export\s+)?(?:abstract\s+)?class\b/.test(trimmed)) return 'class';
     if (/^(?:export\s+)?(?:async\s+)?function\b/.test(trimmed)) return 'function';
     if (/^(?:if|for|while|do|switch|try)\b/.test(trimmed)) return 'control';
     return 'simple';
   }
 
-  for (const raw of lines) {
-    // Track brace depth on the *previous* line; statements outside any
-    // block are at depth 0.
-    if (depth === 0 && prev !== 'start' && prev !== 'blank') {
-      const kind = classify(raw);
-      // Add a blank line at the boundary between distinct kinds.
-      const isBoundary =
-        (prev === 'import' && kind !== 'import')
-        || (prev === 'class' && kind !== 'blank')
-        || (prev === 'function' && kind !== 'blank')
-        || (prev === 'control' && kind !== 'blank')
-        || (kind === 'class' || kind === 'function');
-      if (isBoundary && kind !== 'blank') out.push('');
+  // Approximate brace-depth tracker that skips runs of characters inside
+  // single/double/back quotes on the same line. Returns `[opens, closes]`.
+  function braceDelta(line: string): [number, number] {
+    let opens = 0, closes = 0;
+    let inStr: '"' | "'" | '`' | null = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i]!;
+      if (inStr) {
+        if (c === '\\') { i++; continue; }
+        if (c === inStr) inStr = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+      if (c === '/' && line[i + 1] === '/') break; // line comment — ignore rest
+      if (c === '{') opens++;
+      else if (c === '}') closes++;
     }
+    return [opens, closes];
+  }
+
+  for (const raw of lines) {
+    const trimmed = raw.trim();
+    const kind = trimmed === '' ? 'blank' : classify(raw);
+
+    // Decide whether to insert a blank line BEFORE this line.
+    if (
+      depth === 0
+      && kind !== 'blank'
+      && prevKind !== 'start'
+    ) {
+      const isBoundary =
+        // 1. import → non-import
+        (prevKind === 'import' && kind !== 'import')
+        // 2. declare → non-declare
+        || (prevKind === 'declare-const' && kind !== 'declare-const')
+        // 3. previous statement was multi-line, separate from next
+        || prevWasMultiline
+        // 4. before a class/function declaration
+        || kind === 'class' || kind === 'function';
+      if (isBoundary) out.push('');
+    }
+
     out.push(raw);
-    if (raw.trim() !== '') prev = classify(raw);
-    // Update brace depth based on this line's contribution.
-    for (const c of raw) {
-      if (c === '{') depth++;
-      else if (c === '}') depth = Math.max(0, depth - 1);
+
+    // Update tracking based on this line's braces.
+    const [opens, closes] = braceDelta(raw);
+    if (depth === 0 && opens > 0) inMultilineStmt = true;
+    depth = Math.max(0, depth + opens - closes);
+    if (kind !== 'blank') {
+      prevKind = kind;
+      // Statement just ended (we're back to depth 0 after non-blank line).
+      // The previous-line tracker for "was the just-finished statement
+      // multi-line" needs to fire on the line where depth bottoms out.
+      if (depth === 0) {
+        prevWasMultiline = inMultilineStmt;
+        inMultilineStmt = false;
+      } else {
+        prevWasMultiline = false;
+      }
     }
   }
   return out.join('\n');
