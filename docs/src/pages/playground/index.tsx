@@ -10,6 +10,7 @@ export default function PlaygroundPage(): ReactNode {
     >
       <BrowserOnly fallback={<div style={{ padding: '2rem' }}>Loading playground…</div>}>
         {() => {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
           const Playground = require('./Playground').default;
           return <Playground />;
         }}

@@ -20,6 +20,11 @@
       "types": "./dist/runtime/index.d.ts",
       "import": "./dist/runtime/index.js",
       "default": "./dist/runtime/index.js"
+    },
+    "./rojo": {
+      "types": "./dist/rojo/index.d.ts",
+      "import": "./dist/rojo/index.js",
+      "default": "./dist/rojo/index.js"
     }
   },
   "files": [

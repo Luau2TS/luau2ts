@@ -11,3 +11,7 @@ coverage
 !.vscode/settings.json
 .idea
 .vercel
+
+# Docusaurus build artifacts
+docs/.docusaurus
+docs/build

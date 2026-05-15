@@ -18,10 +18,15 @@ function nodeShimPlugin(): PluginOptions {
   const shimPath = path.resolve(__dirname, 'src', 'empty-shim.js');
   return {
     name: 'luau2ts-node-shim',
-    configureWebpack() {
+    configureWebpack(_config: unknown, isServer: boolean) {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const webpack = require('webpack');
-      return {
+      // During SSR, leave `luau2ts` unresolved: the playground page is
+      // wrapped in <BrowserOnly>, so the SSR bundle never reaches the
+      // dynamic import. Marking it external prevents webpack from
+      // generating the require.resolveWeak code-splitting wrapper that
+      // server.bundle.js cannot evaluate.
+      const cfg: Record<string, unknown> = {
         resolve: {
           fallback: {
             module: false,
@@ -40,6 +45,10 @@ function nodeShimPlugin(): PluginOptions {
           ),
         ],
       };
+      if (isServer) {
+        cfg.externals = ['luau2ts'];
+      }
+      return cfg;
     },
   } as unknown as PluginOptions;
 }
@@ -51,6 +60,10 @@ const config: Config = {
 
   url: 'https://luau2ts.dev',
   baseUrl: '/',
+
+  future: {
+    v4: true,
+  },
 
   organizationName: 'luau2ts',
   projectName: 'luau2ts',

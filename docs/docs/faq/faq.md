@@ -8,9 +8,9 @@ slug: /faq
 
 A growing list of common questions. PRs welcome.
 
-- [Handling untyped Luau](./missing-types)
-- [Formatting the emitted TypeScript](./output-formatting)
-- [Running alongside roblox-ts](./roblox-ts-interop)
+- [Handling untyped Luau](/docs/faq/missing-types)
+- [Formatting the emitted TypeScript](/docs/faq/output-formatting)
+- [Running alongside roblox-ts](/docs/faq/roblox-ts-interop)
 
 ## Quick answers
 
