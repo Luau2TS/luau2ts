@@ -445,6 +445,28 @@ declare task: {
 declare shared: { [string]: any }
 declare _G: { [string]: any }
 
+-- Top-level Roblox/Luau globals not in Luau's core stdlib that real
+-- scripts call constantly. Without these, every `warn(...)`/`tick()`/
+-- `wait(0.5)` etc. fires `UnknownSymbol`. Each accounted for tens of
+-- errors across the rbxl corpus before being declared.
+--
+-- Use the value-binding form (`declare name: (sig) -> ret`) rather
+-- than `declare function name(...)` — the function form trips Luau's
+-- definition-file parser on variadic args ("All declaration parameters
+-- must be annotated", "got '...'").
+declare warn: (...any) -> ()
+declare tick: () -> number
+declare elapsedTime: () -> number
+declare settings: () -> any
+declare UserSettings: () -> any
+declare typeof: (value: any) -> string
+
+-- Pre-`task.library` schedulers. Still valid in Roblox today; older
+-- scripts use them in place of `task.wait` / `task.spawn` / `task.delay`.
+declare wait: (seconds: number?) -> (number, number)
+declare spawn: (callback: (...any) -> (), ...any) -> ()
+declare delay: (duration: number, callback: (...any) -> (), ...any) -> ()
+
 -- ---- Roblox script globals -------------------------------------------
 -- Concrete `game`, `script`, `workspace`, etc. are declared after the
 -- generated class bodies so DataModel/Workspace/etc. are already in scope.

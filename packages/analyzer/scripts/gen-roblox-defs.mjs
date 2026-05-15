@@ -124,11 +124,39 @@ function safeIdent(name) {
   return name;
 }
 
+// -- Known-optional-param overrides --------------------------------------
+//
+// The API dump under-marks several params: real Roblox accepts them as
+// optional, but the dump's Parameter entry has no `Default` field. The
+// analyzer then rejects ~every script's call as CountMismatch. Listed
+// here as `<ClassName>.<MethodName>: <paramName>`. Each entry promotes
+// the param to nilable (`T?` instead of `T`) so callers can omit it.
+const KNOWN_OPTIONAL_PARAMS = new Set([
+  'Instance.WaitForChild:timeOut',
+  'Instance.FindFirstAncestorWhichIsA:recursive',
+  'Instance.FindFirstChildWhichIsA:recursive',
+  'Instance.IsA:isType',
+  'Workspace.Raycast:raycastParams',
+  'Workspace.Spherecast:raycastParams',
+  'Workspace.Blockcast:raycastParams',
+  'BasePart.GetPartBoundsInBox:overlapParams',
+  'BasePart.GetPartBoundsInRadius:overlapParams',
+  'BasePart.GetPartsInPart:overlapParams',
+  'Players.GetPlayerFromCharacter:character',
+  'TweenService.Create:tweenInfo',
+]);
+
+function isParamOptional(p, ownerClass, methodName) {
+  if (p.Default !== undefined) return true;
+  if (KNOWN_OPTIONAL_PARAMS.has(`${ownerClass}.${methodName}:${p.Name}`)) return true;
+  return false;
+}
+
 // -- Format a function-type member ---------------------------------------
 //
 // Roblox methods are `instance:Method(args)` which in Luau-types is
 // `Method: (self: ClassName, args) -> ret`. Emit that form.
-function formatFunctionType(params, retType) {
+function formatFunctionType(params, retType, ownerClass, methodName) {
   const parts = [];
   for (const p of params || []) {
     let typeStr = mapType(p.Type, 'param');
@@ -137,7 +165,7 @@ function formatFunctionType(params, retType) {
     } else {
       // Optional with default value: mark the slot nilable so callers
       // can omit it.
-      if (p.Default !== undefined && !typeStr.endsWith('?') && typeStr !== 'any') {
+      if (isParamOptional(p, ownerClass, methodName) && !typeStr.endsWith('?') && typeStr !== 'any') {
         typeStr += '?';
       }
       parts.push(`${safeIdent(p.Name)}: ${typeStr}`);
@@ -147,14 +175,14 @@ function formatFunctionType(params, retType) {
   return `(${parts.join(', ')}) -> ${ret}`;
 }
 
-function formatMethodType(className, params, retType) {
+function formatMethodType(className, params, retType, methodName) {
   const parts = [`self: ${className}`];
   for (const p of params || []) {
     let typeStr = mapType(p.Type, 'param');
     if (typeStr === '...any') {
       parts.push('...any');
     } else {
-      if (p.Default !== undefined && !typeStr.endsWith('?') && typeStr !== 'any') {
+      if (isParamOptional(p, className, methodName) && !typeStr.endsWith('?') && typeStr !== 'any') {
         typeStr += '?';
       }
       parts.push(`${safeIdent(p.Name)}: ${typeStr}`);
@@ -194,7 +222,7 @@ function emitMember(className, m, lines) {
       break;
     }
     case 'Function': {
-      const sig = formatMethodType(className, m.Parameters, m.ReturnType);
+      const sig = formatMethodType(className, m.Parameters, m.ReturnType, m.Name);
       lines.push(`    ${name}: ${sig}`);
       break;
     }
@@ -210,7 +238,7 @@ function emitMember(className, m, lines) {
     case 'Callback': {
       // Callbacks are settable function-typed slots. The optional `?` lets
       // scripts assign nil to clear them (idiomatic Roblox pattern).
-      const sig = formatFunctionType(m.Parameters, m.ReturnType);
+      const sig = formatFunctionType(m.Parameters, m.ReturnType, className, m.Name);
       lines.push(`    ${name}: ${sig}?`);
       break;
     }
@@ -241,7 +269,7 @@ function topoSortClasses(classes) {
   return order;
 }
 
-function emitClass(c, lines) {
+function emitClass(c, lines, serviceNames) {
   // Skip the synthetic root marker; everything below it gets `extends`.
   // Roblox marks the absolute base with Superclass `<<<ROOT>>>` (typically
   // Instance's superclass).
@@ -255,6 +283,17 @@ function emitClass(c, lines) {
     if (seen.has(m.Name)) continue;
     seen.add(m.Name);
     emitMember(c.Name, m, lines);
+  }
+  // DataModel: also expose every Service as a property. Real Roblox
+  // accepts `game.Players`, `game.Debris`, etc. as a shortcut for
+  // `game:GetService(...)`. Without these, the analyzer flags 30+
+  // legitimate accesses across the corpus.
+  if (c.Name === 'DataModel' && serviceNames) {
+    for (const svc of serviceNames) {
+      if (seen.has(svc)) continue;
+      seen.add(svc);
+      lines.push(`    ${svc}: ${svc}`);
+    }
   }
   lines.push('end');
   lines.push('');
@@ -338,9 +377,17 @@ if (missingDataTypes.length > 0) {
   out.push('');
 }
 
+// Collect service class names so DataModel can expose them as direct
+// properties (matching real Roblox where `game.Players` works as a
+// shortcut for `game:GetService("Players")`).
+const serviceNames = dump.Classes
+  .filter((c) => c.Tags?.includes('Service'))
+  .map((c) => c.Name)
+  .sort();
+
 out.push('-- Classes (generated) -------------------------------------------');
 out.push('');
-for (const c of sortedClasses) emitClass(c, out);
+for (const c of sortedClasses) emitClass(c, out, serviceNames);
 
 emitEnums(dump.Enums, out);
 

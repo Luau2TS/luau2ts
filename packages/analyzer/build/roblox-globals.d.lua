@@ -455,6 +455,28 @@ declare task: {
 declare shared: { [string]: any }
 declare _G: { [string]: any }
 
+-- Top-level Roblox/Luau globals not in Luau's core stdlib that real
+-- scripts call constantly. Without these, every `warn(...)`/`tick()`/
+-- `wait(0.5)` etc. fires `UnknownSymbol`. Each accounted for tens of
+-- errors across the rbxl corpus before being declared.
+--
+-- Use the value-binding form (`declare name: (sig) -> ret`) rather
+-- than `declare function name(...)` — the function form trips Luau's
+-- definition-file parser on variadic args ("All declaration parameters
+-- must be annotated", "got '...'").
+declare warn: (...any) -> ()
+declare tick: () -> number
+declare elapsedTime: () -> number
+declare settings: () -> any
+declare UserSettings: () -> any
+declare typeof: (value: any) -> string
+
+-- Pre-`task.library` schedulers. Still valid in Roblox today; older
+-- scripts use them in place of `task.wait` / `task.spawn` / `task.delay`.
+declare wait: (seconds: number?) -> (number, number)
+declare spawn: (callback: (...any) -> (), ...any) -> ()
+declare delay: (duration: number, callback: (...any) -> (), ...any) -> ()
+
 -- ---- Roblox script globals -------------------------------------------
 -- Concrete `game`, `script`, `workspace`, etc. are declared after the
 -- generated class bodies so DataModel/Workspace/etc. are already in scope.
@@ -512,7 +534,7 @@ declare class Instance
     RemoveTag: (self: Instance, tag: string) -> ()
     ResetPropertyToDefault: (self: Instance, name: string) -> ()
     SetAttribute: (self: Instance, attribute: string, value: any) -> ()
-    WaitForChild: (self: Instance, childName: string, timeOut: number) -> Instance
+    WaitForChild: (self: Instance, childName: string, timeOut: number?) -> Instance
     children: (self: Instance) -> { Instance }
     clone: (self: Instance) -> Instance
     destroy: (self: Instance) -> ()
@@ -4124,7 +4146,7 @@ declare class Players extends Instance
     numPlayers: number
     Chat: (self: Players, message: string) -> ()
     GetPlayerByUserId: (self: Players, userId: number) -> Player
-    GetPlayerFromCharacter: (self: Players, character: Model) -> Player
+    GetPlayerFromCharacter: (self: Players, character: Model?) -> Player
     GetPlayers: (self: Players) -> { Instance }
     SetChatStyle: (self: Players, style: EnumItem?) -> ()
     TeamChat: (self: Players, message: string) -> ()
@@ -4718,6 +4740,217 @@ declare class DataModel extends ServiceProvider
     ItemChanged: RBXScriptSignal
     Loaded: RBXScriptSignal
     OnClose: () -> ...any?
+    AdService: AdService
+    AnalyticsService: AnalyticsService
+    AnimationClipProvider: AnimationClipProvider
+    AnimationFromVideoCreatorService: AnimationFromVideoCreatorService
+    AnimationFromVideoCreatorStudioService: AnimationFromVideoCreatorStudioService
+    AppStorageService: AppStorageService
+    AppUpdateService: AppUpdateService
+    AssetCounterService: AssetCounterService
+    AssetDeliveryProxy: AssetDeliveryProxy
+    AssetImportService: AssetImportService
+    AssetManagerService: AssetManagerService
+    AssetService: AssetService
+    AvatarChatService: AvatarChatService
+    AvatarEditorService: AvatarEditorService
+    AvatarImportService: AvatarImportService
+    BadgeService: BadgeService
+    BrowserService: BrowserService
+    BulkImportService: BulkImportService
+    CSGDictionaryService: CSGDictionaryService
+    CacheableContentProvider: CacheableContentProvider
+    CalloutService: CalloutService
+    CaptureService: CaptureService
+    ChangeHistoryService: ChangeHistoryService
+    Chat: Chat
+    ClusterPacketCache: ClusterPacketCache
+    CollectionService: CollectionService
+    CommandService: CommandService
+    ConfigureServerService: ConfigureServerService
+    ContentProvider: ContentProvider
+    ContextActionService: ContextActionService
+    ControllerService: ControllerService
+    CookiesService: CookiesService
+    CoreGui: CoreGui
+    CorePackages: CorePackages
+    CoreScriptDebuggingManagerHelper: CoreScriptDebuggingManagerHelper
+    CoreScriptSyncService: CoreScriptSyncService
+    CrossDMScriptChangeListener: CrossDMScriptChangeListener
+    DataModelPatchService: DataModelPatchService
+    DataStoreService: DataStoreService
+    Debris: Debris
+    DebuggablePluginWatcher: DebuggablePluginWatcher
+    DebuggerConnectionManager: DebuggerConnectionManager
+    DebuggerManager: DebuggerManager
+    DebuggerUIService: DebuggerUIService
+    DeviceIdService: DeviceIdService
+    DraftsService: DraftsService
+    DraggerService: DraggerService
+    EventIngestService: EventIngestService
+    ExperienceAuthService: ExperienceAuthService
+    FaceAnimatorService: FaceAnimatorService
+    FacialAnimationRecordingService: FacialAnimationRecordingService
+    FacialAnimationStreamingServiceV2: FacialAnimationStreamingServiceV2
+    FlagStandService: FlagStandService
+    FlyweightService: FlyweightService
+    FriendService: FriendService
+    GamePassService: GamePassService
+    GamepadService: GamepadService
+    Geometry: Geometry
+    GeometryService: GeometryService
+    GoogleAnalyticsConfiguration: GoogleAnalyticsConfiguration
+    GroupService: GroupService
+    GuiService: GuiService
+    GuidRegistryService: GuidRegistryService
+    HSRDataContentProvider: HSRDataContentProvider
+    HapticService: HapticService
+    HeightmapImporterService: HeightmapImporterService
+    Hopper: Hopper
+    HttpRbxApiService: HttpRbxApiService
+    HttpService: HttpService
+    ILegacyStudioBridge: ILegacyStudioBridge
+    IXPService: IXPService
+    IncrementalPatchBuilder: IncrementalPatchBuilder
+    InsertService: InsertService
+    JointsService: JointsService
+    KeyboardService: KeyboardService
+    KeyframeSequenceProvider: KeyframeSequenceProvider
+    LSPFileSyncService: LSPFileSyncService
+    LanguageService: LanguageService
+    LegacyStudioBridge: LegacyStudioBridge
+    Lighting: Lighting
+    LiveScriptingService: LiveScriptingService
+    LocalStorageService: LocalStorageService
+    LocalizationService: LocalizationService
+    LodDataService: LodDataService
+    LogService: LogService
+    LoginService: LoginService
+    LuaWebService: LuaWebService
+    LuauScriptAnalyzerService: LuauScriptAnalyzerService
+    MarketplaceService: MarketplaceService
+    MaterialGenerationService: MaterialGenerationService
+    MaterialService: MaterialService
+    MemStorageService: MemStorageService
+    MemoryStoreService: MemoryStoreService
+    MeshContentProvider: MeshContentProvider
+    MessageBusService: MessageBusService
+    MessagingService: MessagingService
+    MetaBreakpointManager: MetaBreakpointManager
+    MouseService: MouseService
+    NetworkClient: NetworkClient
+    NetworkServer: NetworkServer
+    NetworkSettings: NetworkSettings
+    NonReplicatedCSGDictionaryService: NonReplicatedCSGDictionaryService
+    NotificationService: NotificationService
+    OmniRecommendationsService: OmniRecommendationsService
+    OpenCloudService: OpenCloudService
+    PackageService: PackageService
+    PackageUIService: PackageUIService
+    PatchBundlerFileWatch: PatchBundlerFileWatch
+    PathfindingService: PathfindingService
+    PermissionsService: PermissionsService
+    PhysicsService: PhysicsService
+    PlaceStatsService: PlaceStatsService
+    PlacesService: PlacesService
+    PlayerEmulatorService: PlayerEmulatorService
+    Players: Players
+    PluginDebugService: PluginDebugService
+    PluginGuiService: PluginGuiService
+    PluginManagementService: PluginManagementService
+    PluginPolicyService: PluginPolicyService
+    PointsService: PointsService
+    PolicyService: PolicyService
+    ProcessInstancePhysicsService: ProcessInstancePhysicsService
+    ProximityPromptService: ProximityPromptService
+    PublishService: PublishService
+    RbxAnalyticsService: RbxAnalyticsService
+    RemoteCursorService: RemoteCursorService
+    RemoteDebuggerServer: RemoteDebuggerServer
+    RenderSettings: RenderSettings
+    ReplicatedFirst: ReplicatedFirst
+    ReplicatedStorage: ReplicatedStorage
+    RobloxPluginGuiService: RobloxPluginGuiService
+    RobloxReplicatedStorage: RobloxReplicatedStorage
+    RobloxServerStorage: RobloxServerStorage
+    RomarkService: RomarkService
+    RtMessagingService: RtMessagingService
+    RunService: RunService
+    RuntimeScriptService: RuntimeScriptService
+    SafetyService: SafetyService
+    ScriptChangeService: ScriptChangeService
+    ScriptCloneWatcher: ScriptCloneWatcher
+    ScriptCloneWatcherHelper: ScriptCloneWatcherHelper
+    ScriptCommitService: ScriptCommitService
+    ScriptContext: ScriptContext
+    ScriptEditorService: ScriptEditorService
+    ScriptRegistrationService: ScriptRegistrationService
+    ScriptService: ScriptService
+    Selection: Selection
+    SelectionHighlightManager: SelectionHighlightManager
+    ServerScriptService: ServerScriptService
+    ServerStorage: ServerStorage
+    ServiceVisibilityService: ServiceVisibilityService
+    SessionService: SessionService
+    SharedTableRegistry: SharedTableRegistry
+    ShorelineUpgraderService: ShorelineUpgraderService
+    SmoothVoxelsUpgraderService: SmoothVoxelsUpgraderService
+    SnippetService: SnippetService
+    SocialService: SocialService
+    SolidModelContentProvider: SolidModelContentProvider
+    SoundService: SoundService
+    SpawnerService: SpawnerService
+    StarterGui: StarterGui
+    StarterPack: StarterPack
+    StarterPlayer: StarterPlayer
+    Stats: Stats
+    StopWatchReporter: StopWatchReporter
+    Studio: Studio
+    StudioAssetService: StudioAssetService
+    StudioData: StudioData
+    StudioDeviceEmulatorService: StudioDeviceEmulatorService
+    StudioPublishService: StudioPublishService
+    StudioScriptDebugEventListener: StudioScriptDebugEventListener
+    StudioSdkService: StudioSdkService
+    StudioService: StudioService
+    StylingService: StylingService
+    TaskScheduler: TaskScheduler
+    TeamCreateData: TeamCreateData
+    TeamCreatePublishService: TeamCreatePublishService
+    TeamCreateService: TeamCreateService
+    Teams: Teams
+    TeleportService: TeleportService
+    TemporaryCageMeshProvider: TemporaryCageMeshProvider
+    TemporaryScriptService: TemporaryScriptService
+    TestService: TestService
+    TextBoxService: TextBoxService
+    TextChatService: TextChatService
+    TextService: TextService
+    ThirdPartyUserService: ThirdPartyUserService
+    TimerService: TimerService
+    ToastNotificationService: ToastNotificationService
+    TouchInputService: TouchInputService
+    TracerService: TracerService
+    TutorialService: TutorialService
+    TweenService: TweenService
+    UGCAvatarService: UGCAvatarService
+    UGCValidationService: UGCValidationService
+    UnvalidatedAssetService: UnvalidatedAssetService
+    UserInputService: UserInputService
+    UserService: UserService
+    UserStorageService: UserStorageService
+    VRService: VRService
+    VRStatusService: VRStatusService
+    VersionControlService: VersionControlService
+    VideoCaptureService: VideoCaptureService
+    VideoService: VideoService
+    VirtualInputManager: VirtualInputManager
+    VirtualUser: VirtualUser
+    VisibilityCheckDispatcher: VisibilityCheckDispatcher
+    VisibilityService: VisibilityService
+    Visit: Visit
+    VoiceChatInternal: VoiceChatInternal
+    VoiceChatService: VoiceChatService
 end
 
 declare class GenericSettings extends ServiceProvider
@@ -5533,7 +5766,7 @@ declare class Tween extends TweenBase
 end
 
 declare class TweenService extends Instance
-    Create: (self: TweenService, instance: Instance, tweenInfo: TweenInfo, propertyTable: { [string]: any }) -> Tween
+    Create: (self: TweenService, instance: Instance, tweenInfo: TweenInfo?, propertyTable: { [string]: any }) -> Tween
     GetValue: (self: TweenService, alpha: number, easingStyle: EnumItem, easingDirection: EnumItem) -> number
 end
 
