@@ -37,9 +37,9 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - run: pnpm build
+      - run: pnpm -r build
 
-      - run: pnpm test
+      - run: pnpm -r test
 
       - name: Publish to npm
         run: |
