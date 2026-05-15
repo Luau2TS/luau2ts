@@ -1,0 +1,212 @@
+.root {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - var(--ifm-navbar-height));
+  padding: 1.5rem;
+  gap: 1rem;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.title {
+  font-size: 1.5rem;
+  margin: 0;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.modeLabel {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+}
+
+.select {
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  background: var(--ifm-background-color);
+  color: var(--ifm-font-color-base);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.9rem;
+}
+
+.busy {
+  font-size: 0.85rem;
+  color: var(--ifm-color-emphasis-600);
+  font-style: italic;
+  min-width: 6rem;
+}
+
+.panes {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  flex: 1;
+  min-height: 28rem;
+  position: relative;
+}
+
+.pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--ifm-card-background-color);
+}
+
+.paneHeader {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  background: var(--ifm-color-emphasis-100);
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
+  color: var(--ifm-color-emphasis-800);
+}
+
+.editorWrap {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.editorGutter {
+  width: 2.75rem;
+  flex-shrink: 0;
+  padding: 0.75rem 0;
+  text-align: right;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.85rem;
+  line-height: 1.55;
+  color: var(--ifm-color-emphasis-500);
+  background: var(--ifm-color-emphasis-100);
+  user-select: none;
+  overflow: hidden;
+  /* Tabular numerals so line counts past 9 don't shift width. */
+  font-variant-numeric: tabular-nums;
+}
+
+.editorGutterLine {
+  padding-right: 0.75rem;
+}
+
+.editor {
+  flex: 1;
+  resize: none;
+  border: 0;
+  outline: 0;
+  padding: 0.75rem 1rem;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.85rem;
+  line-height: 1.55;
+  background: transparent;
+  color: var(--ifm-font-color-base);
+  white-space: pre;
+  overflow: auto;
+  min-width: 0;
+}
+
+.editor:focus {
+  outline: 0;
+}
+
+.output {
+  flex: 1;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  font-size: 0.85rem !important;
+  line-height: 1.55 !important;
+  overflow: auto;
+  padding: 0.75rem 1rem !important;
+}
+
+.output > div {
+  display: flex;
+  align-items: flex-start;
+}
+
+.lineNum {
+  display: inline-block;
+  width: 2rem;
+  text-align: right;
+  margin-right: 0.75rem;
+  color: var(--ifm-color-emphasis-500);
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.errors {
+  border-top: 1px solid var(--ifm-color-danger-darker);
+  background: rgba(214, 31, 44, 0.08);
+  padding: 0.5rem 0.75rem;
+  max-height: 8rem;
+  overflow: auto;
+}
+
+.errorRow {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.8rem;
+  color: var(--ifm-color-danger-darker);
+  white-space: pre-wrap;
+}
+
+/*
+ * Swap button: round, sits on the gap between the two panes. Z-indexed
+ * above the panes' borders so it bridges them visually (Google Translate
+ * style).
+ */
+.swap {
+  order: 1;
+  align-self: center;
+  width: 44px;
+  height: 44px;
+  margin: 0 -22px;
+  border-radius: 50%;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  background: var(--ifm-background-color);
+  color: var(--ifm-color-emphasis-800);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  transition: transform 120ms ease, color 120ms ease, border-color 120ms ease;
+  flex-shrink: 0;
+}
+
+.swap:hover {
+  color: var(--ifm-color-primary);
+  border-color: var(--ifm-color-primary);
+  transform: rotate(180deg);
+}
+
+.swap:active {
+  transform: rotate(180deg) scale(0.96);
+}
+
+@media (max-width: 800px) {
+  .panes {
+    flex-direction: column;
+  }
+  .swap {
+    margin: -22px 0;
+    align-self: center;
+  }
+}

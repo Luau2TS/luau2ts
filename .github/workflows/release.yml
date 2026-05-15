@@ -1,0 +1,55 @@
+name: Release
+
+# Publishes to npm when a tag `vX.Y.Z` is pushed. Uses npm OIDC trusted
+# publishing for provenance attestation — no long-lived NPM_TOKEN secret
+# required. Before this workflow can publish for the first time, the
+# package needs to be configured for trusted publishing on npm:
+#   https://docs.npmjs.com/trusted-publishers
+# (link this repo + workflow file under the package's "Trusted Publisher"
+# settings on npmjs.com.)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write   # required for npm OIDC publishing
+
+jobs:
+  publish:
+    name: publish to npm
+    runs-on: ubuntu-latest
+
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/luau2ts
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      - run: pnpm test
+
+      - run: npm publish --provenance --access public

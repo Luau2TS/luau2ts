@@ -1,0 +1,13 @@
+node_modules
+dist
+*.tsbuildinfo
+.DS_Store
+*.log
+.env
+.env.local
+coverage
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+.vercel

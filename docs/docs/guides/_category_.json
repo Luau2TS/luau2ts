@@ -1,0 +1,8 @@
+{
+  "label": "Guides",
+  "position": 7,
+  "link": {
+    "type": "generated-index",
+    "description": "Task-focused walkthroughs: Rojo conversion, datatype mapping, migration, debugging, custom emit, and Luau-specific syntax features."
+  }
+}

@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a compilation bug, runtime issue, or unexpected behaviour.
+labels: ['bug']
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you expect, what did you see instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal Luau reproduction
+      description: The smallest Luau snippet (or a link to one) that demonstrates the bug.
+      render: lua
+    validations:
+      required: true
+
+  - type: textarea
+    id: emitted
+    attributes:
+      label: What luau2ts emitted (if applicable)
+      description: Paste the compiled TypeScript, or describe what came out.
+      render: typescript
+
+  - type: input
+    id: version
+    attributes:
+      label: luau2ts version
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      placeholder: e.g. 22.10.0
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: e.g. Windows 11, macOS 14, Ubuntu 22.04

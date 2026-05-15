@@ -1,0 +1,593 @@
+import { describe, expect, it } from 'vitest';
+import { compile } from './compile/index.js';
+
+const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+
+describe('compile — top-level', () => {
+  it('emits a runtime import only when helpers are needed', async () => {
+    const noHelpers = await compile('local x = 1');
+    expect(noHelpers.source).not.toContain('luau2ts/runtime');
+    expect(noHelpers.helpers).toEqual([]);
+
+    const withHelpers = await compile('local x = #t');
+    expect(withHelpers.source).toContain('luau2ts/runtime');
+    expect(withHelpers.helpers).toContain('lualen');
+  });
+
+  it('preserves variable names', async () => {
+    const r = await compile('local myVariable = 42');
+    expect(r.source).toContain('let myVariable = 42');
+  });
+
+  it('escapes JS-reserved variable names', async () => {
+    const r = await compile('local class = 1\nlocal yield = 2');
+    expect(r.source).toContain('class_');
+    expect(r.source).toContain('yield_');
+  });
+
+  it('returns parse errors without throwing', async () => {
+    const r = await compile('local = ');
+    expect(r.errors.length).toBeGreaterThan(0);
+    expect(typeof r.source).toBe('string');
+  });
+});
+
+describe('compile — statements', () => {
+  it('local declarations with multiple vars and values', async () => {
+    const r = await compile('local a, b, c = 1, 2, 3');
+    expect(norm(r.source)).toContain('let a = 1, b = 2, c = 3');
+  });
+
+  it('local with no initializer', async () => {
+    const r = await compile('local x');
+    expect(norm(r.source)).toContain('let x;');
+  });
+
+  it('expression statement', async () => {
+    const r = await compile('print("hi")');
+    expect(norm(r.source)).toContain('print("hi");');
+  });
+
+  it('multi-value return: native mode emits JS array', async () => {
+    const r = await compile('local function pair() return "abc", 123 end');
+    expect(r.source).toContain('return ["abc", 123];');
+    expect(r.source).not.toContain('$tuple');
+    expect(r.source).not.toContain('LuaTuple');
+  });
+
+  it('multi-value return: rbxts mode emits $tuple + LuaTuple annotation', async () => {
+    const r = await compile('local function pair() return "abc", 123 end', {
+      compatMode: 'rbxts',
+    });
+    expect(r.source).toContain('$tuple("abc", 123)');
+    expect(r.source).toContain('LuaTuple');
+    expect(r.source).toMatch(/import \{[^}]*LuaTuple[^}]*\} from "@rbxts\/types"/);
+  });
+
+  it('multi-value return: rbxts mode tuple arity uses max across branches', async () => {
+    const r = await compile(
+      `local function f(x)
+         if x then return 1, 2 end
+         return 0
+       end`,
+      { compatMode: 'rbxts' },
+    );
+    expect(r.source).toContain('$tuple(1, 2)');
+    expect(r.source).toMatch(/LuaTuple<\[\s*unknown\s*,\s*unknown\s*\]>/);
+  });
+
+  it('single-value return: rbxts mode leaves the return alone', async () => {
+    const r = await compile('local function f() return 42 end', { compatMode: 'rbxts' });
+    expect(r.source).toContain('return 42;');
+    expect(r.source).not.toContain('$tuple');
+    expect(r.source).not.toContain('LuaTuple');
+  });
+
+  it('return statements', async () => {
+    expect(norm((await compile('return')).source)).toContain('return;');
+    expect(norm((await compile('return 1')).source)).toContain('return 1;');
+    expect(norm((await compile('return 1, 2')).source)).toContain('return [1, 2];');
+  });
+
+  it('assignment + compound assignment', async () => {
+    const a = await compile('x = 5');
+    expect(norm(a.source)).toContain('x = 5;');
+    const b = await compile('x += 1');
+    expect(norm(b.source)).toContain('x += 1;');
+    const c = await compile('s ..= "hi"');
+    expect(c.source).toContain('luaConcat');
+  });
+
+  it('if / elseif / else', async () => {
+    const r = await compile('if a then x = 1 elseif b then x = 2 else x = 3 end');
+    const out = r.source;
+    // Conditions on unknown-typed expressions route through `isTruthy()`
+    // — shorter than the inline 6-clause fallback we used previously.
+    expect(out).toContain('isTruthy(a)');
+    expect(out).toContain('isTruthy(b)');
+    expect(out).toContain('if (');
+    expect(out).toContain('else if');
+    expect(out).toContain('else');
+    expect(r.helpers).toContain('isTruthy');
+  });
+
+  it('compiles if conditions before branch bodies can narrow locals', async () => {
+    const r = await compile(`
+      local minP
+      if not minP then
+        minP = Vector3.new(0, 0, 0)
+      else
+        minP = Vector3.new(minP.X, minP.Y, minP.Z)
+      end
+    `);
+    expect(r.source).toContain('isTruthy(minP)');
+    expect(r.source).not.toContain('if (!(true))');
+  });
+
+  it('while loop with break/continue', async () => {
+    const r = await compile('while x do break end');
+    expect(r.source).toContain('while (isTruthy(x))');
+    expect(r.source).toContain('break;');
+
+    const r2 = await compile('while x do continue end');
+    expect(r2.source).toContain('continue;');
+  });
+
+  it('repeat/until inverts condition (do-while equivalent)', async () => {
+    const r = await compile('repeat x = 1 until done');
+    expect(r.source).toContain('do {');
+    expect(r.source).toContain('} while (!isTruthy(done))');
+  });
+});
+
+describe('compile — expressions', () => {
+  it('every literal kind', async () => {
+    expect((await compile('return nil')).source).toContain('return undefined;');
+    expect((await compile('return true')).source).toContain('return true;');
+    expect((await compile('return false')).source).toContain('return false;');
+    expect((await compile('return 42')).source).toContain('return 42;');
+    expect((await compile('return 3.14')).source).toContain('return 3.14;');
+    expect((await compile('return "hi"')).source).toContain('return "hi";');
+    expect((await compile('return -5')).source).toContain('return -5;');
+  });
+
+  it('binary arithmetic routes through helpers (so Vector3/CFrame ops work)', async () => {
+    const r = await compile('return a + b * c - d / e % f');
+    // Helpers are required because JS has no operator overloading on
+    // objects; luaAdd / luaMul / etc. fast-path numeric operands but
+    // dispatch to .add/.mul/__add/__mul on Roblox-style objects.
+    expect(r.helpers).toEqual(
+      expect.arrayContaining(['luaAdd', 'luaMul', 'luaSub', 'luaDiv', 'luaMod']),
+    );
+  });
+
+  it('arithmetic on statically-typed datatypes routes through methods', async () => {
+    // `Vector3.new(...)` narrows the result to datatype:Vector3, so the
+    // subsequent `+` skips the `luaAdd` indirection and emits `.add(…)`.
+    const r = await compile(`
+      local v1 = Vector3.new(1, 2, 3)
+      local v2 = Vector3.new(4, 5, 6)
+      local sum = v1 + v2
+      local scaled = v1 * 2
+    `);
+    expect(r.source).toContain('v1.add(v2)');
+    expect(r.source).toContain('v1.mul(2)');
+    expect(r.helpers ?? []).not.toContain('luaAdd');
+    expect(r.helpers ?? []).not.toContain('luaMul');
+  });
+
+  it('annotated Vector3 parameter narrows for arithmetic', async () => {
+    const r = await compile(`
+      local function add(a: Vector3, b: Vector3) return a + b end
+    `);
+    expect(r.source).toContain('a.add(b)');
+    expect(r.helpers ?? []).not.toContain('luaAdd');
+  });
+
+  it('mixed datatype + unknown still uses helper (safe fallback)', async () => {
+    const r = await compile('return a + Vector3.new(0, 1, 0)');
+    // Left is unknown, so we keep luaAdd to dispatch via the right's __add.
+    expect(r.helpers).toContain('luaAdd');
+  });
+
+  it('comparison operators', async () => {
+    const r = await compile('return a == b, a ~= b, a < b, a <= b');
+    // == routes through luaEq (handles __eq metamethod); < and <= stay direct
+    expect(r.helpers).toContain('luaEq');
+    expect(r.source).toContain('!luaEq(a, b)'); // ~= is !luaEq
+    expect(r.source).toContain('a < b');
+    expect(r.source).toContain('a <= b');
+  });
+
+  it('and/or/not route through Lua-truthiness helpers', async () => {
+    const r = await compile('return a and b or not c');
+    expect(r.helpers).toContain('isTruthy');
+    expect(r.helpers).not.toEqual(expect.arrayContaining(['luaAnd', 'luaOr', 'luaNot']));
+  });
+
+  it('string concat (..) — both literal sides fold to template literal', async () => {
+    const r = await compile('return "a" .. "b"');
+    // Beautified emit: when at least one side is statically string, fold
+    // to a TS template literal; no luaConcat helper needed.
+    expect(r.source).toContain('`ab`');
+    expect(r.helpers ?? []).not.toContain('luaConcat');
+  });
+
+  it('string concat (..) — mixed string + unknown produces template literal', async () => {
+    const r = await compile('return "hello, " .. name');
+    expect(r.source).toContain('`hello, ${name}`');
+    expect(r.helpers ?? []).not.toContain('luaConcat');
+  });
+
+  it('string concat (..) — both unknown sides keep luaConcat helper', async () => {
+    const r = await compile('return a .. b');
+    expect(r.helpers).toContain('luaConcat');
+  });
+
+  it('floor division (//) uses luaIdiv', async () => {
+    const r = await compile('return a // b');
+    expect(r.helpers).toContain('luaIdiv');
+  });
+
+  it('length (#) uses lualen', async () => {
+    const r = await compile('return #t');
+    expect(r.helpers).toContain('lualen');
+  });
+
+  it('unary minus emits direct -x', async () => {
+    const r = await compile('return -a');
+    expect(r.source).toContain('return -a;');
+  });
+
+  it('property access via dot and bracket', async () => {
+    expect((await compile('return t.k')).source).toContain('t.k');
+    expect((await compile('return t["a key"]')).source).toContain('t["a key"]');
+  });
+
+  it('regular calls and method calls (`obj:m(arg)`)', async () => {
+    expect((await compile('return f(1, 2)')).source).toContain('f(1, 2)');
+    expect((await compile('return t:m(1)')).source).toContain('t.m(1)');
+  });
+
+  it('parenthesized groups preserved', async () => {
+    const r = await compile('return (a + b) * c');
+    // Arithmetic now routes through helpers — the group structure shows
+    // up as nested calls.
+    expect(r.source).toContain('luaMul((luaAdd(a, b)), c)');
+  });
+});
+
+describe('compile — functions', () => {
+  it('non-yielding functions skip the async modifier', async () => {
+    // `pure(x)` body has no awaits → emit a sync function.
+    const pureSrc = await compile('local function pure(x) return x * 2 end');
+    expect(pureSrc.source).not.toContain('async function pure');
+    expect(pureSrc.source).toContain('function pure');
+
+    // Calling `task.wait` is a yielding call → keep the async modifier.
+    const yieldSrc = await compile('local function withWait() task.wait(1) end');
+    expect(yieldSrc.source).toContain('async function withWait');
+  });
+
+  it('local function declaration', async () => {
+    const r = await compile('local function add(a, b) return a + b end');
+    expect(norm(r.source)).toContain('function add(a, b)');
+    expect(r.source).toContain('return luaAdd(a, b)');
+  });
+
+  it('global function declaration', async () => {
+    const r = await compile('function greet(name) return "hi " .. name end');
+    expect(norm(r.source)).toContain('function greet(name)');
+  });
+
+  it('member function (`function obj.m(args) end`)', async () => {
+    // No yielding calls inside; emitted as plain (non-async) function.
+    const r = await compile('function obj.fn(x) return x end');
+    expect(r.source).toContain('obj.fn = function');
+    expect(r.source).not.toContain('async function');
+  });
+
+  it('member function with yielding call → async', async () => {
+    const r = await compile('function obj.fn() wait(1) end');
+    expect(r.source).toContain('obj.fn = async function');
+  });
+
+  it('assignment with yielding function rhs propagates await to call sites', async () => {
+    // Old Roblox Animate scripts declare `waitForChild` as a plain global
+    // assignment with a function expression rhs (not `function name() end`).
+    // The scanYieldingFunctions pre-pass must catalog these so call sites
+    // get `await` — otherwise `Humanoid = waitForChild(...)` binds a Promise
+    // and `Humanoid.Died.connect(...)` blows up with "Cannot read properties
+    // of undefined (reading 'connect')".
+    const r = await compile(
+      'waitForChild = function(p, n) return p.ChildAdded:wait() end\n' +
+      'local h = waitForChild(figure, "Humanoid")\n',
+    );
+    expect(r.source).toContain('waitForChild = async function');
+    expect(r.source).toContain('await waitForChild(figure');
+  });
+
+  it('method with self bound to this', async () => {
+    const r = await compile('function t:greet(name) return name end');
+    // The self-binding line is generated inside the method body.
+    expect(r.source).toContain('const self = this');
+  });
+
+  it('anonymous function expression', async () => {
+    const r = await compile('local f = function(x) return x * 2 end');
+    // No yielding calls — async modifier omitted.
+    expect(r.source).toContain('let f = function');
+    expect(r.source).not.toContain('async function');
+    expect(r.source).toContain('return luaMul(x, 2)');
+  });
+
+  it('typed parameters and return', async () => {
+    const r = await compile('local function add(a: number, b: number): number return a + b end');
+    expect(r.source).toContain('a: number');
+    expect(r.source).toContain('b: number');
+    expect(r.source).toContain('): number');
+  });
+
+  it('vararg functions become rest parameters', async () => {
+    const r = await compile('local function f(...) return ... end');
+    expect(r.source).toContain('...__varargs');
+  });
+});
+
+describe('compile — tables', () => {
+  it('list-only emits an array literal', async () => {
+    const r = await compile('local t = {1, 2, 3}');
+    expect(r.source).toContain('let t = [1, 2, 3]');
+  });
+
+  it('record-only emits an object literal with identifier keys', async () => {
+    const r = await compile('local t = {name = "x", count = 5}');
+    expect(r.source).toContain('name: "x"');
+    expect(r.source).toContain('count: 5');
+  });
+
+  it('mixed list+record emits an object with 1-indexed numeric keys', async () => {
+    const r = await compile('local t = {1, 2, foo = "bar"}');
+    expect(r.source).toContain('1: 1');
+    expect(r.source).toContain('2: 2');
+    expect(r.source).toContain('foo: "bar"');
+  });
+
+  it('general (computed) keys with [expr] = value', async () => {
+    const r = await compile('local t = {["a key"] = 1}');
+    expect(r.source).toContain('["a key"]: 1');
+  });
+});
+
+describe('compile — for loops', () => {
+  // Beautified emit: numeric `for` loops with constant-positive step
+  // become idiomatic `for (let i = 1; i <= N; i++)` instead of the
+  // hoisted-bounds-with-runtime-direction-check expansion. Negative-step
+  // and runtime-step variants still use the slower expansion.
+
+  it('numeric for loop with default step → i++', async () => {
+    const r = await compile('for i = 1, 10 do print(i) end');
+    expect(r.source).toContain('for (let i = 1; i <= 10; i++)');
+    expect(r.source).not.toContain('__for_i_to');
+  });
+
+  it('numeric for with literal positive step → i += step', async () => {
+    const r = await compile('for i = 1, 10, 2 do end');
+    expect(r.source).toContain('for (let i = 1; i <= 10; i += 2)');
+    expect(r.source).not.toContain('__for_i_step');
+  });
+
+  it('numeric for with literal negative step → i-- / i -= step', async () => {
+    const r1 = await compile('for i = 10, 1, -1 do end');
+    expect(r1.source).toContain('for (let i = 10; i >= 1; i--)');
+    const r2 = await compile('for i = 10, 0, -2 do end');
+    expect(r2.source).toContain('for (let i = 10; i >= 0; i -= 2)');
+  });
+
+  it('numeric for with runtime step keeps the iterator-protocol expansion', async () => {
+    const r = await compile('for i = 1, 10, x do end');
+    // x is a runtime expression — direction unknown statically — so we
+    // fall back to the hoisted-bounds form.
+    expect(r.source).toContain('__for_i_to');
+    expect(r.source).toContain('__for_i_step');
+  });
+
+  it('for _, v in ipairs(arr) → indexed array loop', async () => {
+    const r = await compile('for _, v in ipairs(arr) do print(v) end');
+    expect(r.source).toMatch(/for \(let __i_\d+ = 0; __i_\d+ < arr\.length; __i_\d+\+\+\)/);
+    expect(r.source).toMatch(/let v = arr\[__i_\d+\]/);
+    expect(r.source).not.toContain('__iter');
+  });
+
+  it('for i, v in ipairs(arr) → indexed array loop with 1-indexed prelude', async () => {
+    const r = await compile('for i, v in ipairs(arr) do print(i, v) end');
+    expect(r.source).toMatch(/for \(let __i_\d+ = 0; __i_\d+ < arr\.length; __i_\d+\+\+\)/);
+    expect(r.source).toMatch(/let i = __i_\d+ \+ 1/);
+    expect(r.source).toMatch(/let v = arr\[__i_\d+\]/);
+  });
+
+  it('for k in pairs(t) → for (let k of pairKeys(t))', async () => {
+    const r = await compile('for k in pairs(t) do print(k) end');
+    expect(r.source).toContain('for (let k of pairKeys(t))');
+  });
+
+  it('for k, v in pairs(t) → pairKeys + pairValue lookup', async () => {
+    const r = await compile('for k, v in pairs(t) do print(k, v) end');
+    expect(r.source).toContain('for (let k of pairKeys(t))');
+    expect(r.source).toContain('pairValue(t, k)');
+  });
+
+  it('pairs hoist temps are unique for non-identifier tables', async () => {
+    const r = await compile(`
+      for k, v in pairs(getA()) do print(k, v) end
+      for k, v in pairs(getB()) do print(k, v) end
+    `);
+    const hoists = [...r.source.matchAll(/const (__t_\d+) = get[AB]\(\)/g)];
+    expect(hoists).toHaveLength(2);
+    expect(hoists[0]![1]).not.toBe(hoists[1]![1]);
+  });
+
+  it('non-pairs/ipairs iterator falls back to the protocol expansion', async () => {
+    const r = await compile('for k, v in customIter do print(k, v) end');
+    expect(r.source).toMatch(/let \[__iter_\d+, __state_\d+, __ctrl_\d+\]/);
+    expect(r.source).toContain('while (true)');
+    expect(r.source).toMatch(/let \[k, v\] = __step_\d+/);
+  });
+
+  it('slow generic iterator temps are unique across sibling loops', async () => {
+    const r = await compile(`
+      for k, v in customIter do print(k, v) end
+      for k, v in otherIter do print(k, v) end
+    `);
+    const iterDeclarations = [...r.source.matchAll(/let \[(__iter_\d+), (__state_\d+), (__ctrl_\d+)\]/g)];
+    expect(iterDeclarations).toHaveLength(2);
+    expect(iterDeclarations[0]![1]).not.toBe(iterDeclarations[1]![1]);
+    expect(iterDeclarations[0]![2]).not.toBe(iterDeclarations[1]![2]);
+    expect(iterDeclarations[0]![3]).not.toBe(iterDeclarations[1]![3]);
+  });
+});
+
+describe('compile — types', () => {
+  it('local with type annotation emits TS type', async () => {
+    const r = await compile('local x: number = 1');
+    expect(r.source).toContain('let x: number = 1');
+  });
+
+  it('typed locals with generic refs', async () => {
+    const r = await compile('local x: { [string]: number } = {}');
+    expect(r.source).toContain('[key: string]: number');
+  });
+
+  it('union, intersection, optional', async () => {
+    const r = await compile(
+      'local a: number | string = 1\nlocal b: A & B = nil\nlocal c: string? = nil',
+    );
+    expect(r.source).toContain('number | string');
+    expect(r.source).toContain('A & B');
+    // string? in Luau desugars to string | nil
+    expect(r.source).toContain('string | null');
+  });
+
+  it('typeof reference', async () => {
+    const r = await compile('local t: typeof(x) = nil');
+    expect(r.source).toContain('typeof x');
+  });
+
+  it('singleton string and bool types', async () => {
+    const r = await compile('local k: "literal" | true = nil');
+    expect(r.source).toContain('"literal" | true');
+  });
+});
+
+describe('compile — type aliases & declares', () => {
+  it('type alias with generics', async () => {
+    const r = await compile('type Box<T> = { value: T }');
+    expect(r.source).toContain('type Box<T>');
+    expect(r.source).toContain('value: T');
+  });
+
+  it('exported type alias', async () => {
+    const r = await compile('export type Foo = number');
+    expect(r.source).toContain('export type Foo = number');
+  });
+
+  it('declare global', async () => {
+    const r = await compile('declare game: any');
+    expect(r.source).toContain('declare const game: any');
+  });
+
+  it('declare function', async () => {
+    const r = await compile('declare function require(p: string): any');
+    expect(r.source).toContain('declare function require');
+    expect(r.source).toContain('p: string');
+  });
+});
+
+describe('compile — multi-return destructuring', () => {
+  it('local with multiple LHS and single Call RHS destructures', async () => {
+    const r = await compile('local a, b = pairs(t)');
+    expect(r.source).toContain('let [a, b] = multiret(pairs(t))');
+  });
+
+  it('assign with multiple LHS and single Call RHS destructures', async () => {
+    const r = await compile('a, b = pairs(t)');
+    expect(r.source).toContain('[a, b] = multiret(pairs(t))');
+  });
+
+  it('local with paired RHS does NOT destructure', async () => {
+    const r = await compile('local a, b = 1, 2');
+    expect(r.source).toContain('let a = 1, b = 2');
+  });
+});
+
+describe('compile — expressions: type assertion / if-else / interp string', () => {
+  it('type assertion `x :: T` becomes `(x as T)`', async () => {
+    const r = await compile('local x = y :: string');
+    expect(r.source).toContain('y as string');
+  });
+
+  it('if-else expression becomes a ternary', async () => {
+    const r = await compile('local x = if a then 1 else 2');
+    expect(r.source).toContain('isTruthy(a)');
+    expect(r.source).toContain('? 1 : 2');
+  });
+
+  it('interpolated string emits a TS template literal', async () => {
+    const r = await compile('local s = `hi {name}`');
+    expect(r.source).toContain('`hi ${name}`');
+  });
+});
+
+describe('compile — runtime semantics', () => {
+  it('Lua nil maps to JS undefined', async () => {
+    const r = await compile('local x = nil');
+    expect(r.source).toContain('let x = undefined');
+  });
+
+  it('Lua truthiness wraps conditional expressions, not the value itself', async () => {
+    // `local x = a and b` — luaAnd returns the value, NOT a boolean.
+    // The conditional uses isTruthy() to wrap the test, but the chosen
+    // branch is the original operand value (no implicit cast to bool).
+    const r = await compile('local x = a and b');
+    expect(r.source).toContain('let x = isTruthy(a)');
+    expect(r.source).toContain('? b : a;');
+    expect(r.source).not.toContain('luaAnd(a, b)');
+    // `if a then` — isTruthy *is* called on the condition for control flow.
+    const r2 = await compile('if a then x = 1 end');
+    expect(r2.source).toContain('isTruthy(a)');
+  });
+
+  it('logical operators short-circuit awaited right-hand sides lazily', async () => {
+    const r = await compile('local x = a and wait(1)');
+    expect(r.source).toContain('let x = isTruthy(a)');
+    expect(r.source).toContain('? await wait(1) : a;');
+  });
+});
+
+describe('compile — header / sourcemap / comments', () => {
+  it('always prepends a single-line "Compiled by" header', async () => {
+    const r = await compile('local x = 1');
+    expect(r.source).toMatch(/^\/\/ Compiled by luau2ts v[\d.]+ — do not edit\./);
+  });
+
+  it('preserves the source file header comments when requested', async () => {
+    const r = await compile('-- Top of file\n-- Authored by tony\nlocal x = 1', {
+      preserveComments: true,
+    });
+    expect(r.source).toContain('// Top of file');
+    expect(r.source).toContain('// Authored by tony');
+  });
+
+  it('emits a v3 source map when requested', async () => {
+    const r = await compile('local x = 1\nlocal y = 2', { sourceMap: true });
+    expect(r.sourceMap).toBeDefined();
+    expect(r.sourceMap!.version).toBe(3);
+    expect(r.sourceMap!.sources).toEqual(['input.luau']);
+    expect(r.sourceMap!.mappings.length).toBeGreaterThan(0);
+  });
+
+  it('inlines the source map when inlineSourceMap is set', async () => {
+    const r = await compile('local x = 1', { inlineSourceMap: true });
+    expect(r.source).toContain('//# sourceMappingURL=data:application/json;base64,');
+  });
+});
