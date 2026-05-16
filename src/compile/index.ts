@@ -1624,13 +1624,41 @@ function buildAssignmentStatement(
  *  on write the property exists at runtime so plain access works. */
 function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
   if (target.type === 'IndexName') {
-    // Phase 1 of rbxts cleanup dropped the `<DetectedClass>.member = …`
-    // `(class as any).member = …` LHS cast. That cast was for Luau's
-    // monkey-patch idiom (`ProfileService.GetProfileStore = function
-    // …`) — extending a class statically at runtime. roblox-ts
-    // doesn't support that pattern; Phase 2 will handle it via
-    // module augmentation declarations alongside the class. Until
-    // then, monkey-patch writes will surface TS2339.
+    // Phase 2: when target is `<simpleRef>.<name>` in rbxts mode,
+    // cast the receiver to `Record<string, unknown>` so writes to
+    // ANY property name typecheck — supports Luau's monkey-patch
+    // idiom (`ProfileService.GetProfileStore = function …`, `API
+    // .OnEquippedChanged = signal.Event`). The receiver's declared
+    // members are preserved on READ sites; only WRITES route
+    // through Record. Skip when the target receiver is `self` —
+    // class-method body writes (`self.X = …`) must hit the class
+    // declaration, not a generic record. Skip when the property
+    // name isn't a valid identifier (we use literal forms then).
+    const isSelf =
+      (target.expr.type === 'Local' && (target.expr as { name: string }).name === 'self')
+      || (target.expr.type === 'Global' && (target.expr as { name: string }).name === 'self');
+    if (
+      ctx.compatMode === 'rbxts'
+      && !isSelf
+      && (target.expr.type === 'Local' || target.expr.type === 'Global')
+      && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(target.index)
+    ) {
+      return factory.createPropertyAccessExpression(
+        factory.createParenthesizedExpression(
+          factory.createAsExpression(
+            factory.createAsExpression(
+              compileExpr(target.expr, ctx),
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createTypeReferenceNode('Record', [
+              factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ]),
+          ),
+        ),
+        factory.createIdentifier(propertyName(target.index)),
+      );
+    }
     return factory.createPropertyAccessExpression(
       compileExpr(target.expr, ctx),
       factory.createIdentifier(propertyName(target.index)),
