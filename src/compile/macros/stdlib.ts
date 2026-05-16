@@ -262,12 +262,17 @@ function emitMathPassthrough(name: string) {
     // params) flow into math's numeric slots without TS2345. The
     // generic compileCall castArgsForCall hook doesn't fire for
     // macro-rewritten calls (macros bypass it), so we apply the
-    // cast here.
+    // cast here. Wrap the inner expression in parens first — `??`
+    // and other binary operators bind LOOSER than `as`, so a bare
+    // `X ?? 0 as unknown as number` would parse as `X ?? (0 as
+    // unknown as number)` and miss the X branch.
     const args = ctx.compatMode === 'rbxts'
       ? compiledArgs.map((a) =>
           factory.createAsExpression(
             factory.createAsExpression(
-              a,
+              ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
+                ? factory.createParenthesizedExpression(a)
+                : a,
               factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
             ),
             factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),

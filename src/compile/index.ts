@@ -3472,10 +3472,17 @@ function castArgsForCall(
       return arg;
     }
     if (ts.isAsExpression(arg)) return arg;
-    // Wrap arrow-function args in parens before casting — arrow
-    // `() => { … } as T` would parse as arrow returning `T`, not
-    // as a cast.
-    const inner = (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg))
+    // Wrap arrow/function/binary/conditional args in parens before
+    // casting — `as` binds tighter than `??`/`&&`/`||`, so a bare
+    // `x ?? y as T` would parse as `x ?? (y as T)` and miss the x
+    // branch. Arrow `() => { … } as T` would parse as arrow
+    // returning T. Parenthesising fixes both.
+    const inner = (
+      ts.isArrowFunction(arg)
+      || ts.isFunctionExpression(arg)
+      || ts.isBinaryExpression(arg)
+      || ts.isConditionalExpression(arg)
+    )
       ? factory.createParenthesizedExpression(arg)
       : arg;
     return factory.createAsExpression(
@@ -3557,7 +3564,9 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       ...args.slice(1).map((a) =>
         factory.createAsExpression(
           factory.createAsExpression(
-            a,
+            ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
+              ? factory.createParenthesizedExpression(a)
+              : a,
             factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
           ),
           numStr,
@@ -3655,7 +3664,9 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
         formattedArgs = args.map((a) =>
           factory.createAsExpression(
             factory.createAsExpression(
-              a,
+              ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
+                ? factory.createParenthesizedExpression(a)
+                : a,
               factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
             ),
             numStr,
