@@ -3877,10 +3877,18 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     // .method()`) is too broad to cast unconditionally — it would
     // strip valuable type info for receivers whose declared types
     // are correct (any-cast results from WaitForChild fallbacks,
-    // typed @rbxts/services chains, etc.).
+    // typed @rbxts/services chains, etc.) — BUT for known signal
+    // methods (`:Connect`, `:Fire`, `:Wait`) the receiver type is
+    // typically too narrow (a union of RBXScriptSignal generics
+    // with incompatible `this` contexts) or already `unknown` from
+    // a structural-shape leaf. Cast through Record for these.
     const receiverIsIndexExpr =
       ctx.compatMode === 'rbxts' && expr.func.expr.type === 'IndexExpr';
-    const needsReceiverCast = receiverIsIndexExpr;
+    const isSignalMethod =
+      ctx.compatMode === 'rbxts'
+      && SIGNAL_METHODS.has(expr.func.index)
+      && expr.func.expr.type === 'IndexName';
+    const needsReceiverCast = receiverIsIndexExpr || isSignalMethod;
     const innerRecv = needsReceiverCast
       ? factory.createParenthesizedExpression(
           factory.createAsExpression(
@@ -4056,6 +4064,19 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
  *  `script.Helpers`, etc. type-check. Subsequent `.Parent` and
  *  FindFirstChild casts compose. */
 const RBX_DYNAMIC_ROOTS = new Set(['game', 'workspace', 'script', 'plugin']);
+
+/** Method names that real Roblox scripts call on RBXScriptSignal
+ *  values (`:Connect(fn)`, `:Fire(...)`, `:Wait()`, `:Once(fn)`).
+ *  Detecting these on a chained receiver (`obj.field:Connect(fn)`)
+ *  lets us cast the receiver through Record on the way to the
+ *  call — the receiver's @rbxts/types declaration is often too
+ *  narrow (union of incompatible `RBXScriptSignal<T>` generics) or
+ *  already `unknown` (structural-shape leaf). Disconnect lives on
+ *  RBXScriptConnection but follows the same pattern. */
+const SIGNAL_METHODS = new Set([
+  'Connect', 'ConnectParallel', 'Once', 'Fire', 'Wait',
+  'Disconnect',
+]);
 
 const INSTANCE_LOOSE_METHODS = new Set([
   'FindFirstChild',
