@@ -33,6 +33,7 @@ import './macros/instance.js';
 import './macros/stdlib.js';
 import './rbxts-runtime.js';
 import { detectClasses, compileClassPattern, type ClassPattern } from './class-shape.js';
+import { collectLocalNames, collectShapes, shapeToTypeNode } from './shape-infer.js';
 import { compileType, compileTypePack, setAliasArities, setTypeCompatMode } from './type.js';
 import {
   buildSourceMap,
@@ -393,20 +394,30 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       // table" semantics, but that propagates `any` into every
       // downstream usage and trips roblox-ts's no-any rule N times.
       //
-      // The narrow cases we still need a hint for:
-      //   • `let x;` (no init AND no annotation) — TS infers undefined
-      //     in strict mode and rejects later writes (TS7034). Annotate
-      //     as `unknown` so it's writable AND roblox-ts-clean.
-      //   • `let x = nil` (init is ConstantNil) — same problem,
-      //     annotate as `unknown` with an `undefined` initializer.
-      //   • table-init locals: drop the annotation entirely and let
-      //     TS infer. Some downstream `obj.X = …` writes will fail
-      //     against the inferred type — that's the surface area
-      //     Phase 2 fixes with per-variable shape inference.
+      // Phase 2 (rbxts-only): if the surrounding function body
+      // exposes a non-empty access shape for this local (e.g. `let
+      // origSize = button.Size; origSize.X.Scale; origSize.Y.Offset`),
+      // materialize the shape as a structural type annotation so
+      // downstream chained access typechecks without TS18046.
+      //
+      // The narrow fallbacks if no shape applies:
+      //   • `let x;` (no init AND no annotation) — annotate as
+      //     `unknown` so subsequent writes don't fail TS7034.
+      //   • `let x = nil` — same, annotate as `unknown` so TS
+      //     doesn't narrow to literal `undefined`.
+      //   • table-init / other: leave bare and let TS infer.
       let typeNode: ts.TypeNode | undefined = v.annotation ? compileType(v.annotation) : undefined;
       const initIsNil = init?.type === 'ConstantNil';
-      if (!typeNode && ctx.compatMode === 'rbxts' && (!initExpr || initIsNil)) {
-        typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+      if (!typeNode && ctx.compatMode === 'rbxts') {
+        const inferred = ctx.getShape(v.name) as
+          | import('./shape-infer.js').Shape
+          | undefined;
+        const fromShape = inferred ? shapeToTypeNode(inferred) : null;
+        if (fromShape) {
+          typeNode = fromShape;
+        } else if (!initExpr || initIsNil) {
+          typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+        }
       }
       newDecls.push(
         factory.createVariableDeclaration(
@@ -638,12 +649,15 @@ function compileFunctionStat(stat: FunctionStat, ctx: CompileContext): ts.Statem
     // scope (e.g. Build to Survive's player-list builder redefining
     // `onClick` per player) emit assignment, not redeclaration.
     ctx.defineLocal(stat.name.name, 'unknown');
+    const declShapes = ctx.compatMode === 'rbxts' && stat.func.body
+      ? collectShapes(stat.func.body, new Set(stat.func.args.map((a) => a.name)))
+      : undefined;
     return factory.createFunctionDeclaration(
       asyncModIfNeeded(fn.body),
       undefined,
       factory.createIdentifier(safeIdentifier(stat.name.name)),
       undefined,
-      paramsFromLocals(stat.func.args, ctx),
+      paramsFromLocals(stat.func.args, ctx, declShapes),
       stat.func.returnAnnotation ? compileTypePack(stat.func.returnAnnotation) : undefined,
       fn.body,
     );
@@ -1848,7 +1862,20 @@ function compileFunctionShape(
     );
   }
   const realArgs = implicitSelf ? fn.args.slice(1) : fn.args;
-  for (const p of paramsFromLocals(realArgs, ctx)) {
+  // Phase 2 (rbxts-only): pre-scan the function body so paramsFromLocals
+  // AND compileLocal can synthesize structural interfaces for each
+  // unannotated param / local. Track every observed name in the
+  // body — params AND locals — so chained reads like
+  // `let origSize = button.Size; ... origSize.X.Scale` get a typed
+  // local annotation rather than `: unknown`.
+  let paramShapes: Map<string, import('./shape-infer.js').Shape> | undefined;
+  if (ctx.compatMode === 'rbxts' && fn.body) {
+    const trackedNames = new Set<string>(realArgs.map((a) => a.name));
+    for (const n of collectLocalNames(fn.body)) trackedNames.add(n);
+    paramShapes = collectShapes(fn.body, trackedNames);
+    ctx.pushShapeScope(paramShapes as Map<string, unknown>);
+  }
+  for (const p of paramsFromLocals(realArgs, ctx, paramShapes)) {
     params.push(p);
   }
   if (fn.vararg) {
@@ -1917,6 +1944,7 @@ function compileFunctionShape(
   if (returnType && bodyContainsAwait(block)) {
     finalReturnType = factory.createTypeReferenceNode('Promise', [returnType]);
   }
+  if (paramShapes) ctx.popShapeScope();
   return {
     params,
     typeParams: buildTypeParams(fn.generics, fn.genericPacks),
@@ -1925,7 +1953,15 @@ function compileFunctionShape(
   };
 }
 
-function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.ParameterDeclaration[] {
+function paramsFromLocals(
+  locals: readonly Local[],
+  ctx: CompileContext,
+  /** rbxts-mode shape inference: pre-collected shapes for these params
+   *  from the function body. When a param's shape isn't empty, the
+   *  synthesized type literal becomes the param annotation, replacing
+   *  the default `: unknown` and turning TS18046s into typed access. */
+  shapes?: Map<string, import('./shape-infer.js').Shape>,
+): ts.ParameterDeclaration[] {
   const seen = new Set<string>();
   const out: ts.ParameterDeclaration[] = [];
   // Detect a trailing run of nilable annotations and mark them optional.
@@ -1940,9 +1976,25 @@ function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.Par
   // a separate cutoff that accepts unannotated-or-nilable; the cutoff
   // applies on top of `optionalFrom` (annotated-nilable wins because it
   // chooses the `= undefined` default path instead of `?`).
-  const rbxtsOptionalFrom = ctx.compatMode === 'rbxts'
+  let rbxtsOptionalFrom = ctx.compatMode === 'rbxts'
     ? computeTrailingOptionalStartRbxts(locals)
     : locals.length;
+  // Phase 2 adjustment: if any param has a non-empty inferred shape,
+  // it's REQUIRED (`param.X` access in the body fails if param is
+  // possibly-undefined). TS forbids required-after-optional, so
+  // pull `rbxtsOptionalFrom` past the last shape-required param —
+  // i.e. nothing optional can precede a shape-typed param.
+  if (shapes) {
+    let lastShapeRequired = -1;
+    locals.forEach((local, i) => {
+      if (local.annotation) return;
+      const sh = shapes.get(local.name);
+      if (sh && !sh.empty) lastShapeRequired = i;
+    });
+    if (lastShapeRequired + 1 > rbxtsOptionalFrom) {
+      rbxtsOptionalFrom = lastShapeRequired + 1;
+    }
+  }
   locals.forEach((local, i) => {
     const base = safeIdentifier(local.name);
     let name = base;
@@ -1965,10 +2017,22 @@ function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.Par
     // narrowing (TS18046); Phase 2 will narrow by inferring shapes
     // from observed access patterns.
     let ty: ts.TypeNode | undefined;
+    /** True iff Phase 2 inference produced a non-empty shape for this
+     *  param. Synthesized shapes assume the value exists (body reads
+     *  fail otherwise), so we suppress the `?` optionality marker —
+     *  callers must pass a conforming value. */
+    let hasInferredShape = false;
     if (local.annotation) {
       ty = compileType(local.annotation);
     } else if (ctx.compatMode === 'rbxts') {
-      ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+      const shape = shapes?.get(local.name);
+      const fromShape = shape ? shapeToTypeNode(shape) : null;
+      if (fromShape) {
+        ty = fromShape;
+        hasInferredShape = true;
+      } else {
+        ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+      }
     }
     // rbxts mode: Luau call semantics let any param be omitted (missing
     // positional args become `nil`); roblox-ts strict mode rejects
@@ -1980,7 +2044,11 @@ function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.Par
     // user's explicit signal that the arg is required.
     const rbxtsImplicitOptional =
       ctx.compatMode === 'rbxts' && !local.annotation && i >= rbxtsOptionalFrom;
-    const useQuestion = rbxtsImplicitOptional && !isOptional;
+    // When Phase 2 inferred a non-empty shape, the body assumes the
+    // value exists. Marking it optional turns `param.X` into
+    // TS18048 ("possibly undefined") at every access. Drop the `?`
+    // for shape-typed params and require callers to supply.
+    const useQuestion = rbxtsImplicitOptional && !isOptional && !hasInferredShape;
     // In rbxts mode the default value is `undefined` to match the
     // nil-as-undefined choice (roblox-ts rejects `null` literally).
     out.push(
@@ -3694,7 +3762,20 @@ export async function compile(
     recordMultiReturnFns(parsed.root);
   }
 
+  // Phase 2 (rbxts-only): pre-scan the top-level script body for
+  // every local's access pattern so compileLocal can emit
+  // structural-type annotations. Top-level scripts often have
+  // long-lived locals (`let cashBar = buildBar(...)`) whose body
+  // accesses (`cashBar.Bar.Fill`) form the same kind of inference
+  // surface as function-level locals.
+  let rootShapes: Map<string, import('./shape-infer.js').Shape> | null = null;
+  if (ctx.compatMode === 'rbxts' && rootBlock) {
+    const rootNames = collectLocalNames(rootBlock);
+    rootShapes = collectShapes(rootBlock, rootNames);
+    ctx.pushShapeScope(rootShapes as Map<string, unknown>);
+  }
   const stmts: ts.Statement[] = rootBlock ? compileBlockBody(rootBlock, ctx) : [];
+  if (rootShapes) ctx.popShapeScope();
   // Luau ModuleScripts end with `return <export-value>` — the value is
   // what `require(script)` returns. TS has no top-level `return`; rewrite
   // the trailing return as `export default <value>`. Conservative scope:

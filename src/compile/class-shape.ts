@@ -9,6 +9,7 @@ import type {
   Stat,
 } from '../parser/index.js';
 import type { CompileContext } from './context.js';
+import { collectLocalNames, collectShapes, mergeShape, shapeToTypeNode } from './shape-infer.js';
 import { compileType } from './type.js';
 
 const { factory } = ts;
@@ -293,16 +294,102 @@ export function compileClassPattern(
     }
   }
 
+  // Phase 2: scan every method body (and the ctor body) for `self.X`
+  // reads and writes. Aggregate into a single Shape representing the
+  // class instance's full surface, then emit property declarations
+  // for any field NOT already captured by the setmetatable init.
+  // This catches the common Luau idiom where fields are assigned
+  // lazily inside methods (`self._is_connected = false`) instead of
+  // up-front. Before Phase 2 we used a `[k: string]: any` index sig
+  // to absorb these — that fired roblox-ts's no-any rule. With
+  // structural declarations the class is roblox-ts-clean.
+  if (ctx.compatMode === 'rbxts') {
+    const selfShape = (() => {
+      // collectShapes returns a fresh shape per call; aggregate by
+      // re-running into the same map.
+      let aggregated: import('./shape-infer.js').Shape | null = null;
+      const merge = (body: Stat | null | undefined): void => {
+        if (!body) return;
+        const m = collectShapes(body, new Set(['self']));
+        const s = m.get('self');
+        if (!s || s.empty) return;
+        if (!aggregated) {
+          aggregated = s;
+          return;
+        }
+        mergeShape(aggregated, s);
+      };
+      if (pattern.ctorFactory) merge(pattern.ctorFactory.func.body);
+      if (pattern.constructor) merge(pattern.constructor.func.body);
+      for (const method of pattern.methods) merge(method.func.body);
+      return aggregated;
+    })();
+    if (selfShape) {
+      for (const [name] of (selfShape as import('./shape-infer.js').Shape).props) {
+        if (fieldNames.has(name)) continue;
+        // Skip names that aren't legal identifiers (we use them as
+        // class member names, not via [string] indexing).
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+        fieldNames.add(name);
+        members.push(
+          factory.createPropertyDeclaration(
+            undefined,
+            factory.createIdentifier(name),
+            // `!` (definite-assignment) marker — TS doesn't see the
+            // method-body write that initializes the field, so the
+            // strict-mode `Property has no initializer and is not
+            // definitely assigned in the constructor` warning would
+            // fire otherwise.
+            factory.createToken(ts.SyntaxKind.ExclamationToken),
+            // Type left as `unknown` (no leaf access info here without
+            // recursively expanding the shape; for now we just declare
+            // the slot's existence so `this.X` typechecks).
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            undefined,
+          ),
+        );
+      }
+    }
+  }
+
   // Constructor — prefer :constructor; fall back to the .new factory body.
   const ctorFn = pattern.constructor ?? pattern.ctorFactory;
   if (ctorFn) {
     const fnExpr = ctorFn.func;
     const ctorArgs = (fnExpr.args ?? []);
-    const ctorOptionalFrom = ctx.compatMode === 'rbxts'
+    let ctorOptionalFrom = ctx.compatMode === 'rbxts'
       ? trailingMissingStart(ctorArgs)
       : ctorArgs.length;
-    const params = ctorArgs.map((a, idx) => paramDecl(a, idx >= ctorOptionalFrom));
+    // Phase 2: scan the ctor body for per-param AND per-local access
+    // patterns. The map is pushed onto ctx around the ctor-body
+    // compile so `let x = …` declarations inside the body can
+    // consult shapes for their structural-type annotations.
+    let ctorShapes: Map<string, import('./shape-infer.js').Shape> | null = null;
+    if (ctx.compatMode === 'rbxts' && fnExpr.body) {
+      const trackedNames = new Set<string>(ctorArgs.map((a) => a.name));
+      for (const n of collectLocalNames(fnExpr.body)) trackedNames.add(n);
+      ctorShapes = collectShapes(fnExpr.body, trackedNames);
+    }
+    // Shape-typed params are required (body assumes existence). Push
+    // ctorOptionalFrom past the last shape-required param so TS
+    // doesn't see required-after-optional (TS1016).
+    if (ctorShapes) {
+      let lastShapeRequired = -1;
+      ctorArgs.forEach((a, i) => {
+        if (a.annotation) return;
+        const sh = ctorShapes.get(a.name);
+        if (sh && !sh.empty) lastShapeRequired = i;
+      });
+      if (lastShapeRequired + 1 > ctorOptionalFrom) {
+        ctorOptionalFrom = lastShapeRequired + 1;
+      }
+    }
+    const params = ctorArgs.map((a, idx) =>
+      paramDecl(a, idx >= ctorOptionalFrom, ctorShapes?.get(a.name) ?? null),
+    );
+    if (ctorShapes) ctx.pushShapeScope(ctorShapes as Map<string, unknown>);
     const body = ctorBody(fnExpr.body, pattern, ctx, compileBlockBody, compileExpr);
+    if (ctorShapes) ctx.popShapeScope();
     // Prepend the harvested field-init statements so constructor params
     // are in scope when their values flow into `this.X`.
     members.push(
@@ -382,10 +469,37 @@ export function compileClassPattern(
     // optional. Lets the call site pass fewer args (Luau missing-args
     // → nil semantics) without tripping arity checks.
     const fnArgs = (fnExpr.args ?? []);
-    const optionalFrom = ctx.compatMode === 'rbxts'
+    let optionalFrom = ctx.compatMode === 'rbxts'
       ? trailingMissingStart(fnArgs)
       : fnArgs.length;
-    const params = fnArgs.map((a, idx) => paramDecl(a, idx >= optionalFrom));
+    // Phase 2: collect per-param AND per-local shapes from the method
+    // body so paramDecl AND compileLocal can synthesize structural
+    // type annotations. We track every Local introduced in the
+    // method scope along with params; the resulting shape map is
+    // pushed onto ctx so compileBlockBody → compileLocal can read
+    // it when emitting `let x = …` declarations.
+    let methodShapes: Map<string, import('./shape-infer.js').Shape> | null = null;
+    if (ctx.compatMode === 'rbxts' && fnExpr.body) {
+      const trackedNames = new Set<string>(fnArgs.map((a) => a.name));
+      for (const n of collectLocalNames(fnExpr.body)) trackedNames.add(n);
+      methodShapes = collectShapes(fnExpr.body, trackedNames);
+    }
+    // Shape-typed params are required; pull optionalFrom past them
+    // to avoid TS1016 (required-after-optional).
+    if (methodShapes) {
+      let lastShapeRequired = -1;
+      fnArgs.forEach((a, i) => {
+        if (a.annotation) return;
+        const sh = methodShapes.get(a.name);
+        if (sh && !sh.empty) lastShapeRequired = i;
+      });
+      if (lastShapeRequired + 1 > optionalFrom) {
+        optionalFrom = lastShapeRequired + 1;
+      }
+    }
+    const params = fnArgs.map((a, idx) =>
+      paramDecl(a, idx >= optionalFrom, methodShapes?.get(a.name) ?? null),
+    );
     // Variadic `function obj:method(...)` carries a `vararg` flag on the
     // FunctionExpr; surface it as a `...__varargs: unknown[]` rest param
     // so body uses of `__varargs[…]` resolve. compileFunctionShape does
@@ -413,10 +527,14 @@ export function compileClassPattern(
     // declared in both addState and addTransition) don't collide via
     // ctx.hasLocalInCurrentScope() and degrade to assignment-without-let
     // form in subsequent methods.
+    // Push the method's shape map so compileLocal inside the body
+    // sees per-variable structural shapes. Popped after compile.
+    if (methodShapes) ctx.pushShapeScope(methodShapes as Map<string, unknown>);
     const rawBody = ctx.withScope(() => {
       for (const a of fnExpr.args ?? []) ctx.defineLocal(a.name, 'unknown');
       return compileBlockBody(fnExpr.body as Stat, ctx);
     });
+    if (methodShapes) ctx.popShapeScope();
     const bodyStmts = rawBody
       .map((s) => rewriteSelfToThis(s))
       .filter((s) => !isSelfThisBinding(s));
@@ -635,20 +753,39 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
 function paramDecl(
   a: { name: string; annotation?: import('../parser/index.js').TypeNode | null },
   isTrailingUnannotated = false,
+  /** Phase 2: pre-collected access shape for this param. When the
+   *  shape isn't empty, synthesize a structural type literal instead
+   *  of the default `: unknown` annotation. */
+  shape?: import('./shape-infer.js').Shape | null,
 ): ts.ParameterDeclaration {
-  // Unannotated rbxts-mode params default to `: unknown` (not `: any`)
-  // so roblox-ts's no-any rule doesn't fire on every body usage.
-  // Strict-mode body accesses on `unknown` will require narrowing
-  // (TS18046) — that's Phase 2 surface area.
-  const ty = a.annotation
-    ? compileType(a.annotation)
-    : factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+  let ty: ts.TypeNode;
+  let hasInferredShape = false;
+  if (a.annotation) {
+    ty = compileType(a.annotation);
+  } else if (shape) {
+    const fromShape = shapeToTypeNode(shape);
+    if (fromShape) {
+      ty = fromShape;
+      hasInferredShape = true;
+    } else {
+      ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+    }
+  } else {
+    // Unannotated rbxts-mode params default to `: unknown` (not `:
+    // any`) so roblox-ts's no-any rule doesn't fire on every body
+    // usage. Without a shape map (native mode or method outside
+    // inference path), this is the fallback.
+    ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+  }
   // Unannotated trailing params mirror the Luau-call calling convention
   // (missing positional args become `nil`); mark them optional so a
   // 1-arg call site of a 2-param method still typechecks under strict.
   // Annotated params keep their declared shape — if the user wrote
   // `: number` without `?`, that's an explicit "required" signal.
-  const question = isTrailingUnannotated && !a.annotation
+  // When Phase 2 inferred a shape, the body assumes the value exists;
+  // marking it optional would turn every `param.X` access into
+  // TS18048, so drop the `?` and require callers to supply.
+  const question = isTrailingUnannotated && !a.annotation && !hasInferredShape
     ? factory.createToken(ts.SyntaxKind.QuestionToken)
     : undefined;
   return factory.createParameterDeclaration(undefined, undefined, a.name, question, ty);

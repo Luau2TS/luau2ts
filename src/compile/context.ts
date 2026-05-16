@@ -97,6 +97,29 @@ export class CompileContext {
    *  and every `x.field` access fires TS2339. */
   readonly luaTupleReturningFunctions = new Set<string>();
 
+  /** Phase 2 shape inference: a stack of per-function shape maps.
+   *  Pushed by compileFunctionShape on entry, popped on exit. The
+   *  top map is consulted by compileLocal/paramsFromLocals to emit
+   *  structural type annotations from observed access patterns.
+   *  Uses a stack (not a single map) so nested functions get their
+   *  own shape scope without inner locals bleeding into the outer
+   *  function's shape map. */
+  private readonly shapeStack: Map<string, unknown>[] = [];
+
+  pushShapeScope(shapes: Map<string, unknown>): void {
+    this.shapeStack.push(shapes);
+  }
+  popShapeScope(): void {
+    this.shapeStack.pop();
+  }
+  getShape(name: string): unknown {
+    for (let i = this.shapeStack.length - 1; i >= 0; i--) {
+      const s = this.shapeStack[i]!.get(name);
+      if (s) return s;
+    }
+    return undefined;
+  }
+
   constructor(public readonly compatMode: CompatMode = 'native') {}
 
   /** Record a named import from `module`. The emitter will write
