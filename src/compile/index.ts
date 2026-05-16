@@ -1878,6 +1878,24 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
             ),
             primitiveTypeNode,
           );
+        } else {
+          // Non-primitive tracked type (`unknown`, `datatype:X`) —
+          // cast through `typeof <local>` so an unknown-typed RHS
+          // (or `undefined` for `x = nil`-style resets) satisfies
+          // whatever TS inferred at the declaration. This is the
+          // catch-all that handles array-typed locals (`let a =
+          // [0]`) and table-literal-typed locals (`let x = {...}`)
+          // — TS's `typeof` returns the literal type for these, and
+          // the cast asserts compatibility.
+          valueExpr = factory.createAsExpression(
+            factory.createAsExpression(
+              inner,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createTypeQueryNode(
+              factory.createIdentifier(safeIdentifier((target as { name: string }).name)),
+            ),
+          );
         }
       }
     }
@@ -2915,9 +2933,20 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
             ]),
           ),
         );
+        // Paren-wrap binary/conditional indices first — `as` binds
+        // tighter than `??`/`||`/`&&`, so a bare `dir ?? "down" as
+        // unknown as string` would only cast the "down" branch and
+        // leave the union widened (TS2538: '{}' can't be used as
+        // index).
+        const innerIndex = (
+          ts.isBinaryExpression(index)
+          || ts.isConditionalExpression(index)
+        )
+          ? factory.createParenthesizedExpression(index)
+          : index;
         const coercedIndex = factory.createAsExpression(
           factory.createAsExpression(
-            index,
+            innerIndex,
             factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
           ),
           factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
