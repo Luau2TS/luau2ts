@@ -1656,6 +1656,45 @@ function buildAssignmentStatement(
  *  syntactically invalid lvalue. The cast is only needed for read
  *  positions to absorb @rbxts/types' `Instance | undefined` narrowing;
  *  on write the property exists at runtime so plain access works. */
+/** Build an IndexName-chain receiver for an assignment LHS, casting
+ *  the deepest Local/Global root through `_LuauChild` so each
+ *  intermediate dot-access resolves to `_LuauChild` (the recursive
+ *  dynamic-child interface) instead of failing against a narrow
+ *  declared type like Frame. The OUTERMOST receiver (the one whose
+ *  property is being assigned) is then re-cast through Record in the
+ *  caller — this helper just builds the readable chain underneath. */
+function compileLValueReceiver(expr: Expr, ctx: CompileContext): ts.Expression {
+  if (ctx.compatMode !== 'rbxts') return compileExpr(expr, ctx);
+  if (expr.type !== 'IndexName') return compileExpr(expr, ctx);
+  // Recurse: compile the inner expression. If THAT is itself an
+  // IndexName, keep peeling. The leaf (Local/Global) gets cast to
+  // `_LuauChild`.
+  const inner = expr.expr;
+  if (inner.type === 'Local' || inner.type === 'Global') {
+    ctx.useLuauChildType();
+    const wrapped = factory.createParenthesizedExpression(
+      factory.createAsExpression(
+        factory.createAsExpression(
+          compileExpr(inner, ctx),
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createTypeReferenceNode('_LuauChild', undefined),
+      ),
+    );
+    return factory.createPropertyAccessExpression(
+      wrapped,
+      factory.createIdentifier(propertyName(expr.index)),
+    );
+  }
+  if (inner.type === 'IndexName') {
+    return factory.createPropertyAccessExpression(
+      compileLValueReceiver(inner, ctx),
+      factory.createIdentifier(propertyName(expr.index)),
+    );
+  }
+  return compileExpr(expr, ctx);
+}
+
 function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
   if (target.type === 'IndexName') {
     // Phase 2: when target is `<simpleRef>.<name>` in rbxts mode,
@@ -1687,11 +1726,17 @@ function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
       && receiverIsChainable
       && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(target.index)
     ) {
+      // When the receiver is itself a chain (`a.b.c.Size = X`),
+      // route the chain's leaf Local through `_LuauChild` so each
+      // intermediate `.X` resolves dynamically. Otherwise a Local
+      // typed e.g. as Frame (from `Instance.new("Frame")`) rejects
+      // `.Bar` (TS2339) — Frame has no Bar member.
+      const receiverExpr = compileLValueReceiver(target.expr, ctx);
       return factory.createPropertyAccessExpression(
         factory.createParenthesizedExpression(
           factory.createAsExpression(
             factory.createAsExpression(
-              compileExpr(target.expr, ctx),
+              receiverExpr,
               factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
             ),
             factory.createTypeReferenceNode('Record', [
@@ -3810,11 +3855,90 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
 
   let call: ts.Expression;
   if (expr.self && expr.func.type === 'IndexName') {
-    const calleeAccess = factory.createPropertyAccessExpression(
-      compileExpr(expr.func.expr, ctx),
+    // rbxts mode: when the colon-method receiver is itself an
+    // IndexExpr (`obj[k]:Disconnect()`), the compiled receiver type
+    // is `unknown` (from Record<string,unknown> casts). A direct
+    // method-access on unknown fires TS2571. Recast the receiver
+    // through Record so `.Disconnect` resolves to an `unknown`
+    // slot, then cast that slot to a callable function so the
+    // invocation itself typechecks (otherwise calling unknown()
+    // fires TS2571 again at the call site).
+    // The cast applies when the method-call receiver is an indexed
+    // access (`obj[k]:Method()`). Chained dot-access (`obj.field
+    // .method()`) is too broad to cast unconditionally — it would
+    // strip valuable type info for receivers whose declared types
+    // are correct (any-cast results from WaitForChild fallbacks,
+    // typed @rbxts/services chains, etc.).
+    const receiverIsIndexExpr =
+      ctx.compatMode === 'rbxts' && expr.func.expr.type === 'IndexExpr';
+    const needsReceiverCast = receiverIsIndexExpr;
+    const innerRecv = needsReceiverCast
+      ? factory.createParenthesizedExpression(
+          factory.createAsExpression(
+            factory.createAsExpression(
+              compileExpr(expr.func.expr, ctx),
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createTypeReferenceNode('Record', [
+              factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ]),
+          ),
+        )
+      : compileExpr(expr.func.expr, ctx);
+    let calleeAccess: ts.Expression = factory.createPropertyAccessExpression(
+      innerRecv,
       factory.createIdentifier(propertyName(expr.func.index)),
     );
+    if (needsReceiverCast) {
+      // Cast the unknown-typed method slot through a callable so the
+      // call site doesn't re-trip TS2571.
+      calleeAccess = factory.createParenthesizedExpression(
+        factory.createAsExpression(
+          factory.createAsExpression(
+            calleeAccess,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createFunctionTypeNode(
+            undefined,
+            [factory.createParameterDeclaration(
+              undefined,
+              factory.createToken(ts.SyntaxKind.DotDotDotToken),
+              'args',
+              undefined,
+              factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+            )],
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+        ),
+      );
+    }
     call = factory.createCallExpression(calleeAccess, undefined, castArgsForCall(calleeAccess, args, ctx));
+  } else if (ctx.compatMode === 'rbxts' && expr.func.type === 'IndexExpr') {
+    // Bare-call of `obj[k](...)` in rbxts mode: when the receiver is
+    // a Record-cast IndexExpr, the indexed slot is `unknown` and a
+    // direct call fires TS2571. Recast the IndexExpr result through
+    // a call signature so the invocation typechecks.
+    const callable = factory.createParenthesizedExpression(
+      factory.createAsExpression(
+        factory.createAsExpression(
+          compileExpr(expr.func, ctx),
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createFunctionTypeNode(
+          undefined,
+          [factory.createParameterDeclaration(
+            undefined,
+            factory.createToken(ts.SyntaxKind.DotDotDotToken),
+            'args',
+            undefined,
+            factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+          )],
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+      ),
+    );
+    call = factory.createCallExpression(callable, undefined, args);
   } else {
     const calleeExpr = compileExpr(expr.func, ctx);
     call = factory.createCallExpression(calleeExpr, undefined, castArgsForCall(calleeExpr, args, ctx));
