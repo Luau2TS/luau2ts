@@ -4171,9 +4171,21 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     && expr.func.type === 'IndexName'
     && INSTANCE_LOOSE_METHODS.has(expr.func.index)
   ) {
+    // GetAttribute returns a value (string/number/bool/datatype |
+    // undefined). Most call sites use the result for a truthy check
+    // or compare against a specific value — `unknown` is enough,
+    // and avoids tripping roblox-ts's no-any rule. The other
+    // INSTANCE_LOOSE_METHODS (FindFirstChild family, WaitForChild)
+    // return Instance subtypes whose users chain `.X.Y.Z` access —
+    // those still need the `any` cast to keep the chain typing
+    // loose. Splitting the cast target gets us past the no-any
+    // surface without losing the chained-access pattern.
+    const isValueMethod = expr.func.index === 'GetAttribute';
     call = factory.createAsExpression(
       call,
-      factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+      isValueMethod
+        ? factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)
+        : factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
     );
   }
   // rbxts mode: `require(ModuleScript)` returns `unknown` per @rbxts/types
