@@ -2596,8 +2596,33 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       return typeFromAnnotation(expr.annotation, expr.expr, ctx);
     case 'Unary':
       if (expr.op === 'not') return 'boolean';
-      if (expr.op === '#' || expr.op === '-') return 'number';
+      if (expr.op === '#' || expr.op === '-') {
+        // `-vec` returns Vector3 when vec is a datatype. The luaUnm
+        // path emits `vec.mul(-1)` (Vector3 has a unary __unm); the
+        // result type matches the operand.
+        if (expr.op === '-') {
+          const t = staticTypeOfExpr(expr.expr, ctx);
+          if (typeof t === 'string' && t.startsWith('datatype:')) return t;
+        }
+        return 'number';
+      }
       return 'unknown';
+    case 'IndexName': {
+      // Property accesses for well-known Vector3-typed members on
+      // BasePart-like instances. Real Roblox scripts treat
+      // `part.Position` / `part.Size` / `part.Velocity` as Vector3
+      // values for arithmetic — without this hint, `p.Position -
+      // p.Size/2` falls through to the unknown-as-number fallback
+      // and the result types as number, breaking subsequent
+      // `result.X` reads or Vector3-typed assignment targets.
+      const VECTOR3_PROPS = new Set([
+        'Position', 'Size', 'Velocity', 'Rotation',
+        'AssemblyLinearVelocity', 'AssemblyAngularVelocity',
+        'RotVelocity', 'Orientation',
+      ]);
+      if (VECTOR3_PROPS.has(expr.index)) return 'datatype:Vector3' as StaticValueType;
+      return 'unknown';
+    }
     case 'Binary':
       if (['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
         const lt = staticTypeOfExpr(expr.left, ctx);
