@@ -43,6 +43,10 @@ export interface Shape {
   methods: Map<string, { maxArgs: number }>;
   indexed: boolean;
   assigned: boolean;
+  /** True if the variable was directly called (`fn(args)`). Triggers
+   *  shapeToTypeNode to emit a call signature alongside the
+   *  property literal so `fn(...)` typechecks. */
+  callable: boolean;
   /** True if this shape is the empty leaf — the variable was used
    *  bare (`local s; print(s)`) without any property/method/index
    *  access. In that case there's nothing to synthesize and we
@@ -51,7 +55,14 @@ export interface Shape {
 }
 
 function newShape(): Shape {
-  return { props: new Map(), methods: new Map(), indexed: false, assigned: false, empty: true };
+  return {
+    props: new Map(),
+    methods: new Map(),
+    indexed: false,
+    assigned: false,
+    callable: false,
+    empty: true,
+  };
 }
 
 function getOrAddProp(shape: Shape, name: string): Shape {
@@ -135,7 +146,22 @@ export function collectShapes(body: Stat, vars: Set<string>): Map<string, Shape>
             recordMethod(innerShape, idx, call.args.length);
           }
         } else {
-          visitExpr(call.func);
+          // Bare call on a tracked variable: `fn(...)` or
+          // `callback(args)`. Mark the variable as callable so
+          // shapeToTypeNode synthesizes a call signature instead
+          // of a property literal.
+          const innerShape = visitExpr(call.func);
+          if (innerShape) {
+            innerShape.empty = false;
+            innerShape.callable = true;
+            // Track max arity for the call signature.
+            const meta = innerShape.methods.get('__call__');
+            if (meta) {
+              meta.maxArgs = Math.max(meta.maxArgs, call.args.length);
+            } else {
+              innerShape.methods.set('__call__', { maxArgs: call.args.length });
+            }
+          }
         }
         for (const a of call.args) visitExpr(a);
         return null;
@@ -372,7 +398,31 @@ export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
   if (shape.empty) return null;
   const members: ts.TypeElement[] = [];
 
+  if (shape.callable) {
+    // Bare-call pattern: `fn(arg)`, `callback()`. Add a call
+    // signature `(...args: unknown[]): unknown` so the variable
+    // typechecks as callable. The synthetic `__call__` entry in
+    // shape.methods is the arity record; skip it in the prop loop
+    // below so we don't also emit it as a method.
+    const callMeta = shape.methods.get('__call__');
+    members.push(
+      factory.createCallSignature(
+        undefined,
+        [factory.createParameterDeclaration(
+          undefined,
+          factory.createToken(ts.SyntaxKind.DotDotDotToken),
+          factory.createIdentifier('args'),
+          undefined,
+          factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+        )],
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
+    );
+    void callMeta;
+  }
+
   for (const [name, child] of shape.props) {
+    if (name === '__call__') continue;
     // If the property was also called as a method, declare it as a
     // method signature (callable + chainable). Otherwise it's a
     // property with the inferred child shape (or `unknown` if leaf).

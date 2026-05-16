@@ -84,8 +84,11 @@ describe('macros — datatype constructors (R.2)', () => {
   });
 
   it('Instance.new with non-literal class name forwards the call', async () => {
+    // Non-literal class names get cast `as unknown as keyof
+    // CreatableInstances` so Instance's overload resolver doesn't
+    // fail on the `unknown`/`string`-typed receiver.
     const out = await emit('local p = Instance.new(name)', 'rbxts');
-    expect(out).toContain('new Instance(name)');
+    expect(out).toMatch(/new Instance\(name as unknown as keyof CreatableInstances\)/);
   });
 
   it('game:GetService("Workspace") → Workspace + services import', async () => {

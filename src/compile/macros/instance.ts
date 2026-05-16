@@ -30,12 +30,33 @@ function isValidIdentifier(name: string): boolean {
 // idiomatic rbxts without losing type info.
 registerMacro(
   'Instance.new',
-  ({ compiledArgs }) => {
+  ({ call, compiledArgs }) => {
     if (compiledArgs.length === 0) return undefined;
+    // If the class-name arg is not a string literal (i.e. a variable
+    // or function-call result), it'll be typed `unknown` or
+    // `string` — Instance's constructor wants `keyof
+    // CreatableInstances`. Cast through `unknown as keyof
+    // CreatableInstances` so the call typechecks. Literal-string
+    // args fall through with no cast (they already match the
+    // overload).
+    const firstArg = call.args[0];
+    const literalClassName = firstArg && firstArg.type === 'ConstantString';
+    const args = literalClassName
+      ? compiledArgs
+      : [
+          factory.createAsExpression(
+            factory.createAsExpression(
+              compiledArgs[0]!,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createTypeReferenceNode('keyof CreatableInstances', undefined),
+          ),
+          ...compiledArgs.slice(1),
+        ];
     return factory.createNewExpression(
       factory.createIdentifier('Instance'),
       undefined,
-      compiledArgs,
+      args,
     );
   },
   'rbxts',
