@@ -1550,9 +1550,36 @@ function buildAssignmentStatement(
             factory.createNumericLiteral(Math.abs(n)),
           )
         : factory.createNumericLiteral(n);
+      let recv = compileExpr(target.expr, ctx);
+      // rbxts mode: chained LHS `obj[runtimeKey][literal] = v` — the
+      // inner `obj[runtimeKey]` compiles to a Record-cast access
+      // that returns `unknown`, and the literal `[N] = v` on
+      // unknown fires TS2571. Re-cast the receiver through Record
+      // so the assignment slot is typed `unknown` and accepts any
+      // RHS.
+      if (
+        ctx.compatMode === 'rbxts'
+        && (target.expr.type === 'IndexExpr' || target.expr.type === 'IndexName')
+      ) {
+        recv = factory.createParenthesizedExpression(
+          factory.createAsExpression(
+            factory.createAsExpression(
+              recv,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createTypeReferenceNode('Record', [
+              factory.createUnionTypeNode([
+                factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+                factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+              ]),
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ]),
+          ),
+        );
+      }
       return factory.createExpressionStatement(
         factory.createAssignment(
-          factory.createElementAccessExpression(compileExpr(target.expr, ctx), lit),
+          factory.createElementAccessExpression(recv, lit),
           valueExpr,
         ),
       );
@@ -1749,36 +1776,13 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
         );
       }
     }
-    // rbxts mode: `obj.X = rhs` where rhs is `unknown` / `{}` and
-    // obj.X has a typed slot (TextLabel.Text: string, BasePart.
-    // BrickColor: BrickColor, etc.) — cast the RHS through
-    // `as unknown as typeof obj.X`. Requires obj to be a simple
-    // identifier so `typeof obj.X` is valid in type position.
-    // (We'd need entity-name chains for deeper paths; the simple
-    // case covers the dominant `lbl.Text = …` / `wrap.Name = …`
-    // patterns.)
-    if (
-      ctx.compatMode === 'rbxts'
-      && target.type === 'IndexName'
-      && (target.expr.type === 'Local' || target.expr.type === 'Global')
-      && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(target.index)
-    ) {
-      const compiledObj = compileExpr(target.expr, ctx);
-      if (ts.isIdentifier(compiledObj)) {
-        valueExpr = factory.createAsExpression(
-          factory.createAsExpression(
-            valueExpr,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
-          factory.createTypeQueryNode(
-            factory.createQualifiedName(
-              factory.createIdentifier(compiledObj.text),
-              factory.createIdentifier(target.index),
-            ),
-          ),
-        );
-      }
-    }
+    // (Phase 2's earlier `as unknown as typeof obj.X` RHS cast was
+    // removed: the assignment LHS now goes through a
+    // `Record<string, unknown>` cast in compileLValue, which makes
+    // the slot accept any RHS. The `typeof obj.X` query also broke
+    // when obj's declared type didn't have X — common for the
+    // monkey-patch idiom — so the cast was both redundant and
+    // sometimes invalid.)
     // `tbl[k] = v` with a non-literal numeric key compiles to a luaIndexSet
     // call; plain `target = v` would emit `luaIndex(tbl, k) = v` which is
     // not a valid LHS in TS. Literal numeric / string keys go through plain
