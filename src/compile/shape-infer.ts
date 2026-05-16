@@ -150,7 +150,7 @@ export function collectShapes(body: Stat, vars: Set<string>): Map<string, Shape>
         //   table.find(t, v)      → t.indexOf(v) + 1
         const macroMap: Record<string, string> = {
           'table.insert': 'push',
-          'table.remove': 'splice',
+          'table.remove': 'remove',
           'table.concat': 'join',
           'table.sort': 'sort',
           'table.find': 'indexOf',
@@ -433,6 +433,25 @@ function intersectionTypeName(shape: Shape): string | null {
   return null;
 }
 
+/** Method names that identify a value as a JS Array. When a shape
+ *  exposes one of these AS A METHOD, we treat the value as
+ *  `Array<unknown>` instead of synthesizing a structural literal —
+ *  Array has all the methods (push / splice / indexOf / etc.)
+ *  typed correctly (push: number, splice: T[], indexOf: number),
+ *  so chained access like `queue.splice(1, 1)[0]` typechecks. */
+const ARRAY_METHOD_DISCRIMINATORS = new Set([
+  'push', 'pop', 'shift', 'unshift', 'insert', 'remove',
+  'indexOf', 'lastIndexOf', 'join', 'concat', 'find',
+  'forEach', 'map', 'filter', 'reduce',
+]);
+
+function looksLikeArray(shape: Shape): boolean {
+  for (const name of shape.methods.keys()) {
+    if (ARRAY_METHOD_DISCRIMINATORS.has(name)) return true;
+  }
+  return false;
+}
+
 /** Names that a given intersection target type already declares. The
  *  structural literal we synthesize alongside the intersection drops
  *  these names so our `(...args: unknown[]): unknown` signature
@@ -454,6 +473,21 @@ function intersectionTargetDeclaresName(target: string, name: string): boolean {
  *  unknown` index signature. */
 export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
   if (shape.empty) return null;
+
+  // If the shape looks array-like (has push/splice/indexOf/etc.),
+  // emit `Array<defined>` instead of a structural literal. Array's
+  // methods have proper return types in @rbxts/compiler-types —
+  // `splice(...)` returns `T[]`, `indexOf(...)` returns `number`,
+  // etc. — so chained access like `queue.splice(0, 1)[0]`
+  // typechecks. We use `defined` (= `{}`) not `unknown` because
+  // some Array methods declare `this: defined[]` and reject
+  // `unknown[]` (TS2684).
+  if (looksLikeArray(shape)) {
+    return factory.createArrayTypeNode(
+      factory.createTypeReferenceNode('defined', undefined),
+    );
+  }
+
   const members: ts.TypeElement[] = [];
 
   if (shape.callable) {

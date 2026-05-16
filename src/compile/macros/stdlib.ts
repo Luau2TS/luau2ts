@@ -17,6 +17,14 @@ registerMacro(
   ({ compiledArgs }: MacroArgs) => {
     const [target, second, third] = compiledArgs;
     if (!target) return undefined;
+    const asDefined = (e: ts.Expression) =>
+      factory.createAsExpression(
+        factory.createAsExpression(
+          e,
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createTypeReferenceNode('defined', undefined),
+      );
     if (third !== undefined) {
       const indexExpr = factory.createBinaryExpression(
         second!,
@@ -26,21 +34,25 @@ registerMacro(
       return factory.createCallExpression(
         factory.createPropertyAccessExpression(target, factory.createIdentifier('insert')),
         undefined,
-        [indexExpr, third],
+        [indexExpr, asDefined(third)],
       );
     }
     if (second === undefined) return undefined;
     return factory.createCallExpression(
       factory.createPropertyAccessExpression(target, factory.createIdentifier('push')),
       undefined,
-      [second],
+      [asDefined(second)],
     );
   },
   'rbxts',
 );
 
 // `table.remove(t)` → `t.pop()`
-// `table.remove(t, i)` → `t.splice(i-1, 1)[0]`
+// `table.remove(t, i)` → `t.remove(i - 1)`. @rbxts/compiler-types'
+// Array<T> exposes `remove(index)` (0-indexed, returns removed
+// element); roblox-ts maps it back to Lua's `table.remove(t, i)`.
+// We use `remove`, NOT `splice` — the rbxts Array doesn't have
+// `splice` and TS would fire TS2339.
 registerMacro(
   'table.remove',
   ({ compiledArgs }: MacroArgs) => {
@@ -58,13 +70,10 @@ registerMacro(
       factory.createToken(ts.SyntaxKind.MinusToken),
       factory.createNumericLiteral(1),
     );
-    return factory.createElementAccessExpression(
-      factory.createCallExpression(
-        factory.createPropertyAccessExpression(target, factory.createIdentifier('splice')),
-        undefined,
-        [indexExpr, factory.createNumericLiteral(1)],
-      ),
-      factory.createNumericLiteral(0),
+    return factory.createCallExpression(
+      factory.createPropertyAccessExpression(target, factory.createIdentifier('remove')),
+      undefined,
+      [indexExpr],
     );
   },
   'rbxts',
@@ -111,11 +120,21 @@ registerMacro(
   ({ compiledArgs }: MacroArgs) => {
     const [target, value] = compiledArgs;
     if (!target || !value) return undefined;
+    // Cast the search value `as unknown as defined` so the call
+    // typechecks against `indexOf(this: ReadonlyArray<defined>,
+    // searchElement: T)` even when `value` came in as `unknown`.
+    const castValue = factory.createAsExpression(
+      factory.createAsExpression(
+        value,
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
+      factory.createTypeReferenceNode('defined', undefined),
+    );
     return factory.createBinaryExpression(
       factory.createCallExpression(
         factory.createPropertyAccessExpression(target, factory.createIdentifier('indexOf')),
         undefined,
-        [value],
+        [castValue],
       ),
       factory.createToken(ts.SyntaxKind.PlusToken),
       factory.createNumericLiteral(1),

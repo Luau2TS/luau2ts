@@ -187,7 +187,9 @@ describe('macros — RuntimeLib.lua recognizer (R.8)', () => {
 describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
   it('table.insert(t, v) → t.push(v)', async () => {
     const out = await emit('table.insert(arr, x)', 'rbxts');
-    expect(out).toContain('arr.push(x)');
+    // The value is cast `as unknown as defined` so it satisfies
+    // the rbxts Array<defined>.push signature.
+    expect(out).toMatch(/arr\.push\(x as unknown as defined\)/);
   });
 
   it('table.insert(t, i, v) → t.insert(i - 1, v)', async () => {
@@ -196,7 +198,7 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     // `table` (which doesn't even expose `.insert` in @rbxts/types) or
     // through `.splice` (also missing on Array<T>).
     const out = await emit('table.insert(arr, 2, x)', 'rbxts');
-    expect(out).toContain('arr.insert(2 - 1, x)');
+    expect(out).toMatch(/arr\.insert\(2 - 1, x as unknown as defined\)/);
     expect(out).not.toContain('table.insert');
     expect(out).not.toContain('.splice(');
   });
@@ -206,9 +208,13 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     expect(out).toContain('arr.pop()');
   });
 
-  it('table.remove(t, i) → t.splice(i-1, 1)[0]', async () => {
+  it('table.remove(t, i) → t.remove(i-1)', async () => {
+    // @rbxts/compiler-types exposes `Array.remove(index)` which
+    // roblox-ts compiles back to `table.remove`. The earlier
+    // emit used `t.splice(...)` (JS-style) — rbxts Array doesn't
+    // have `splice` so that fired TS2339.
     const out = await emit('local v = table.remove(arr, 1)', 'rbxts');
-    expect(out).toMatch(/arr\.splice\(1 - 1, 1\)\[0\]/);
+    expect(out).toMatch(/arr\.remove\(1 - 1\)/);
   });
 
   it('table.concat(t, sep) → t.join(sep)', async () => {
