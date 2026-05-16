@@ -749,8 +749,12 @@ function compileFunctionStat(stat: FunctionStat, ctx: CompileContext): ts.Statem
       ),
     );
   }
+  // Use compileLValue so the rbxts-mode `<simpleRef>.<member> = …`
+  // monkey-patch cast fires for `function ProfileService.X() …`
+  // style declarations (TS would otherwise fire TS2339 on the
+  // member access).
   return factory.createExpressionStatement(
-    factory.createAssignment(compileExpr(stat.name, ctx), fn),
+    factory.createAssignment(compileLValue(stat.name, ctx), fn),
   );
 }
 
@@ -2716,6 +2720,32 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
               factory.createNumericLiteral(Math.abs(n)),
             )
           : factory.createNumericLiteral(n);
+        // rbxts mode: when the parent expression is a chained
+        // IndexExpr / IndexName (the receiver here was something
+        // like `obj[runtimeKey]` returning `unknown`), wrap the
+        // receiver through `as unknown as Record<string | number,
+        // unknown>` so the literal-numeric access doesn't fire
+        // TS2571 ("Object is of type 'unknown'").
+        if (
+          ctx.compatMode === 'rbxts'
+          && (expr.expr.type === 'IndexExpr' || expr.expr.type === 'IndexName')
+        ) {
+          target = factory.createParenthesizedExpression(
+            factory.createAsExpression(
+              factory.createAsExpression(
+                target,
+                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+              ),
+              factory.createTypeReferenceNode('Record', [
+                factory.createUnionTypeNode([
+                  factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+                  factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+                ]),
+                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+              ]),
+            ),
+          );
+        }
         return factory.createElementAccessExpression(target, lit);
       }
       if (indexExpr.type === 'ConstantString') {
