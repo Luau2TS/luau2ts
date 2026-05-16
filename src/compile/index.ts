@@ -3320,7 +3320,7 @@ function compileBinary(
         // receiver through Record<string, unknown> first so the
         // access itself typechecks even when `obj.X` doesn't exist on
         // obj's declared type. Without this the inner `obj.X` fires
-        // TS2339 and the surrounding `as any` cast can't recover —
+        // TS2339 and the surrounding `as` cast can't recover —
         // semantic errors on sub-expressions aren't suppressed by an
         // outer type assertion.
         const widenAccess = (e: ts.Expression): ts.Expression => {
@@ -3343,14 +3343,25 @@ function compileBinary(
           }
           return e;
         };
+        // Cast operands `as unknown as number` (not `as any`) so the
+        // arithmetic typechecks against TS's `number` operator
+        // signature without leaking `any` — roblox-ts's no-any rule
+        // fires on every `any`-typed expression. Vector3-class
+        // arithmetic already goes through the .add()/.sub() method
+        // path earlier in compileBinaryExpr; the fallback here is
+        // for genuinely-unknown operands that are almost always
+        // numeric (UI scale/offset, scalar arithmetic).
         const wrap = (e: ts.Expression) =>
           factory.createParenthesizedExpression(
-            factory.createAsExpression(widenAccess(e), factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword)),
+            factory.createAsExpression(
+              factory.createAsExpression(
+                widenAccess(e),
+                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+              ),
+              factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+            ),
           );
-        return factory.createAsExpression(
-          factory.createBinaryExpression(wrap(left), direct, wrap(right)),
-          factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
-        );
+        return factory.createBinaryExpression(wrap(left), direct, wrap(right));
       }
       // Equality (`===` / `!==`): widen operands `as unknown` so
       // TS doesn't fire TS2367 ("comparison appears unintentional
