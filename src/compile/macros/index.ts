@@ -37,20 +37,35 @@ export function registerMacro(key: string, fn: MacroFn, mode: MacroMode = 'rbxts
 }
 
 /** Convenience: a constructor macro that always emits `new <Type>(...args)`.
- *  Mode defaults to 'rbxts'. */
+ *  Mode defaults to 'rbxts'. When `numericArgs` is true, each compiled
+ *  arg is cast `as unknown as number` so callers passing `unknown`-
+ *  typed values (typical Phase-2 leaves: `frame.X.Scale`, etc.) flow
+ *  into the numeric slots without TS2345. The roundtrip back to Lua
+ *  drops the cast — Lua's runtime accepts whatever's there. */
 export function registerConstructorMacro(
   key: string,
   typeName: string,
   mode: MacroMode = 'rbxts',
+  numericArgs = false,
 ): void {
   registerMacro(
     key,
     ({ ctx, compiledArgs }) => {
       ctx.useImport('@rbxts/types', typeName);
+      const args = numericArgs
+        ? compiledArgs.map((a) =>
+            factory.createAsExpression(
+              factory.createAsExpression(
+                a,
+                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+              ),
+              factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+            ))
+        : compiledArgs;
       return factory.createNewExpression(
         factory.createIdentifier(typeName),
         undefined,
-        compiledArgs,
+        args,
       );
     },
     mode,

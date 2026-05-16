@@ -325,12 +325,28 @@ export function compileClassPattern(
       return aggregated;
     })();
     if (selfShape) {
-      for (const [name] of (selfShape as import('./shape-infer.js').Shape).props) {
+      // Collect the names of methods we're about to emit so the
+      // self-shape pass doesn't shadow them with `name!: unknown`
+      // field declarations (TS2300, duplicate identifier).
+      const methodNames = new Set<string>();
+      for (const method of pattern.methods) {
+        const mn = method.name;
+        if (mn.type === 'IndexName') methodNames.add(mn.index);
+      }
+      for (const [name, childShape] of (selfShape as import('./shape-infer.js').Shape).props) {
         if (fieldNames.has(name)) continue;
+        if (methodNames.has(name)) continue;
         // Skip names that aren't legal identifiers (we use them as
         // class member names, not via [string] indexing).
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
         fieldNames.add(name);
+        // Use the child shape as the field type when it's non-empty
+        // (`this._script_signal._head` chains need `_script_signal`
+        // declared with the `_head`/etc. sub-shape, not just
+        // `unknown`). Falls back to `unknown` for leaves we never
+        // chain into.
+        const fieldType = shapeToTypeNode(childShape)
+          ?? factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
         members.push(
           factory.createPropertyDeclaration(
             undefined,
@@ -341,10 +357,7 @@ export function compileClassPattern(
             // definitely assigned in the constructor` warning would
             // fire otherwise.
             factory.createToken(ts.SyntaxKind.ExclamationToken),
-            // Type left as `unknown` (no leaf access info here without
-            // recursively expanding the shape; for now we just declare
-            // the slot's existence so `this.X` typechecks).
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            fieldType,
             undefined,
           ),
         );

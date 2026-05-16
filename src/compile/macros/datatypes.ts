@@ -5,6 +5,16 @@ import { registerConstructorMacro, registerMacro } from './index.js';
 const { factory } = ts;
 
 // ─── `.new` constructors → `new TypeName(...)` ─────────────────────────────
+// Constructors whose `.new(…)` signature is `(number, number, …)`. We
+// cast each compiled arg `as unknown as number` so unknown-typed
+// leaves from Phase-2 structural shapes (`frame.X.Scale`,
+// `instance.Position.Magnitude`, …) flow through without TS2345.
+const numericConstructorTypes = new Set<string>([
+  'Vector3', 'Vector2', 'Vector3int16', 'Vector2int16',
+  'UDim', 'UDim2',
+  'NumberRange', 'NumberSequenceKeypoint',
+  'Region3int16', 'Rect',
+]);
 const constructorTypes = [
   'Vector3', 'Vector2', 'Vector3int16', 'Vector2int16',
   'CFrame', 'Color3', 'BrickColor',
@@ -19,7 +29,7 @@ const constructorTypes = [
   'CatalogSearchParams', 'Font',
 ] as const;
 for (const t of constructorTypes) {
-  registerConstructorMacro(`${t}.new`, t, 'rbxts');
+  registerConstructorMacro(`${t}.new`, t, 'rbxts', numericConstructorTypes.has(t));
 }
 
 // ─── Static factories → `TypeName.method(...)` ────────────────────────────

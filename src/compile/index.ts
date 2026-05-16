@@ -398,7 +398,10 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       // exposes a non-empty access shape for this local (e.g. `let
       // origSize = button.Size; origSize.X.Scale; origSize.Y.Offset`),
       // materialize the shape as a structural type annotation so
-      // downstream chained access typechecks without TS18046.
+      // downstream chained access typechecks without TS18046. The
+      // initializer is also cast `as unknown as Shape` so the
+      // annotation accepts even an `unknown`-typed RHS (the common
+      // case when the source is a leaf in another variable's shape).
       //
       // The narrow fallbacks if no shape applies:
       //   • `let x;` (no init AND no annotation) — annotate as
@@ -409,14 +412,47 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       let typeNode: ts.TypeNode | undefined = v.annotation ? compileType(v.annotation) : undefined;
       const initIsNil = init?.type === 'ConstantNil';
       if (!typeNode && ctx.compatMode === 'rbxts') {
-        const inferred = ctx.getShape(v.name) as
-          | import('./shape-infer.js').Shape
-          | undefined;
-        const fromShape = inferred ? shapeToTypeNode(inferred) : null;
-        if (fromShape) {
-          typeNode = fromShape;
-        } else if (!initExpr || initIsNil) {
-          typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+        // Phase 2 shape inference for locals: only apply when the
+        // initializer is one that TS would otherwise infer as
+        // `unknown` — bare identifier reads, property accesses, or
+        // missing/nil init. For initializers that produce a
+        // properly-typed value (Instance.new(…), function calls,
+        // table literals, constructors), let TS infer from the init
+        // — the inferred type is almost always better than what our
+        // structural shape would synthesize (e.g. `Part` vs.
+        // `{Name; Position; Size; Material; BrickColor}` — Part
+        // accepts `Vector3` on Position writes, the shape only
+        // accepts `unknown`).
+        const initIsShapelyCandidate =
+          !init
+          || init.type === 'ConstantNil'
+          || init.type === 'Local'
+          || init.type === 'Global'
+          || init.type === 'IndexName'
+          || init.type === 'IndexExpr';
+        if (initIsShapelyCandidate) {
+          const inferred = ctx.getShape(v.name) as
+            | import('./shape-infer.js').Shape
+            | undefined;
+          const fromShape = inferred ? shapeToTypeNode(inferred) : null;
+          if (fromShape) {
+            typeNode = fromShape;
+            // Route the initializer through `as unknown as <shape>`
+            // so even an `unknown` RHS satisfies the annotation.
+            // The cast is purely a TS-side hint; at runtime the
+            // value is whatever the source expression returns.
+            if (initExpr) {
+              initExpr = factory.createAsExpression(
+                factory.createAsExpression(
+                  initExpr,
+                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+                ),
+                fromShape,
+              );
+            }
+          } else if (!initExpr || initIsNil) {
+            typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+          }
         }
       }
       newDecls.push(
@@ -1508,12 +1544,33 @@ function buildAssignmentStatement(
     // luaIndexSet helper because the JS runtime needs to translate 1-based
     // Luau idioms (and `luaIndex(t, k) = v` isn't a valid TS lvalue).
     if (ctx.compatMode === 'rbxts') {
+      // Cast the receiver to `Record<string, unknown>` so the assignment
+      // accepts the RHS regardless of the receiver's declared shape AND
+      // the key is treated as a `string` slot (not narrowed to the
+      // receiver's known prop names). Routing the key through
+      // `unknown as string` covers Instance/Player/unknown-typed keys
+      // without triggering TS2538. roblox-ts's no-any rule isn't
+      // tripped because we widened via `Record` and `string`, not
+      // `any`. Round-trip back to Lua is identity (`t[k] = v`).
+      const recv = factory.createParenthesizedExpression(
+        factory.createAsExpression(
+          compileExpr(target.expr, ctx),
+          factory.createTypeReferenceNode('Record', [
+            factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ]),
+        ),
+      );
+      const key = factory.createAsExpression(
+        factory.createAsExpression(
+          compileExpr(indexExpr, ctx),
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+      );
       return factory.createExpressionStatement(
         factory.createAssignment(
-          factory.createElementAccessExpression(
-            compileExpr(target.expr, ctx),
-            compileExpr(indexExpr, ctx),
-          ),
+          factory.createElementAccessExpression(recv, key),
           valueExpr,
         ),
       );
@@ -1688,6 +1745,18 @@ function compileCompoundAssign(stat: CompoundAssignStat, ctx: CompileContext): t
   }
   const op = compoundAssignToken(stat.op);
   if (op !== undefined && stat.op !== '..' && stat.op !== '//') {
+    // rbxts mode: route arithmetic compound assigns through the
+    // expanded `target = target <op> value` form so the same
+    // `as any` operand widening compileBinary applies kicks in.
+    // Without this, `x += hit.Cash.Value` where `hit.Cash.Value`
+    // is unknown fires TS18046 (`Object of type 'unknown'`).
+    // Native mode keeps the tight `+=` form since unknown
+    // arithmetic isn't an issue there.
+    if (ctx.compatMode === 'rbxts') {
+      return factory.createExpressionStatement(
+        factory.createAssignment(target, newValue),
+      );
+    }
     return factory.createExpressionStatement(factory.createBinaryExpression(target, op, value));
   }
   return factory.createExpressionStatement(factory.createAssignment(target, newValue));
@@ -2488,33 +2557,30 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       // Runtime key: native bracket access in rbxts mode (roblox-ts preserves
       // variable indices), helper in native mode (handles 1-based at runtime).
       if (ctx.compatMode === 'rbxts') {
-        // The index is a runtime variable (not a literal). Under
-        // @rbxts/types' strict mode, indexing a typed object/array with
-        // an arbitrary key (`{ up: UDim2; … }[someVar]`) fires TS7053.
-        // Luau-style dictionary lookups make no narrowing promise here,
-        // so cast the target to `any` to mirror Luau's read-anything-
-        // index behaviour. We skip the cast when the target itself is
-        // already cast — avoid `((x as any) as any)` noise.
-        const alreadyAny = ts.isParenthesizedExpression(target)
-          && ts.isAsExpression(target.expression)
-          && target.expression.type?.kind === ts.SyntaxKind.AnyKeyword;
-        const dynamicTarget = alreadyAny
-          ? target
-          : factory.createParenthesizedExpression(
-              factory.createAsExpression(
-                target,
-                factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
-              ),
-            );
-        // Also cast the index to `any` so Player/Instance-typed keys
-        // (common in Roblox dict lookups by player) typecheck. TS
-        // rejects `someObj[player]` because Player isn't a valid index
-        // type, even when the receiver is `any`.
-        const anyIndex = factory.createAsExpression(
-          index,
-          factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+        // The index is a runtime variable (not a literal). Cast the
+        // receiver to `Record<string, unknown>` (not `any` — that
+        // would trip roblox-ts's no-any rule) so arbitrary string-
+        // keyed access yields `unknown`. Cast the index through
+        // `unknown as string` so Player/Instance-typed keys (common
+        // in Roblox dict lookups by player) coerce to a string slot
+        // without TS2538.
+        const dynamicTarget = factory.createParenthesizedExpression(
+          factory.createAsExpression(
+            target,
+            factory.createTypeReferenceNode('Record', [
+              factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ]),
+          ),
         );
-        return factory.createElementAccessExpression(dynamicTarget, anyIndex);
+        const coercedIndex = factory.createAsExpression(
+          factory.createAsExpression(
+            index,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+        );
+        return factory.createElementAccessExpression(dynamicTarget, coercedIndex);
       }
       const luaIndexFn = ctx.use('luaIndex');
       return factory.createCallExpression(
@@ -2933,7 +2999,22 @@ function compileBinary(
     '>=': ts.SyntaxKind.GreaterThanEqualsToken,
   };
   const directOp = direct[op];
-  if (directOp !== undefined) return factory.createBinaryExpression(left, directOp, right);
+  if (directOp !== undefined) {
+    // rbxts mode: comparison operands may be `unknown` (from
+    // structural-shape leaves), and `<` / `<=` / etc. on unknown
+    // fires TS2571. Cast both operands through `as any` so the
+    // comparison goes through. roblox-ts will emit `a < b` in Lua
+    // either way; the runtime dispatch uses __lt or numeric
+    // comparison based on actual types.
+    if (ctx.compatMode === 'rbxts') {
+      const wrap = (e: ts.Expression) =>
+        factory.createParenthesizedExpression(
+          factory.createAsExpression(e, factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword)),
+        );
+      return factory.createBinaryExpression(wrap(left), directOp, wrap(right));
+    }
+    return factory.createBinaryExpression(left, directOp, right);
+  }
 
   throw new Error(`luau-to-ts: unhandled binary operator '${op}'`);
 }
@@ -3206,8 +3287,42 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
   // signal so nested tuple-returning calls auto-extract.
   const savedMR = ctx.preferMultiReturn;
   ctx.preferMultiReturn = false;
-  const args = expr.args.map((a) => compileExprAsArg(a, ctx));
+  let args = expr.args.map((a) => compileExprAsArg(a, ctx));
   ctx.preferMultiReturn = savedMR;
+
+  // rbxts mode: `string.format(fmt, …rest)` typed as `(fmt: string,
+  // …Array<number | string>)` per @rbxts/types. After Phase 2, the
+  // rest args are often `unknown` (structural-shape leaves), which
+  // fires TS2345. Cast each rest arg `as unknown as string | number`
+  // so the variadic slot accepts them. Same for `string.gsub`'s
+  // repl arg in some shapes — applied uniformly across the string
+  // namespace methods that have number-or-string variadic tails.
+  if (
+    ctx.compatMode === 'rbxts'
+    && !expr.self
+    && expr.func.type === 'IndexName'
+    && expr.func.expr.type === 'Global'
+    && (expr.func.expr as { name: string }).name === 'string'
+    && (expr.func.index === 'format')
+    && args.length > 1
+  ) {
+    const numStr = factory.createUnionTypeNode([
+      factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+      factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+    ]);
+    args = [
+      args[0]!,
+      ...args.slice(1).map((a) =>
+        factory.createAsExpression(
+          factory.createAsExpression(
+            a,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          numStr,
+        ),
+      ),
+    ];
+  }
 
   // Macro registry — interception point for compatMode='rbxts' rewrites
   // (Vector3.new → new Vector3, Instance.new("Part") → new Part(),

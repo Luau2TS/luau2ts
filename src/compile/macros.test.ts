@@ -25,9 +25,11 @@ describe('macros — datatype constructors (R.2)', () => {
     // Vector3 is a globally-declared class in @rbxts/types (no exports —
     // the module isn't importable). We DON'T emit `import { Vector3 }
     // from "@rbxts/types"` in rbxts mode; the bare `new Vector3(...)`
-    // resolves via the ambient declaration.
+    // resolves via the ambient declaration. Phase 2 of the rbxts
+    // cleanup wraps each numeric-constructor arg in `as unknown as
+    // number` so unknown leaves from inferred shapes flow in.
     const out = await emit('local v = Vector3.new(1, 2, 3)', 'rbxts');
-    expect(out).toContain('new Vector3(1, 2, 3)');
+    expect(out).toMatch(/new Vector3\(\s*1 as unknown as number/);
     expect(out).not.toContain('@rbxts/types');
   });
 
@@ -392,7 +394,7 @@ describe('macros — re-export grouping', () => {
       'rbxts',
     );
     expect(out).not.toContain('@rbxts/types');
-    expect(out).toContain('new Vector3(1, 2, 3)');
+    expect(out).toMatch(/new Vector3\(\s*1 as unknown as number/);
     expect(out).toContain('Color3.fromRGB(255, 0, 0)');
     expect(out).toContain('new CFrame(0, 0, 0)');
   });
