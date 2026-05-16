@@ -965,12 +965,20 @@ function rewriteSuperCall(stat: ts.Statement, superclass: string): ts.Statement 
       && ts.isIdentifier(node.expression.name)
       && node.expression.name.text === 'constructor'
     ) {
-      // Drop the first arg if it's `this` / `self` — both forms appear
-      // depending on whether the self→this rewrite ran first (which
-      // produces a ts.ThisExpression node, not an identifier).
+      // Drop the first arg if it's `this` / `self` — both forms
+      // appear depending on whether the self→this rewrite ran first
+      // (which produces a ts.ThisExpression node, not an identifier).
+      // Look through any `(<expr>) as T as U` wrappers too: the
+      // call-arg cast we inserted wraps `this` in an AsExpression
+      // chain, but the semantic content is still `this`.
       const args = node.arguments.slice();
+      const unwrap = (e: ts.Expression): ts.Expression => {
+        if (ts.isParenthesizedExpression(e)) return unwrap(e.expression);
+        if (ts.isAsExpression(e)) return unwrap(e.expression);
+        return e;
+      };
       if (args.length > 0) {
-        const first = args[0]!;
+        const first = unwrap(args[0]!);
         const isThisLike =
           first.kind === ts.SyntaxKind.ThisKeyword
           || (ts.isIdentifier(first) && (first.text === 'this' || first.text === 'self'));

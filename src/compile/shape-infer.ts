@@ -373,16 +373,35 @@ const INSTANCE_DISCRIMINATORS = new Set([
   'ClassName',
 ]);
 
-/** True if the shape includes any property/method that's definitively
- *  on Instance (and nowhere else in common code). Used to decide
- *  whether to intersect the synthesized type literal with Instance. */
-function looksLikeInstance(shape: Shape): boolean {
-  for (const name of shape.props.keys()) {
-    if (INSTANCE_DISCRIMINATORS.has(name)) return true;
-  }
-  for (const name of shape.methods.keys()) {
-    if (INSTANCE_DISCRIMINATORS.has(name)) return true;
-  }
+/** Members unique enough to Player that observing one identifies the
+ *  shape as a Player. Use `& Player` instead of `& Instance` so
+ *  player.GetRoleInGroup / GetRankInGroup / etc. resolve to their
+ *  declared signatures (string / number) instead of the structural
+ *  `(...args: unknown[]): unknown` we'd otherwise synthesize. */
+const PLAYER_DISCRIMINATORS = new Set([
+  'UserId', 'DisplayName', 'Character', 'CharacterAdded',
+  'CharacterRemoving', 'LoadCharacter', 'GetRoleInGroup',
+  'GetRankInGroup', 'IsInGroup', 'Kick',
+]);
+
+/** Pick the closest Roblox class for a structural shape — order
+ *  matters: more-specific discriminators win. */
+function intersectionTypeName(shape: Shape): string | null {
+  const has = (name: string) =>
+    shape.props.has(name) || shape.methods.has(name);
+  for (const d of PLAYER_DISCRIMINATORS) if (has(d)) return 'Player';
+  for (const d of INSTANCE_DISCRIMINATORS) if (has(d)) return 'Instance';
+  return null;
+}
+
+/** Names that a given intersection target type already declares. The
+ *  structural literal we synthesize alongside the intersection drops
+ *  these names so our `(...args: unknown[]): unknown` signature
+ *  doesn't override the @rbxts/types-declared one. */
+function intersectionTargetDeclaresName(target: string, name: string): boolean {
+  if (target === 'Instance') return INSTANCE_DISCRIMINATORS.has(name);
+  if (target === 'Player') return INSTANCE_DISCRIMINATORS.has(name)
+    || PLAYER_DISCRIMINATORS.has(name);
   return false;
 }
 
@@ -488,18 +507,19 @@ export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
   }
 
   if (members.length === 0) return null;
-  // If the shape looks like an Instance (has GetAttribute / IsA /
-  // FindFirstChild / etc.), drop any INSTANCE_DISCRIMINATORS members
-  // from the synthesized literal (Instance already declares them
-  // with stricter sigs — `Destroy(): void` vs. our `Destroy(...args:
-  // unknown[]): unknown`). Then intersect with Instance so the
-  // result has Instance's typed members AND the structural-literal's
-  // extras (user-named children, attributes accessed by name etc.).
-  if (looksLikeInstance(shape)) {
+  // If the shape looks like a known Roblox class (Player /
+  // Instance), drop any members the class already declares — our
+  // synthesized `(...args: unknown[]): unknown` signature is looser
+  // than the @rbxts/types one and would shadow it on intersection.
+  // Then intersect with the target class so the result has its
+  // typed members AND the structural-literal's extras (user-named
+  // children, attributes accessed by name, etc.).
+  const targetClass = intersectionTypeName(shape);
+  if (targetClass) {
     const trimmedMembers = members.filter((m) => {
       const name = m.name && ts.isIdentifier(m.name) ? m.name.text : undefined;
       if (!name) return true;
-      return !INSTANCE_DISCRIMINATORS.has(name);
+      return !intersectionTargetDeclaresName(targetClass, name);
     });
     const intersectedLiteral = trimmedMembers.length > 0
       ? factory.createTypeLiteralNode(trimmedMembers)
@@ -507,11 +527,11 @@ export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
     if (intersectedLiteral) {
       return factory.createIntersectionTypeNode([
         intersectedLiteral,
-        factory.createTypeReferenceNode('Instance', undefined),
+        factory.createTypeReferenceNode(targetClass, undefined),
       ]);
     }
-    // Shape was nothing but Instance discriminators — just emit Instance.
-    return factory.createTypeReferenceNode('Instance', undefined);
+    // Shape was nothing but discriminators — just emit the class.
+    return factory.createTypeReferenceNode(targetClass, undefined);
   }
   return factory.createTypeLiteralNode(members);
 }

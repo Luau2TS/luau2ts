@@ -234,12 +234,16 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     // expose .toUpperCase, .toLowerCase, .repeat). Keep the bare
     // namespace call.
     const out = await emit('local u = string.upper(name)', 'rbxts');
-    expect(out).toContain('string.upper(name)');
+    // Phase 2 inserts a `as unknown as Parameters<typeof
+    // string.upper>[0]` cast on the arg so unknown-typed values
+    // flow into the typed slot. The literal namespace call still
+    // appears.
+    expect(out).toMatch(/string\.upper\(name as unknown as Parameters<typeof string\.upper>/);
   });
 
   it('string.split(s, sep) keeps the namespace form', async () => {
     const out = await emit('local parts = string.split(s, ",")', 'rbxts');
-    expect(out).toContain('string.split(s, ",")');
+    expect(out).toMatch(/string\.split\(s as unknown as Parameters<typeof string\.split>/);
   });
 
   it('math.floor(x) keeps lowercase `math.floor` (roblox-ts has it as a Lua global)', async () => {

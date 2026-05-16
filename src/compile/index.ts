@@ -3315,6 +3315,70 @@ function scanYieldingFunctions(root: BlockStat, ctx: CompileContext): void {
   }
 }
 
+/** rbxts mode: cast each call arg through `Parameters<typeof
+ *  callee>[i]` so unknown-typed values flow into the callee's
+ *  declared param types (Players.GetPlayerByUserId expects number,
+ *  TweenService.Create expects Instance, etc.).
+ *
+ *  Only fires when `callee` is a "simple" reference TS can take
+ *  `typeof` of — Identifier or PropertyAccessExpression chains. For
+ *  complex callees (function-typed expressions, IIFEs, etc.) the
+ *  args go through uncasted; the existing structural-shape work
+ *  covers those.
+ *
+ *  Skips args that are already cast (already have a TypeAssertion
+ *  ancestor) to avoid `(x as A) as Parameters<typeof f>[0]` noise.
+ */
+function castArgsForCall(
+  callee: ts.Expression,
+  args: readonly ts.Expression[],
+  ctx: CompileContext,
+): readonly ts.Expression[] {
+  if (ctx.compatMode !== 'rbxts') return args;
+  if (!isSimpleCalleeRef(callee)) return args;
+  return args.map((arg, i) => {
+    // Skip parenthesised-AsExpression — already cast.
+    if (ts.isParenthesizedExpression(arg) && ts.isAsExpression(arg.expression)) {
+      return arg;
+    }
+    if (ts.isAsExpression(arg)) return arg;
+    // Wrap arrow-function args in parens before casting — arrow
+    // `() => { … } as T` would parse as arrow returning `T`, not
+    // as a cast.
+    const inner = (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg))
+      ? factory.createParenthesizedExpression(arg)
+      : arg;
+    return factory.createAsExpression(
+      // Route through `unknown` first so TS2352 ("conversion may be
+      // a mistake because neither type sufficiently overlaps") stays
+      // off — the user's value might be `(...) => void` cast to
+      // `thread`, etc., and TS rejects the direct cast unless we
+      // explicitly widen first.
+      factory.createAsExpression(
+        inner,
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
+      factory.createIndexedAccessTypeNode(
+        factory.createTypeReferenceNode('Parameters', [
+          factory.createTypeQueryNode(callee as ts.EntityName),
+        ]),
+        factory.createLiteralTypeNode(factory.createNumericLiteral(i)),
+      ),
+    );
+  });
+}
+
+/** True when `expr` is a simple reference (`Identifier` or a chain of
+ *  property accesses anchored in an Identifier). `typeof expr` is
+ *  valid in TS type position only for these forms. */
+function isSimpleCalleeRef(expr: ts.Expression): boolean {
+  if (ts.isIdentifier(expr)) return true;
+  if (ts.isPropertyAccessExpression(expr)) {
+    return isSimpleCalleeRef(expr.expression);
+  }
+  return false;
+}
+
 function compileExprAsArg(a: Expr, ctx: CompileContext): ts.Expression {
   if (a.type === 'Varargs') {
     return factory.createSpreadElement(factory.createIdentifier('__varargs'));
@@ -3492,16 +3556,14 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
 
   let call: ts.Expression;
   if (expr.self && expr.func.type === 'IndexName') {
-    call = factory.createCallExpression(
-      factory.createPropertyAccessExpression(
-        compileExpr(expr.func.expr, ctx),
-        factory.createIdentifier(propertyName(expr.func.index)),
-      ),
-      undefined,
-      args,
+    const calleeAccess = factory.createPropertyAccessExpression(
+      compileExpr(expr.func.expr, ctx),
+      factory.createIdentifier(propertyName(expr.func.index)),
     );
+    call = factory.createCallExpression(calleeAccess, undefined, castArgsForCall(calleeAccess, args, ctx));
   } else {
-    call = factory.createCallExpression(compileExpr(expr.func, ctx), undefined, args);
+    const calleeExpr = compileExpr(expr.func, ctx);
+    call = factory.createCallExpression(calleeExpr, undefined, castArgsForCall(calleeExpr, args, ctx));
   }
   // rbxts mode: methods that return `Instance | undefined` in @rbxts/types
   // (FindFirstChild family, FindFirstAncestor family) plus methods that
