@@ -243,9 +243,24 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
   // which roblox-ts destructures natively (`let [a, b] = f()` ⇄ Lua
   // `local a, b = f()`). Drop the multiret wrap so the output stays clean.
   if (stat.vars.length > 1 && stat.values.length === 1 && stat.values[0]?.type === 'Call') {
+    // The RHS call genuinely consumes the multi-return tuple; suppress
+    // the rbxts-mode single-value auto-extraction.
+    const savedMR = ctx.preferMultiReturn;
+    ctx.preferMultiReturn = true;
     const rawInit = compileExpr(stat.values[0]!, ctx);
+    ctx.preferMultiReturn = savedMR;
+    // In rbxts mode cast the RHS to `any` so the destructured locals
+    // each pick up `any` instead of the LuaTuple's typed components
+    // (`unknown` triggers TS18046 on every property access; nullable
+    // slot types trigger TS18047). A tuple cast `as [any, any]` would
+    // require type-overlap with the source — TS rejects that against
+    // LuaTuple discriminated unions (TS2352). Single `as any` is the
+    // safest widening.
     const init = ctx.compatMode === 'rbxts'
-      ? rawInit
+      ? factory.createAsExpression(
+          rawInit,
+          factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+        )
       : factory.createCallExpression(
           factory.createIdentifier(ctx.use('multiret')),
           undefined,
@@ -372,11 +387,32 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       }
       ctx.assignLocal(v.name, typeFromAnnotation(v.annotation, init, ctx));
     } else {
+      // Phase 1 of the rbxts cleanup: don't broadly annotate locals as
+      // `: any`. Earlier we widened `let x` / `let x = nil` / `let x
+      // = {}` to `: any` to absorb Luau's "everything is a runtime
+      // table" semantics, but that propagates `any` into every
+      // downstream usage and trips roblox-ts's no-any rule N times.
+      //
+      // The narrow cases we still need a hint for:
+      //   • `let x;` (no init AND no annotation) — TS infers undefined
+      //     in strict mode and rejects later writes (TS7034). Annotate
+      //     as `unknown` so it's writable AND roblox-ts-clean.
+      //   • `let x = nil` (init is ConstantNil) — same problem,
+      //     annotate as `unknown` with an `undefined` initializer.
+      //   • table-init locals: drop the annotation entirely and let
+      //     TS infer. Some downstream `obj.X = …` writes will fail
+      //     against the inferred type — that's the surface area
+      //     Phase 2 fixes with per-variable shape inference.
+      let typeNode: ts.TypeNode | undefined = v.annotation ? compileType(v.annotation) : undefined;
+      const initIsNil = init?.type === 'ConstantNil';
+      if (!typeNode && ctx.compatMode === 'rbxts' && (!initExpr || initIsNil)) {
+        typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+      }
       newDecls.push(
         factory.createVariableDeclaration(
           factory.createIdentifier(jsName),
           undefined,
-          v.annotation ? compileType(v.annotation) : undefined,
+          typeNode,
           initExpr,
         ),
       );
@@ -432,14 +468,49 @@ function asyncModIfNeeded(body: ts.Block): readonly ts.Modifier[] | undefined {
  *  Returns the largest number of values across any return; null if every
  *  return has 0 or 1 value. Skips nested functions since each one's
  *  return shape is its own concern. */
+/** True if the given TS statement contains a `return` outside any
+ *  nested function/arrow/method scope. Used to detect top-level
+ *  early-exit patterns that need to be wrapped in an IIFE for
+ *  TS to accept (TS1108 fires on bare module-scoped `return`). */
+function containsTopLevelReturn(stat: ts.Statement): boolean {
+  let found = false;
+  function visit(node: ts.Node): void {
+    if (found) return;
+    if (
+      ts.isFunctionDeclaration(node)
+      || ts.isFunctionExpression(node)
+      || ts.isArrowFunction(node)
+      || ts.isMethodDeclaration(node)
+      || ts.isGetAccessorDeclaration(node)
+      || ts.isSetAccessorDeclaration(node)
+      || ts.isConstructorDeclaration(node)
+    ) {
+      return;
+    }
+    if (ts.isReturnStatement(node)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(stat);
+  return found;
+}
+
 function maxMultiReturnArity(body: BlockStat | Stat): number | null {
   let max: number | null = null;
+  let hasShortReturn = false;
   function walk(stat: Stat | null | undefined): void {
     if (!stat) return;
     if (stat.type === 'Function' || stat.type === 'LocalFunction') return;
     if (stat.type === 'Return') {
       if (stat.values.length > 1) {
         max = Math.max(max ?? 0, stat.values.length);
+      } else {
+        // 0 or 1-value return — incompatible with a LuaTuple<[…]>
+        // annotation. Track so callers can decide to skip the
+        // multi-return widening entirely.
+        hasShortReturn = true;
       }
       return;
     }
@@ -464,6 +535,9 @@ function maxMultiReturnArity(body: BlockStat | Stat): number | null {
     // direct return, so we don't need to descend into them.
   }
   walk(body);
+  // Mixed-arity functions can't be typed as `LuaTuple<[…]>` because the
+  // single-return paths would each need wrapping. Drop the widening.
+  if (hasShortReturn) return null;
   return max;
 }
 
@@ -638,6 +712,15 @@ function compileFor(stat: ForStat, ctx: CompileContext): ts.Statement {
     // up Roblox. Without a guard the same loop hangs every browser tab. Bail
     // out as soon as the loop variable is non-finite — Infinity/NaN bounds
     // could never make forward progress anyway.
+    //
+    // In rbxts mode `Number` (the JS global) is only a TYPE under
+    // @rbxts/types — `Number.isFinite` fires TS2693. Roblox's runtime
+    // is the Lua VM so the browser-DoS scenario doesn't apply; skip the
+    // guard entirely. (If we need it later we'd encode it via `i === i`
+    // + math.abs(i) < math.huge.)
+    if (ctx.compatMode === 'rbxts') {
+      return factory.createBlock(inner, true);
+    }
     const guard = factory.createIfStatement(
       factory.createPrefixUnaryExpression(
         ts.SyntaxKind.ExclamationToken,
@@ -792,6 +875,11 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     // `ipairs(ipairs(arr))`. Unwrap the explicit call so the wrap
     // doesn't double up. Same for pairs() (used in dict iteration).
     let iterableSource: Expr | null = null;
+    // True when the user explicitly wrote `pairs(t)` — preserves the
+    // dict-iteration semantics (key = table key, not array index) by
+    // routing through @rbxts/types' pairs() declaration below instead
+    // of the default ipairs() wrap.
+    let userWantsPairs = false;
     if (
       stat.values.length === 1
       && stat.values[0]!.type === 'Call'
@@ -801,6 +889,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
       && (stat.values[0]! as { args: Expr[] }).args.length === 1
     ) {
       iterableSource = (stat.values[0]! as { args: Expr[] }).args[0]!;
+      userWantsPairs = (stat.values[0]!.func as { name: string }).name === 'pairs';
     }
     const iterableExpr = iterableSource
       ? compileExpr(iterableSource, ctx)
@@ -824,8 +913,16 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     // access with TS18046 ("X is of type 'unknown'"). Same trick as
     // for-of method-result casts: roblox-ts accepts `any` in this
     // position, real Roblox runtime doesn't care.
+    //
+    // The direct cast `expr as any[]` is rejected by TS when the
+    // source's static type doesn't overlap with `any[]` — e.g. a
+    // record-shaped table `{ a: number; b: number }`. Route through
+    // `unknown` first to widen unconditionally.
     const castedIterable = factory.createAsExpression(
-      iterableExpr,
+      factory.createAsExpression(
+        iterableExpr,
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
       factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword)),
     );
     if (stat.vars.length === 1) {
@@ -845,16 +942,45 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
         ),
       ];
     }
-    // Two-binding `for k, v in arr do` — use ipairs(). roblox-ts has
-    // ipairs<T>(t: Array<T>) declared in @rbxts/types returning typed
-    // [number, T] pairs, which the destructure picks up faithfully.
-    // arr.entries() isn't available in roblox-ts's Array type because
-    // Lua has no native entries() iterator.
+    // Two-binding `for k, v in arr do`:
+    //   • Default / user-wrote-ipairs: use ipairs() — array iteration,
+    //     k = 1-based index (typed `number`), v = element.
+    //   • User-wrote-pairs: use pairs() — dict iteration, k = table key
+    //     (could be any type), v = value. Wrapping in `pairs(... as any)`
+    //     widens both slots so the destructured locals get `any`.
     const binding = factory.createArrayBindingPattern(
       forInNames.map((name) =>
         factory.createBindingElement(undefined, undefined, factory.createIdentifier(name)),
       ),
     );
+    const iteratorFn = userWantsPairs ? 'pairs' : 'ipairs';
+    if (userWantsPairs) ctx.useAmbient('pairs');
+    const iterCall = factory.createCallExpression(
+      factory.createIdentifier(iteratorFn),
+      undefined,
+      [
+        userWantsPairs
+          // pairs() expects an object — cast through `any` to
+          // tolerate the Luau record-as-array idiom (`{[1]=…, ["k"]=…}`).
+          ? factory.createAsExpression(
+              iterableSource
+                ? compileExpr(iterableSource, ctx)
+                : (stat.values.length === 1
+                    ? compileExpr(stat.values[0]!, ctx)
+                    : factory.createArrayLiteralExpression(stat.values.map((v) => compileExpr(v, ctx)))),
+              factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+            )
+          : castedIterable,
+      ],
+    );
+    // pairs(x as any) types its key as `string | number | symbol`
+    // (`keyof any`); ipairs(x as any[]) types its key as `number`.
+    // Cast the iterator-call result to `any` for pairs() so the
+    // destructured key picks up `any` and `key.X` access typechecks
+    // under Luau-style dynamic key usage.
+    const iterableForFor: ts.Expression = userWantsPairs
+      ? factory.createAsExpression(iterCall, factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword))
+      : iterCall;
     return [
       factory.createForOfStatement(
         undefined,
@@ -862,11 +988,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
           [factory.createVariableDeclaration(binding, undefined, undefined, undefined)],
           ts.NodeFlags.Const,
         ),
-        factory.createCallExpression(
-          factory.createIdentifier('ipairs'),
-          undefined,
-          [castedIterable],
-        ),
+        iterableForFor,
         factory.createBlock(bodyStatements, true),
       ),
     ];
@@ -1404,6 +1526,13 @@ function buildAssignmentStatement(
  *  on write the property exists at runtime so plain access works. */
 function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
   if (target.type === 'IndexName') {
+    // Phase 1 of rbxts cleanup dropped the `<DetectedClass>.member = …`
+    // `(class as any).member = …` LHS cast. That cast was for Luau's
+    // monkey-patch idiom (`ProfileService.GetProfileStore = function
+    // …`) — extending a class statically at runtime. roblox-ts
+    // doesn't support that pattern; Phase 2 will handle it via
+    // module augmentation declarations alongside the class. Until
+    // then, monkey-patch writes will surface TS2339.
     return factory.createPropertyAccessExpression(
       compileExpr(target.expr, ctx),
       factory.createIdentifier(propertyName(target.index)),
@@ -1432,9 +1561,17 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
   // Single RHS call with multiple LHS → destructuring assignment.
   if (stat.vars.length > 1 && stat.values.length === 1 && stat.values[0]?.type === 'Call') {
     const targets = stat.vars.map((v) => compileExpr(v, ctx));
+    // The RHS call genuinely consumes the multi-return tuple; suppress
+    // the rbxts-mode single-value auto-extraction (`(string.gsub(...))[0]`).
+    const savedMR = ctx.preferMultiReturn;
+    ctx.preferMultiReturn = true;
     const rawRhs = compileExpr(stat.values[0]!, ctx);
+    ctx.preferMultiReturn = savedMR;
     const valueExpr = ctx.compatMode === 'rbxts'
-      ? rawRhs
+      ? factory.createAsExpression(
+          rawRhs,
+          factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+        )
       : factory.createCallExpression(
           factory.createIdentifier(ctx.use('multiret')),
           undefined,
@@ -1798,6 +1935,14 @@ function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.Par
   // Optionality has to be trailing: once a required arg follows, the
   // earlier `?` slots can't be omitted positionally either.
   const optionalFrom = computeTrailingOptionalStart(locals);
+  // rbxts-mode extension: a trailing run of UNANNOTATED params can also
+  // be marked optional, since their type is `any` regardless. We compute
+  // a separate cutoff that accepts unannotated-or-nilable; the cutoff
+  // applies on top of `optionalFrom` (annotated-nilable wins because it
+  // chooses the `= undefined` default path instead of `?`).
+  const rbxtsOptionalFrom = ctx.compatMode === 'rbxts'
+    ? computeTrailingOptionalStartRbxts(locals)
+    : locals.length;
   locals.forEach((local, i) => {
     const base = safeIdentifier(local.name);
     let name = base;
@@ -1812,16 +1957,30 @@ function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.Par
     const isOptional = i >= optionalFrom;
     // Native mode: leave unannotated params untyped (TS infers).
     // rbxts mode: roblox-ts requires `strict: true` which rejects
-    // implicit-any params (TS7006); annotate explicitly as `any`.
-    // `unknown` would satisfy strict but trip TS18046 ("'X' is of
-    // type 'unknown'") on every property access in the body —
-    // `any` is the more useful default.
+    // implicit-any params (TS7006); annotate explicitly as `unknown`.
+    // Phase 1 of the rbxts cleanup switched away from `: any` —
+    // every body access on the param fired roblox-ts's no-any rule.
+    // `unknown` keeps the call site flexible AND satisfies strict
+    // mode AND keeps roblox-ts happy. Body accesses now require
+    // narrowing (TS18046); Phase 2 will narrow by inferring shapes
+    // from observed access patterns.
     let ty: ts.TypeNode | undefined;
     if (local.annotation) {
       ty = compileType(local.annotation);
     } else if (ctx.compatMode === 'rbxts') {
-      ty = factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
+      ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
     }
+    // rbxts mode: Luau call semantics let any param be omitted (missing
+    // positional args become `nil`); roblox-ts strict mode rejects
+    // mismatched arity unless params carry `?`. For UNANNOTATED params
+    // that sit in the rbxts-trailing-optional region (every later param
+    // is also unannotated-or-nilable), mark them optional (`name?: any`)
+    // so legacy Luau callers that pass fewer args than the declaration
+    // still typecheck. An annotated `: number` param without `?` is the
+    // user's explicit signal that the arg is required.
+    const rbxtsImplicitOptional =
+      ctx.compatMode === 'rbxts' && !local.annotation && i >= rbxtsOptionalFrom;
+    const useQuestion = rbxtsImplicitOptional && !isOptional;
     // In rbxts mode the default value is `undefined` to match the
     // nil-as-undefined choice (roblox-ts rejects `null` literally).
     out.push(
@@ -1829,9 +1988,9 @@ function paramsFromLocals(locals: readonly Local[], ctx: CompileContext): ts.Par
         undefined,
         undefined,
         factory.createIdentifier(name),
-        undefined,
+        useQuestion ? factory.createToken(ts.SyntaxKind.QuestionToken) : undefined,
         ty,
-        isOptional
+        isOptional && !useQuestion
           ? (ctx.compatMode === 'rbxts'
               ? factory.createIdentifier('undefined')
               : factory.createNull())
@@ -1849,6 +2008,22 @@ function computeTrailingOptionalStart(locals: readonly Local[]): number {
   let firstTrailing = locals.length;
   for (let i = locals.length - 1; i >= 0; i--) {
     if (annotationIsNilable(locals[i]!.annotation)) {
+      firstTrailing = i;
+    } else {
+      break;
+    }
+  }
+  return firstTrailing;
+}
+
+/** rbxts-mode variant: a trailing run of UNANNOTATED params (whose type
+ *  defaults to `any`) is also positionally optional. Combines with the
+ *  nilable-annotation rule so a tail of `(x, y, z: T?)` still produces
+ *  three optional params. */
+function computeTrailingOptionalStartRbxts(locals: readonly Local[]): number {
+  let firstTrailing = locals.length;
+  for (let i = locals.length - 1; i >= 0; i--) {
+    if (!locals[i]!.annotation || annotationIsNilable(locals[i]!.annotation)) {
       firstTrailing = i;
     } else {
       break;
@@ -2053,6 +2228,27 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           ctx.useAmbient(expr.name);
         }
       }
+      // rbxts-mode name remappings for Lua globals that don't have a
+      // matching identifier in @rbxts/types or whose name collides with
+      // a TS reserved word:
+      //   • `typeof`  → `typeOf`   (declared in @rbxts/compiler-types)
+      //   • `workspace` → `(game.Workspace as any)` (workspace is NOT
+      //     declared global in @rbxts/types; `game` is. Cast to `any`
+      //     so the runtime-named children access typechecks under strict.)
+      if (ctx.compatMode === 'rbxts' && !ctx.getLocalJsName(expr.name)) {
+        if (expr.name === 'typeof') {
+          return factory.createIdentifier('typeOf');
+        }
+        if (expr.name === 'workspace') {
+          return factory.createAsExpression(
+            factory.createPropertyAccessExpression(
+              factory.createIdentifier('game'),
+              factory.createIdentifier('Workspace'),
+            ),
+            factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+          );
+        }
+      }
       return factory.createIdentifier(ctx.getLocalJsName(expr.name) ?? safeIdentifier(expr.name));
     case 'Varargs':
       // Single-value default; call-arg / table-list use compileExprAsArg.
@@ -2147,6 +2343,15 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           factory.createIdentifier(propertyName(expr.index)),
         );
       }
+      // Phase 1 of rbxts cleanup dropped the blanket `<DetectedClass>
+      // .member` → `(class as any).member` cast. Static methods are
+      // already in the class declaration; reading them by name works
+      // without a cast. The case the cast originally caught — reading
+      // an INSTANCE method by name off the class identifier for
+      // metatable-style dispatch tables — is rare enough that we'd
+      // rather surface the TS error than poison every static access
+      // with `any`. Phase 2 will handle that case via class
+      // augmentation.
       const access = factory.createPropertyAccessExpression(
         compileExpr(expr.expr, ctx),
         factory.createIdentifier(propertyName(expr.index)),
@@ -2178,9 +2383,24 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       // `Array.isArray(t)` at runtime and only subtracts 1 when t is an
       // actual JS array. Sequence tables still index correctly; dictionary
       // tables pass through unchanged.
-      const target = compileExpr(expr.expr, ctx);
+      let target = compileExpr(expr.expr, ctx);
       const indexExpr = expr.index;
       const index = compileExpr(indexExpr, ctx);
+      // rbxts mode: `_G` is declared in @rbxts/types as `interface _G {}`
+      // (empty), so `_G["deb"]` fires TS7053. Cast to `any` so dynamic
+      // access through the shared global table type-checks.
+      if (
+        ctx.compatMode === 'rbxts'
+        && expr.expr.type === 'Global'
+        && (expr.expr as { name: string }).name === '_G'
+      ) {
+        target = factory.createParenthesizedExpression(
+          factory.createAsExpression(
+            target,
+            factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+          ),
+        );
+      }
       if (
         (indexExpr.type === 'ConstantNumber' || indexExpr.type === 'ConstantInteger')
         && typeof (indexExpr as { value: number }).value === 'number'
@@ -2200,7 +2420,33 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       // Runtime key: native bracket access in rbxts mode (roblox-ts preserves
       // variable indices), helper in native mode (handles 1-based at runtime).
       if (ctx.compatMode === 'rbxts') {
-        return factory.createElementAccessExpression(target, index);
+        // The index is a runtime variable (not a literal). Under
+        // @rbxts/types' strict mode, indexing a typed object/array with
+        // an arbitrary key (`{ up: UDim2; … }[someVar]`) fires TS7053.
+        // Luau-style dictionary lookups make no narrowing promise here,
+        // so cast the target to `any` to mirror Luau's read-anything-
+        // index behaviour. We skip the cast when the target itself is
+        // already cast — avoid `((x as any) as any)` noise.
+        const alreadyAny = ts.isParenthesizedExpression(target)
+          && ts.isAsExpression(target.expression)
+          && target.expression.type?.kind === ts.SyntaxKind.AnyKeyword;
+        const dynamicTarget = alreadyAny
+          ? target
+          : factory.createParenthesizedExpression(
+              factory.createAsExpression(
+                target,
+                factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+              ),
+            );
+        // Also cast the index to `any` so Player/Instance-typed keys
+        // (common in Roblox dict lookups by player) typecheck. TS
+        // rejects `someObj[player]` because Player isn't a valid index
+        // type, even when the receiver is `any`.
+        const anyIndex = factory.createAsExpression(
+          index,
+          factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+        );
+        return factory.createElementAccessExpression(dynamicTarget, anyIndex);
       }
       const luaIndexFn = ctx.use('luaIndex');
       return factory.createCallExpression(
@@ -2256,11 +2502,29 @@ function compileUnary(expr: Extract<Expr, { type: 'Unary' }>, ctx: CompileContex
       const innerType = staticTypeOfExpr(expr.expr, ctx);
       // Type-narrowed length: strings have a native .length property
       // with byte-equivalent semantics under our parser's UTF-8 strings.
-      // For unknown / table types we still need lualen, which walks the
-      // array part of mixed list+dict tables the way Lua does.
       if (innerType === 'string') {
         return factory.createPropertyAccessExpression(inner, 'length');
       }
+      // rbxts mode: emit `#expr` as a real Lua `#` via roblox-ts. The
+      // closest TS idiom is `(expr as any).size()` for arrays (roblox-ts
+      // Array.size() compiles to `#expr`), but unknown-shape values
+      // need the source's intent preserved. Cast to any and call size().
+      if (ctx.compatMode === 'rbxts') {
+        return factory.createCallExpression(
+          factory.createPropertyAccessExpression(
+            factory.createParenthesizedExpression(
+              factory.createAsExpression(
+                inner,
+                factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+              ),
+            ),
+            factory.createIdentifier('size'),
+          ),
+          undefined,
+          [],
+        );
+      }
+      // Native mode: use the lualen helper to handle mixed-table semantics.
       const fn = ctx.use('lualen');
       return factory.createCallExpression(factory.createIdentifier(fn), undefined, [inner]);
     }
@@ -2295,9 +2559,22 @@ function compileUnary(expr: Extract<Expr, { type: 'Unary' }>, ctx: CompileContex
 }
 
 function compileBinaryExpr(expr: Extract<Expr, { type: 'Binary' }>, ctx: CompileContext): ts.Expression {
-  const leftType = staticTypeOfExpr(expr.left, ctx);
+  let leftType = staticTypeOfExpr(expr.left, ctx);
   const rightType = staticTypeOfExpr(expr.right, ctx);
   const left = compileExpr(expr.left, ctx);
+  // Luau idiom: `cond and value or fallback`. After our `and` lowering
+  // the LHS becomes `cond && value` whose result may be literal `false`
+  // (from the false-y short-circuit). The outer `or` must fall through
+  // false → fallback, but `??` only catches null/undefined. Force the
+  // boolean static type so compileLogicalBinary picks `||` (which
+  // catches false too) for this LHS.
+  if (
+    expr.op === 'or'
+    && expr.left.type === 'Binary'
+    && (expr.left as { op?: string }).op === 'and'
+  ) {
+    leftType = 'boolean';
+  }
   // `or { }` fallback: `config = config or {}` overwhelmingly means
   // "default to empty object," not "default to empty array." compileTable
   // returns `[]` for `{}` by default (array literal). When the empty
@@ -2512,7 +2789,39 @@ function compileBinary(
       '~=': ts.SyntaxKind.ExclamationEqualsEqualsToken,
     };
     const direct = nativeOp[op];
-    if (direct !== undefined) return factory.createBinaryExpression(left, direct, right);
+    if (direct !== undefined) {
+      // Datatype-arithmetic fall-through: when the operands aren't
+      // statically known to be `number` (the both-number fast path is
+      // handled earlier in compileBinaryExpr), the result could be
+      // `Vector3 - Vector3` / `CFrame * CFrame` etc.  Plain native
+      // emit `left - right` fires TS2363 (RHS must be number) when
+      // either side is non-number, and even `(left as any) - (right
+      // as any)` types the result as `number` (any-arithmetic stays
+      // numeric in TS), so a `pos = a - b` slot of `Vector3` rejects
+      // with TS2322.
+      //
+      // Wrap both operands in `as any` for the arithmetic to typecheck
+      // AND wrap the whole expression in `as any` to widen the result
+      // so it's assignable to any datatype slot. roblox-ts compiles
+      // `(a as any) - (b as any)` back to Lua `a - b`, and Roblox's VM
+      // dispatches on __sub the same way — the roundtrip stays
+      // observably identical. (Trade-off: roblox-ts's strict no-any
+      // rule fires a diagnostic on every cast. Removing those without
+      // dropping the cast requires per-call type inference we don't
+      // have today — left for a future pass.)
+      const arithmeticOps = new Set(['+', '-', '*', '/', '%', '^']);
+      if (arithmeticOps.has(op)) {
+        const wrap = (e: ts.Expression) =>
+          factory.createParenthesizedExpression(
+            factory.createAsExpression(e, factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword)),
+          );
+        return factory.createAsExpression(
+          factory.createBinaryExpression(wrap(left), direct, wrap(right)),
+          factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+        );
+      }
+      return factory.createBinaryExpression(left, direct, right);
+    }
     if (op === '//') {
       // Integer division: `Math.floor(a / b)`. roblox-ts lowers Math.floor
       // to math.floor and the slash stays as Lua `/`. Same observable
@@ -2823,7 +3132,14 @@ function compileExprAsArg(a: Expr, ctx: CompileContext): ts.Expression {
 }
 
 function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext): ts.Expression {
+  // Arguments are single-value Luau positions (the last positional one
+  // is the only one that could fan out, and even then only at the call
+  // site — we don't model that here). Suppress the outer multi-return
+  // signal so nested tuple-returning calls auto-extract.
+  const savedMR = ctx.preferMultiReturn;
+  ctx.preferMultiReturn = false;
   const args = expr.args.map((a) => compileExprAsArg(a, ctx));
+  ctx.preferMultiReturn = savedMR;
 
   // Macro registry — interception point for compatMode='rbxts' rewrites
   // (Vector3.new → new Vector3, Instance.new("Part") → new Part(),
@@ -2835,21 +3151,89 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     return macroResult;
   }
 
+  // rbxts mode: `setmetatable(obj, ClassName)` is leftover plumbing
+  // once we've raised the metatable pattern into a real TS class.
+  // setmetatable returns its first arg, so:
+  //   • If the second arg is a detected class, drop the call entirely
+  //     and just yield the first arg — the class structure is already
+  //     in the TS class declaration, and re-binding the metatable at
+  //     runtime is observably a no-op.
+  //   • Otherwise, the second arg is genuine metatable plumbing
+  //     (mixins, weak refs, etc.). Cast it to `LuaMetatable<object>`
+  //     so the call type-checks under @rbxts/types' setmetatable
+  //     signature without resorting to `any`.
+  if (
+    ctx.compatMode === 'rbxts'
+    && !expr.self
+    && expr.func.type === 'Global'
+    && (expr.func as { name: string }).name === 'setmetatable'
+    && args.length >= 2
+  ) {
+    const secondArg = expr.args[1];
+    const secondIsDetectedClass =
+      secondArg
+      && (secondArg.type === 'Global' || secondArg.type === 'Local')
+      && ctx.isDetectedClass((secondArg as { name: string }).name);
+    if (secondIsDetectedClass) {
+      // The first arg is what setmetatable returns; pass it through.
+      // In expression-statement position the value is discarded; in
+      // value position (e.g. `let x = setmetatable(t, C)`) the
+      // binding still gets `t`, matching Luau semantics.
+      return args[0]!;
+    }
+    ctx.useAmbient('setmetatable');
+    ctx.useImport('@rbxts/types', 'LuaMetatable');
+    const newArgs = [
+      args[0]!,
+      factory.createAsExpression(
+        args[1]!,
+        factory.createTypeReferenceNode('LuaMetatable', [
+          factory.createTypeReferenceNode('object', undefined),
+        ]),
+      ),
+      ...args.slice(2),
+    ];
+    return factory.createCallExpression(
+      factory.createIdentifier('setmetatable'),
+      undefined,
+      newArgs,
+    );
+  }
+
   // Lua string method calls: `s:format(...)`, `"...":gsub(...)`, etc. JS
   // strings don't have `.format`/`.gsub`/`.reverse`/etc., so a literal
   // colon-method-on-string emits `"x".format(...)` which tsc rejects.
-  // Route to the runtime helper unconditionally for method names that
-  // only exist on Lua strings — Roblox classes don't define `gsub` /
-  // `format` / `match` / `gmatch` on any datatype, so the false-positive
-  // risk is negligible. A static-type guard would miss the common
-  // `tostring(x):reverse()` chain where staticTypeOfExpr returns
-  // 'unknown' (the call return type doesn't propagate).
+  // In native mode route to the runtime helper unconditionally — Roblox
+  // classes don't define `gsub`/`format`/`match` on any datatype, so the
+  // false-positive risk is negligible. In rbxts mode rewrite to the
+  // namespace form `string.X(s, ...)` instead: @rbxts/types declares
+  // `string` as a Lua-global with these methods, so the call stays
+  // valid and round-trips back to Lua identity.
   if (
     expr.self
     && expr.func.type === 'IndexName'
     && STRING_LIB_METHODS.has(expr.func.index)
   ) {
-    const meta = STRING_LIB_METHODS.get(expr.func.index)!;
+    const methodName = expr.func.index;
+    const meta = STRING_LIB_METHODS.get(methodName)!;
+    if (ctx.compatMode === 'rbxts') {
+      ctx.useAmbient('string');
+      const namespaceCall = factory.createCallExpression(
+        factory.createPropertyAccessExpression(
+          factory.createIdentifier('string'),
+          factory.createIdentifier(methodName),
+        ),
+        undefined,
+        [compileExpr(expr.func.expr, ctx), ...args],
+      );
+      // gsub/find/byte return `LuaTuple<[…]>` in @rbxts/types. Extract
+      // the first value in single-value Luau positions (the default —
+      // destructure / multi-return contexts set preferMultiReturn=true).
+      if (meta.tupleFirst && !ctx.preferMultiReturn) {
+        return factory.createElementAccessExpression(namespaceCall, 0);
+      }
+      return namespaceCall;
+    }
     const helperCall = factory.createCallExpression(
       factory.createIdentifier(ctx.use(meta.helper)),
       undefined,
@@ -2908,6 +3292,59 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     call = factory.createAsExpression(
       call,
       factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+    );
+  }
+  // rbxts mode: namespace-form calls into `string.X(s, ...)` for the
+  // tuple-returning methods (gsub, find, match, byte) need a single-
+  // value extraction `[0]` unless the caller is genuinely consuming the
+  // tuple via destructure / multi-return. @rbxts/types declares these
+  // as `LuaTuple<[T, ...]>`; without extraction TS rejects passing the
+  // result to a `string`-typed parameter.
+  if (
+    ctx.compatMode === 'rbxts'
+    && !ctx.preferMultiReturn
+    && !expr.self
+    && expr.func.type === 'IndexName'
+    && expr.func.expr.type === 'Global'
+    && (expr.func.expr as { name: string }).name === 'string'
+    && STRING_LIB_METHODS.has(expr.func.index)
+    && STRING_LIB_METHODS.get(expr.func.index)!.tupleFirst
+  ) {
+    call = factory.createElementAccessExpression(call, 0);
+  }
+  // rbxts mode: bare `pcall(...)`, `xpcall(...)`, and `coroutine.resume`
+  // return `LuaTuple<[boolean, ...rest]>` in @rbxts/types. Single-value
+  // Luau positions (`local ok = pcall(f)`, `if pcall(f) == false`) take
+  // only the success flag — extract `[0]` so the surrounding context
+  // sees a `boolean` instead of the whole tuple.
+  if (
+    ctx.compatMode === 'rbxts'
+    && !ctx.preferMultiReturn
+    && !expr.self
+    && expr.func.type === 'Global'
+    && ((expr.func as { name: string }).name === 'pcall'
+        || (expr.func as { name: string }).name === 'xpcall')
+  ) {
+    call = factory.createElementAccessExpression(call, 0);
+  }
+  // rbxts mode: calls to file-local functions whose return is annotated
+  // as `LuaTuple<[…]>` need a `[0]` extract in single-value positions.
+  // Without it the LHS picks up the whole tuple as its static type
+  // (LuaTuple<[any, any]>) and subsequent property access on the
+  // captured first-value fails TS2339. Use a non-null assertion
+  // (`call![0]`) instead of `as any` so mixed-return functions
+  // (which return `LuaTuple<…> | undefined`) get the right narrowing
+  // without tripping roblox-ts's no-any rule.
+  if (
+    ctx.compatMode === 'rbxts'
+    && !ctx.preferMultiReturn
+    && !expr.self
+    && (expr.func.type === 'Global' || expr.func.type === 'Local')
+    && ctx.luaTupleReturningFunctions.has((expr.func as { name: string }).name)
+  ) {
+    call = factory.createElementAccessExpression(
+      factory.createNonNullExpression(call),
+      0,
     );
   }
   if (isYieldingCall(expr, ctx)) {
@@ -3014,10 +3451,23 @@ function compileTableProp(item: TableItem, ctx: CompileContext): ts.PropertyAssi
   // FunctionExpr in method context so the first arg (commonly named
   // `self` or `_` for "ignore me") folds into `this`, matching the
   // emitted impl-type that uses `this:` for `self:` parameters.
-  const value =
+  let value =
     item.value.type === 'Function'
       ? compileFunctionExpr(item.value, ctx, { allowImplicitSelf: true })
       : compileExpr(item.value, ctx);
+  // rbxts mode: `{ X = nil }` emits `X: undefined`. TS narrows the
+  // inferred property type to literal `undefined`, which then breaks
+  // every later `obj.X = realValue` write (TS2322: T not assignable
+  // to undefined). Widen explicit-nil slots to `unknown` (not `any`)
+  // so the metatable-builder idiom (`local self = setmetatable({
+  // _field = nil}, …); self._field = …`) keeps working without
+  // tripping roblox-ts's no-any rule.
+  if (ctx.compatMode === 'rbxts' && item.value.type === 'ConstantNil') {
+    value = factory.createAsExpression(
+      value,
+      factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+    );
+  }
   if (item.key === null) {
     return factory.createPropertyAssignment(factory.createIdentifier('_'), value);
   }
@@ -3196,6 +3646,54 @@ export async function compile(
   setAliasArities(aliasArities);
   setTypeCompatMode(ctx.compatMode);
 
+  // rbxts mode pre-scan: walk every top-level function declaration and
+  // remember those whose body emits multi-return (any return path with
+  // 2+ values, even if other paths return one or zero). compileCall
+  // uses this set so calls in single-LHS positions extract `[0]` —
+  // matching Luau's "first value only" capture semantics. Destructure
+  // sites set preferMultiReturn=true beforehand so the tuple stays
+  // intact for that case.
+  if (ctx.compatMode === 'rbxts' && parsed.root) {
+    const hasAnyMultiReturn = (body: Stat | null | undefined): boolean => {
+      if (!body) return false;
+      let found = false;
+      const walk = (s: Stat | null | undefined): void => {
+        if (found || !s) return;
+        if (s.type === 'Function' || s.type === 'LocalFunction') return;
+        if (s.type === 'Return' && s.values.length > 1) { found = true; return; }
+        if (s.type === 'Block') { for (const c of s.body) walk(c); return; }
+        if (s.type === 'If') { walk(s.thenBody); walk(s.elseBody); return; }
+        if (s.type === 'While' || s.type === 'Repeat') { walk(s.body); return; }
+        if (s.type === 'For' || s.type === 'ForIn') { walk(s.body); return; }
+      };
+      walk(body);
+      return found;
+    };
+    const recordMultiReturnFns = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return;
+      const n = node as {
+        type?: string;
+        name?: { type?: string; name?: string };
+        func?: { body?: Stat };
+        body?: Stat;
+      };
+      if (
+        (n.type === 'LocalFunction' || n.type === 'Function')
+        && typeof n.name?.name === 'string'
+        && n.func?.body
+      ) {
+        if (hasAnyMultiReturn(n.func.body)) {
+          ctx.luaTupleReturningFunctions.add(n.name.name);
+        }
+      }
+      for (const v of Object.values(node as Record<string, unknown>)) {
+        if (Array.isArray(v)) for (const it of v) recordMultiReturnFns(it);
+        else if (v && typeof v === 'object') recordMultiReturnFns(v);
+      }
+    };
+    recordMultiReturnFns(parsed.root);
+  }
+
   const stmts: ts.Statement[] = rootBlock ? compileBlockBody(rootBlock, ctx) : [];
   // Luau ModuleScripts end with `return <export-value>` — the value is
   // what `require(script)` returns. TS has no top-level `return`; rewrite
@@ -3212,6 +3710,99 @@ export async function compile(
         false,
         last.expression,
       );
+      // roblox-ts rejects `export = <variable>` when the variable is
+      // `let`. The Luau idiom `local M = {}; M.x = …; return M`
+      // surfaces as `let M; M.x = …; export default M;` — even
+      // though our metatable rewrite means M is observably const-
+      // shape-wise (property mutation, not re-binding). Find the
+      // matching declaration and flip its kind to `const` when the
+      // exported name resolves to a top-level let. (Property-write
+      // assignments don't disqualify; only `M = …` re-bindings
+      // would, and those couldn't compile to a Luau-style export
+      // anyway.)
+      if (ctx.compatMode === 'rbxts' && ts.isIdentifier(last.expression)) {
+        const exportName = last.expression.text;
+        for (let i = 0; i < stmts.length; i++) {
+          const s = stmts[i];
+          if (
+            s
+            && ts.isVariableStatement(s)
+            && (s.declarationList.flags & ts.NodeFlags.Let) !== 0
+            && s.declarationList.declarations.some((d) =>
+              ts.isIdentifier(d.name) && d.name.text === exportName,
+            )
+          ) {
+            stmts[i] = factory.createVariableStatement(
+              s.modifiers,
+              factory.createVariableDeclarationList(
+                s.declarationList.declarations,
+                ts.NodeFlags.Const,
+              ),
+            );
+            break;
+          }
+        }
+      }
+    }
+  }
+  // Luau scripts may early-exit via `if cond then return end`. TS
+  // forbids `return` at module scope (TS1108), so wrap every
+  // statement after the last function declaration in an async IIFE
+  // when ANY non-final return is present. This preserves both Luau's
+  // early-exit semantics and the ability to `await` yielding calls
+  // in the body.
+  if (ctx.compatMode === 'rbxts') {
+    const hasNonFinalReturn = (block: ts.Statement[]): boolean => {
+      for (let i = 0; i < block.length; i++) {
+        const s = block[i]!;
+        // Skip the final statement — that's handled by the export-default
+        // rewrite above.
+        if (i === block.length - 1 && ts.isReturnStatement(s) && s.expression) continue;
+        if (containsTopLevelReturn(s)) return true;
+      }
+      return false;
+    };
+    if (hasNonFinalReturn(stmts)) {
+      // Hoist only the module-level structural declarations (imports,
+      // type aliases, exports) — these can't legally appear inside an
+      // arrow body. Everything else (functions, classes, vars) gets
+      // wrapped in the IIFE so their references to in-scope locals
+      // stay resolvable AND `return` is legal again.
+      const hoisted: ts.Statement[] = [];
+      const inIIFE: ts.Statement[] = [];
+      for (const s of stmts) {
+        if (
+          ts.isImportDeclaration(s)
+          || ts.isTypeAliasDeclaration(s)
+          || ts.isInterfaceDeclaration(s)
+          || ts.isExportAssignment(s)
+          || ts.isExportDeclaration(s)
+        ) {
+          hoisted.push(s);
+        } else {
+          inIIFE.push(s);
+        }
+      }
+      if (inIIFE.length > 0) {
+        const iife = factory.createExpressionStatement(
+          factory.createCallExpression(
+            factory.createParenthesizedExpression(
+              factory.createArrowFunction(
+                ASYNC_MOD,
+                undefined,
+                [],
+                undefined,
+                factory.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+                factory.createBlock(inIIFE, true),
+              ),
+            ),
+            undefined,
+            [],
+          ),
+        );
+        stmts.length = 0;
+        stmts.push(...hoisted, iife);
+      }
     }
   }
   const helpers = ctx.importedHelpers();
@@ -3258,6 +3849,24 @@ export async function compile(
     // (Best-effort: still doesn't see later updates from other scripts —
     // matching Lua semantics would need every read to consult _G, which is
     // a deeper refactor.)
+    // Cast `_G` to `any` so the access type-checks under rbxts/strict
+    // mode (in @rbxts/types `_G` is declared as an empty interface, so
+    // bracket access fires TS7053). Native mode doesn't care, but the
+    // wrap is harmless there.
+    const gRead: ts.Expression = ctx.compatMode === 'rbxts'
+      ? factory.createElementAccessExpression(
+          factory.createParenthesizedExpression(
+            factory.createAsExpression(
+              factory.createIdentifier('_G'),
+              factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+            ),
+          ),
+          factory.createStringLiteral(name),
+        )
+      : factory.createElementAccessExpression(
+          factory.createIdentifier('_G'),
+          factory.createStringLiteral(name),
+        );
     implicitGlobalDecls.push(
       factory.createVariableStatement(
         undefined,
@@ -3265,11 +3874,13 @@ export async function compile(
           [factory.createVariableDeclaration(
             factory.createIdentifier(safeIdentifier(name)),
             undefined,
-            undefined,
-            factory.createElementAccessExpression(
-              factory.createIdentifier('_G'),
-              factory.createStringLiteral(name),
-            ),
+            // rbxts/strict requires an annotation here because the init
+            // is `any` and the variable will later get re-assigned to
+            // arbitrary values without losing its open shape.
+            ctx.compatMode === 'rbxts'
+              ? factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword)
+              : undefined,
+            gRead,
           )],
           ts.NodeFlags.Let,
         ),

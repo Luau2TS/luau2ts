@@ -15,11 +15,19 @@ function isValidIdentifier(name: string): boolean {
 //
 // roblox-ts wires `new Instance("ClassName")` specially: the constructor
 // takes a string literal and the result is typed as the corresponding
-// subclass. The subclass names themselves (Part, ClickDetector, Tool,
-// etc.) are declared as INTERFACES in @rbxts/types — not classes — so
+// subclass (Frame, Part, etc.). The subclass names themselves are
+// declared as INTERFACES in @rbxts/types — not classes — so
 // `new Part(...)` fires TS2693 ("only refers to a type"). Emit the
 // `new Instance("X", parent?)` form so roblox-ts's class-resolver
-// handles it.
+// handles it AND the result inherits the proper subclass type.
+//
+// We DON'T cast the result to `any`. Subsequent runtime-children
+// access (`wrap.Bar`, `frame.MyTextLabel`) will fail typecheck with
+// strict-mode — that's intentional. Phase 2 of the rbxts cleanup
+// will synthesize per-variable interfaces from the observed access
+// pattern (`interface __Wrap extends Frame { Bar: __WrapBar }`) so
+// the dynamic children resolve properly, and the emit becomes
+// idiomatic rbxts without losing type info.
 registerMacro(
   'Instance.new',
   ({ compiledArgs }) => {
@@ -47,14 +55,14 @@ function gameGetService({
   if (!isValidIdentifier(serviceName)) return undefined;
 
   ctx.useImport('@rbxts/services', serviceName);
-  // Cast the service reference to `any` so subsequent property access
-  // (`ReplicatedStorage.MyFolder`, `ServerScriptService.PlayerData`,
-  // etc. — runtime-named children) type-checks under roblox-ts strict
-  // mode. Without this each user-folder access fires TS2339.
-  return factory.createAsExpression(
-    factory.createIdentifier(serviceName),
-    factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
-  );
+  // Return the service reference at its declared type (e.g.
+  // ReplicatedStorage / Players / TweenService). Subsequent
+  // runtime-named-child access (`ReplicatedStorage.MyFolder`) WILL
+  // fail typecheck — that's the surface area Phase 2 fixes by
+  // synthesizing per-variable structural interfaces from observed
+  // access patterns. Previously we cast to `any` here, which fired
+  // roblox-ts's no-any rule on every access downstream.
+  return factory.createIdentifier(serviceName);
 }
 
 registerMacro(

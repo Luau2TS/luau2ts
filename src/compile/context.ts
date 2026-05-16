@@ -80,6 +80,23 @@ export class CompileContext {
    *  for diagnostics). */
   private readonly suppressedLocals = new Set<string>();
 
+  /** Compile-time signal: while truthy, calls that return `LuaTuple<...>`
+   *  (string.gsub / find / match / byte under @rbxts/types) should NOT
+   *  auto-extract the first element. Set by destructure-assignment and
+   *  multi-return-call sites that genuinely consume the tuple. Defaults
+   *  to false: single-value Luau positions (`f(string.gsub(...))`,
+   *  `local x = string.gsub(...)`) auto-extract so the result types as
+   *  the first element instead of as a tuple. */
+  preferMultiReturn = false;
+
+  /** Names of file-local functions whose return type is annotated as
+   *  `LuaTuple<[…]>` (rbxts mode, uniform multi-return paths). Calls
+   *  to these functions in single-LHS positions need a `[0]` extract
+   *  so the receiver picks up the first element instead of the whole
+   *  tuple — without it `let x = f()` types `x` as `LuaTuple<[…]>`
+   *  and every `x.field` access fires TS2339. */
+  readonly luaTupleReturningFunctions = new Set<string>();
+
   constructor(public readonly compatMode: CompatMode = 'native') {}
 
   /** Record a named import from `module`. The emitter will write

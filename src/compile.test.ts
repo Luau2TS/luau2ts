@@ -77,7 +77,13 @@ describe('compile — statements', () => {
     expect(r.source).not.toContain('@rbxts/types');
   });
 
-  it('multi-value return: rbxts mode tuple arity uses max across branches', async () => {
+  it('multi-value return: mixed-arity functions drop the LuaTuple annotation', async () => {
+    // When some branches return multiple values and others return one
+    // (or zero), there's no single LuaTuple<[…]> that fits every
+    // path — the short-return branch fails TS2322 ("undefined not
+    // assignable to LuaTuple<[unknown, unknown]>"). Skip the
+    // annotation and let TS infer; the multi-return $tuple call
+    // still surfaces so roblox-ts macros it back to Lua multi-return.
     const r = await compile(
       `local function f(x)
          if x then return 1, 2 end
@@ -86,6 +92,22 @@ describe('compile — statements', () => {
       { compatMode: 'rbxts' },
     );
     expect(r.source).toContain('$tuple(1, 2)');
+    expect(r.source).not.toMatch(/LuaTuple</);
+  });
+
+  it('multi-value return: uniform multi-return keeps the LuaTuple annotation', async () => {
+    // Every branch returns the same arity → safe to widen the return
+    // type to LuaTuple<[…]> so roblox-ts's recognizer emits real Lua
+    // multi-return instead of a wrapped table.
+    const r = await compile(
+      `local function f(x)
+         if x then return 1, 2 end
+         return 3, 4
+       end`,
+      { compatMode: 'rbxts' },
+    );
+    expect(r.source).toContain('$tuple(1, 2)');
+    expect(r.source).toContain('$tuple(3, 4)');
     expect(r.source).toMatch(/LuaTuple<\[\s*unknown\s*,\s*unknown\s*\]>/);
   });
 

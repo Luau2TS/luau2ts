@@ -175,68 +175,50 @@ registerMacro(
   'rbxts',
 );
 
-// ─── string.* method-form rewrites ─────────────────────────────────────────
+// ─── string.* — keep namespace form in rbxts mode ─────────────────────────
+//
+// roblox-ts's @rbxts/types declares `string` as a Lua-global namespace
+// (lua.d.ts has every method we care about EXCEPT `len`). Letting
+// `string.split(s, sep)` survive as-is round-trips back to Lua
+// identity AND avoids the imports-from-luau2ts-runtime that earlier
+// helper-form macros would route through (stringFormat, stringMatch,
+// etc.). For the missing-in-typesignature `string.len`, route to
+// the method form `s.size()` instead (declared on String via
+// @rbxts/compiler-types).
 
-// `string.split(s, sep)` → `s.split(sep)`
-// `string.upper(s)` → `s.toUpperCase()`
-// `string.lower(s)` → `s.toLowerCase()`
-// `string.reverse(s)` → `[...s].reverse().join('')`
-// `string.len(s)` → `s.length`
-// `string.rep(s, n)` → `s.repeat(n)`
-
-function emitStringMethod(method: string, argsAfterTarget = 0) {
-  return ({ compiledArgs }: MacroArgs) => {
-    const [target, ...rest] = compiledArgs;
-    if (!target) return undefined;
-    return factory.createCallExpression(
-      factory.createPropertyAccessExpression(target, factory.createIdentifier(method)),
-      undefined,
-      rest.slice(0, argsAfterTarget),
-    );
-  };
-}
-
-registerMacro('string.split', emitStringMethod('split', 1), 'rbxts');
-registerMacro('string.upper', emitStringMethod('toUpperCase', 0), 'rbxts');
-registerMacro('string.lower', emitStringMethod('toLowerCase', 0), 'rbxts');
-registerMacro('string.rep', emitStringMethod('repeat', 1), 'rbxts');
-
+// `string.len(s)` → `(s as string).size()`. @rbxts/types' `string`
+// namespace doesn't expose `.len` (only its method-form lives on the
+// String interface, and it's named `size` there). Without this rewrite
+// every `string.len(x)` fires TS2339.
 registerMacro(
   'string.len',
   ({ compiledArgs }: MacroArgs) => {
-    if (!compiledArgs[0]) return undefined;
-    return factory.createPropertyAccessExpression(
-      compiledArgs[0],
-      factory.createIdentifier('length'),
+    const [target] = compiledArgs;
+    if (!target) return undefined;
+    return factory.createCallExpression(
+      factory.createPropertyAccessExpression(
+        factory.createParenthesizedExpression(
+          factory.createAsExpression(target, factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword)),
+        ),
+        factory.createIdentifier('size'),
+      ),
+      undefined,
+      [],
     );
   },
   'rbxts',
 );
 
+// `table.pack(...)` → `[...args]`. Luau returns `{n=N, [1]=v1, ...}`;
+// roblox-ts's table namespace doesn't expose `pack` and most use sites
+// only consume `t[i]` (we shift to 0-indexed) or `t.n` (the array's
+// `.size()`). Emit an array literal — callers that depend on `.n`
+// will need to rewrite, callers that just want a captured tuple are
+// fine.
 registerMacro(
-  'string.reverse',
+  'table.pack',
   ({ compiledArgs }: MacroArgs) => {
-    const [target] = compiledArgs;
-    if (!target) return undefined;
-    // [...s].reverse().join('')
-    return factory.createCallExpression(
-      factory.createPropertyAccessExpression(
-        factory.createCallExpression(
-          factory.createPropertyAccessExpression(
-            factory.createArrayLiteralExpression(
-              [factory.createSpreadElement(target)],
-              false,
-            ),
-            factory.createIdentifier('reverse'),
-          ),
-          undefined,
-          [],
-        ),
-        factory.createIdentifier('join'),
-      ),
-      undefined,
-      [factory.createStringLiteral('')],
-    );
+    return factory.createArrayLiteralExpression(compiledArgs, false);
   },
   'rbxts',
 );

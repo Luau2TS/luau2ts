@@ -297,7 +297,11 @@ export function compileClassPattern(
   const ctorFn = pattern.constructor ?? pattern.ctorFactory;
   if (ctorFn) {
     const fnExpr = ctorFn.func;
-    const params = (fnExpr.args ?? []).map((a) => paramDecl(a));
+    const ctorArgs = (fnExpr.args ?? []);
+    const ctorOptionalFrom = ctx.compatMode === 'rbxts'
+      ? trailingMissingStart(ctorArgs)
+      : ctorArgs.length;
+    const params = ctorArgs.map((a, idx) => paramDecl(a, idx >= ctorOptionalFrom));
     const body = ctorBody(fnExpr.body, pattern, ctx, compileBlockBody, compileExpr);
     // Prepend the harvested field-init statements so constructor params
     // are in scope when their values flow into `this.X`.
@@ -374,7 +378,14 @@ export function compileClassPattern(
     if (nameExpr.type !== 'IndexName') continue;
     const methodName = nameExpr.index;
     const fnExpr = method.func;
-    const params = (fnExpr.args ?? []).map((a) => paramDecl(a));
+    // rbxts-mode-only: mark the trailing run of unannotated/nilable params
+    // optional. Lets the call site pass fewer args (Luau missing-args
+    // → nil semantics) without tripping arity checks.
+    const fnArgs = (fnExpr.args ?? []);
+    const optionalFrom = ctx.compatMode === 'rbxts'
+      ? trailingMissingStart(fnArgs)
+      : fnArgs.length;
+    const params = fnArgs.map((a, idx) => paramDecl(a, idx >= optionalFrom));
     // Variadic `function obj:method(...)` carries a `vararg` flag on the
     // FunctionExpr; surface it as a `...__varargs: unknown[]` rest param
     // so body uses of `__varargs[…]` resolve. compileFunctionShape does
@@ -465,6 +476,16 @@ export function compileClassPattern(
       ),
     );
   }
+  // Phase 1 of the rbxts cleanup dropped this index signature. It used
+  // to be `[k: string]: any` to absorb lazily-assigned fields (Luau
+  // `self.X = …` writes that aren't visible in setmetatable init), but
+  // the `any` value type fires roblox-ts's no-any rule on every
+  // subsequent `instance.X` access — death by a thousand cuts.
+  // Phase 2 will scan method bodies for `this.X = …` writes and emit
+  // typed property declarations for each, so the class shape is
+  // complete without the catch-all. Until then, classes that
+  // monkey-patch their own fields will surface TS2339s — those are
+  // the surface area for Phase 2.
   return factory.createClassDeclaration(
     modifiers,
     pattern.name,
@@ -508,7 +529,14 @@ function ctorBody(
 /** Rewrite every `Identifier('self')` reference in a TS statement to
  *  `this`. The class-shape detector copies Luau bodies that bind `self`
  *  via `self = setmetatable({}, Class)`; once we elevate the body into a
- *  TS class, every `self.X` is the synthesized `this.X`. */
+ *  TS class, every `self.X` is the synthesized `this.X`.
+ *
+ *  Nested function expressions / declarations need extra care: a plain
+ *  `function () { this.X }` would bind `this` to its own call-time
+ *  receiver, not the enclosing class instance. Convert them to ARROW
+ *  functions so `this` inherits lexically from the surrounding method.
+ *  This matches Luau's semantics (a nested function captures `self`
+ *  through closure, not through its own receiver). */
 function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
   function topLevel(node: ts.Node): ts.Node {
     // Property access — only recurse into the `expression`, never rewrite
@@ -547,6 +575,47 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
         node.initializer ? (topLevel(node.initializer) as ts.Expression) : undefined,
       );
     }
+    // Nested `function () { … }` expression → arrow `() => { … }`.
+    if (ts.isFunctionExpression(node)) {
+      const newBody = topLevel(node.body) as ts.Block;
+      const params = node.parameters.filter((p) =>
+        !(ts.isIdentifier(p.name) && p.name.text === 'this'),
+      );
+      const isAsync = node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+      return factory.createArrowFunction(
+        isAsync ? [factory.createModifier(ts.SyntaxKind.AsyncKeyword)] : undefined,
+        node.typeParameters,
+        params,
+        node.type,
+        factory.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+        newBody,
+      );
+    }
+    // Nested `function f() { … }` declaration → `const f = () => { … };`.
+    // (Luau-local functions don't hoist either, so the visible semantics
+    // are equivalent.)
+    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
+      const newBody = topLevel(node.body) as ts.Block;
+      const params = node.parameters.filter((p) =>
+        !(ts.isIdentifier(p.name) && p.name.text === 'this'),
+      );
+      const isAsync = node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+      const arrow = factory.createArrowFunction(
+        isAsync ? [factory.createModifier(ts.SyntaxKind.AsyncKeyword)] : undefined,
+        node.typeParameters,
+        params,
+        node.type,
+        factory.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+        newBody,
+      );
+      return factory.createVariableStatement(
+        undefined,
+        factory.createVariableDeclarationList(
+          [factory.createVariableDeclaration(node.name, undefined, undefined, arrow)],
+          ts.NodeFlags.Const,
+        ),
+      );
+    }
     if (ts.isIdentifier(node) && node.text === 'self') {
       return factory.createThis();
     }
@@ -563,11 +632,63 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
  *  the body — `any` lets the access through and roblox-ts's "any
  *  banned" rule only fires in narrow contexts (assignment targets,
  *  not method bodies). */
-function paramDecl(a: { name: string; annotation?: import('../parser/index.js').TypeNode | null }): ts.ParameterDeclaration {
+function paramDecl(
+  a: { name: string; annotation?: import('../parser/index.js').TypeNode | null },
+  isTrailingUnannotated = false,
+): ts.ParameterDeclaration {
+  // Unannotated rbxts-mode params default to `: unknown` (not `: any`)
+  // so roblox-ts's no-any rule doesn't fire on every body usage.
+  // Strict-mode body accesses on `unknown` will require narrowing
+  // (TS18046) — that's Phase 2 surface area.
   const ty = a.annotation
     ? compileType(a.annotation)
-    : factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
-  return factory.createParameterDeclaration(undefined, undefined, a.name, undefined, ty);
+    : factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+  // Unannotated trailing params mirror the Luau-call calling convention
+  // (missing positional args become `nil`); mark them optional so a
+  // 1-arg call site of a 2-param method still typechecks under strict.
+  // Annotated params keep their declared shape — if the user wrote
+  // `: number` without `?`, that's an explicit "required" signal.
+  const question = isTrailingUnannotated && !a.annotation
+    ? factory.createToken(ts.SyntaxKind.QuestionToken)
+    : undefined;
+  return factory.createParameterDeclaration(undefined, undefined, a.name, question, ty);
+}
+
+/** True for params whose runtime type is "missing → nil" (unannotated)
+ *  or whose annotation explicitly admits nil. Used to decide which
+ *  trailing run to mark optional. Mirrors annotationIsNilable from
+ *  ../compile/index.ts — duplicated here to avoid a circular import. */
+function paramAllowsMissing(
+  a: { name: string; annotation?: import('../parser/index.js').TypeNode | null },
+): boolean {
+  const t = a.annotation;
+  if (!t) return true;
+  if (t.type === 'TypeOptional') return true;
+  if (t.type === 'TypeUnion') {
+    return t.types.some((u) =>
+      u.type === 'TypeOptional'
+      || (u.type === 'TypeReference' && u.name === 'nil')
+      || (u.type === 'TypeReference' && u.name === 'undefined'),
+    );
+  }
+  return false;
+}
+
+/** Index of the first trailing param that admits a missing arg. Used by
+ *  class-method param emission to enable the `?` marker without
+ *  violating TS's "required-after-optional" rule. */
+function trailingMissingStart(
+  args: readonly { name: string; annotation?: import('../parser/index.js').TypeNode | null }[],
+): number {
+  let firstTrailing = args.length;
+  for (let i = args.length - 1; i >= 0; i--) {
+    if (paramAllowsMissing(args[i]!)) {
+      firstTrailing = i;
+    } else {
+      break;
+    }
+  }
+  return firstTrailing;
 }
 
 /** Walk the `.new` factory body looking for the canonical

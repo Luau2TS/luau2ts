@@ -74,8 +74,11 @@ describe('macros — datatype constructors (R.2)', () => {
   });
 
   it('Instance.new with parent forwards the second arg', async () => {
+    // `workspace` is not a typed global in @rbxts/types (only `game` and
+    // `script` are). rbxts mode rewrites bare `workspace` to
+    // `(game.Workspace as any)` so the access stays roblox-ts-clean.
     const out = await emit('local p = Instance.new("Part", workspace)', 'rbxts');
-    expect(out).toMatch(/new Instance\("Part", workspace[^)]*\)/);
+    expect(out).toMatch(/new Instance\("Part", \(?game\.Workspace[^)]*\)/);
   });
 
   it('Instance.new with non-literal class name forwards the call', async () => {
@@ -218,14 +221,20 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     expect(out).toMatch(/\[\.\.\.arr\]/);
   });
 
-  it('string.upper(s) → s.toUpperCase()', async () => {
+  it('string.upper(s) keeps the namespace form (roblox-ts has string.upper)', async () => {
+    // Previously rewrote to JS-side `s.toUpperCase()`. roblox-ts's
+    // @rbxts/types declares `string.upper` (and the rest of the lib)
+    // as Lua globals; method-form on JS strings doesn't exist in the
+    // roblox-ts type universe (TS strings via @rbxts/types don't
+    // expose .toUpperCase, .toLowerCase, .repeat). Keep the bare
+    // namespace call.
     const out = await emit('local u = string.upper(name)', 'rbxts');
-    expect(out).toContain('name.toUpperCase()');
+    expect(out).toContain('string.upper(name)');
   });
 
-  it('string.split(s, sep) → s.split(sep)', async () => {
+  it('string.split(s, sep) keeps the namespace form', async () => {
     const out = await emit('local parts = string.split(s, ",")', 'rbxts');
-    expect(out).toContain('s.split(",")');
+    expect(out).toContain('string.split(s, ",")');
   });
 
   it('math.floor(x) keeps lowercase `math.floor` (roblox-ts has it as a Lua global)', async () => {
@@ -323,13 +332,15 @@ describe('class-shape recognition (R.9, rbxts mode only)', () => {
     `;
     const out = await emit(src, 'rbxts');
     expect(out).toMatch(/class Class \{/);
-    // Constructor params get explicit `: any` annotations when the
+    // Constructor params get explicit `: unknown` annotations when the
     // source had none. roblox-ts strict mode rejects implicit-any
-    // (TS7006); `unknown` would satisfy that but then trip TS18046 on
-    // body accesses (`this.x = x` with x: unknown). `any` is the
-    // pragmatic default — roblox-ts's "any banned" rule only fires
-    // in narrow contexts, not at param positions.
-    expect(out).toMatch(/constructor\(x: any, y: any\)/);
+    // (TS7006), and `any` would trip roblox-ts's no-any rule on every
+    // body access; `unknown` keeps both happy. Body accesses on
+    // `unknown` will require narrowing — Phase 2's job.
+    // Unannotated trailing params are marked optional (`?: unknown`)
+    // so a 1-arg `new Vec(x)` call site (Luau missing-positional →
+    // nil semantics) still typechecks under roblox-ts strict mode.
+    expect(out).toMatch(/constructor\(x\?: unknown, y\?: unknown\)/);
     expect(out).toContain('getX()');
     // The metatable plumbing should be gone.
     expect(out).not.toContain('setmetatable');
@@ -398,9 +409,14 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
   it('rbxts mode lowers `nil` literals to `undefined` (not `null`)', async () => {
     // roblox-ts rejects `null` outright ("null is not supported — use
     // undefined"). The native-mode null mapping (matched against
-    // `T | null` annotations) is wrong for the rbxts target.
+    // `T | null` annotations) is wrong for the rbxts target. We also
+    // annotate the local as `: unknown` so subsequent writes are
+    // open-ended (without it TS narrows to `undefined` and rejects
+    // assignment of any non-undefined value — TS2322). `unknown`
+    // satisfies roblox-ts's no-any rule, unlike the prior `: any`
+    // annotation.
     const out = await emit('local x = nil', 'rbxts');
-    expect(out).toContain('let x = undefined');
+    expect(out).toMatch(/let x:\s*unknown\s*=\s*undefined/);
     expect(out).not.toContain('let x = null');
   });
 
@@ -416,19 +432,22 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
     expect(out).not.toMatch(/= null/);
   });
 
-  it('rbxts mode defaults unannotated method params to `: any`', async () => {
+  it('rbxts mode defaults unannotated method params to `: unknown`', async () => {
     const out = await emit(
       `local C = setmetatable({}, {__index = nil})
        function C.new(x, y) local self = setmetatable({}, C); self.x = x; self.y = y; return self end
        function C:get() return self.x end`,
       'rbxts',
     );
-    // Class constructor + method params default to `any` so roblox-ts's
-    // strict mode doesn't trip on implicit-any (TS7006). `unknown` would
-    // satisfy TS7006 but then trigger TS18046 on every property access
-    // in the body. roblox-ts's own "any banned" check only fires in
-    // narrow contexts (not method param positions).
-    expect(out).toMatch(/constructor\(x: any, y: any\)/);
+    // Class constructor + method params default to `: unknown` (Phase 1
+    // of the rbxts cleanup switched from `: any` — every body access
+    // on an `any` param tripped roblox-ts's no-any rule). `unknown`
+    // satisfies TS7006 (no implicit any) AND roblox-ts's no-any rule;
+    // body accesses on `unknown` will require narrowing (TS18046) —
+    // surface area for Phase 2's per-variable shape inference.
+    // Unannotated trailing params keep their `?` marker so 1-arg
+    // call sites (Luau missing-positional → nil) still typecheck.
+    expect(out).toMatch(/constructor\(x\?: unknown, y\?: unknown\)/);
   });
 
   it('rbxts mode does NOT synthesize a `static new(...)` forwarder', async () => {
@@ -472,7 +491,10 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
       `local function f(xs: { number }) for _, x in xs do print(x) end end`,
       'rbxts',
     );
-    expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs as any\[\]\)\)/);
+    // The cast routes through `unknown` first so record-shaped tables
+    // (no overlap with `any[]`) don't trip TS2352. Array-shaped sources
+    // pass through unchanged at runtime.
+    expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs as unknown as any\[\]\)\)/);
   });
 
   it('rbxts mode skips the `declare const X: any;` preamble', async () => {
