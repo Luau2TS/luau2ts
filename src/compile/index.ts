@@ -1834,9 +1834,23 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
     // where button.Size is a `Size: unknown` leaf in button's shape)
     // still typechecks against the local's declared shape.
     if (ctx.compatMode === 'rbxts' && target.type === 'Local') {
-      const inferred = ctx.getShape((target as { name: string }).name) as
-        | import('./shape-infer.js').Shape
-        | undefined;
+      // When the target's TRACKED type is a primitive (string,
+      // number, boolean — captured from a literal-init), prefer
+      // that over the inferred structural shape. The shape
+      // collected from observed method calls (`s:gsub(...)`,
+      // `s:upper(...)`) would synthesize a `{gsub(...): unknown}`
+      // type that's wider than `string` but loses the primitive's
+      // assignability — assigning a string-typed RHS to a
+      // `{gsub(...): unknown}` slot doesn't typecheck.
+      const isPrimitiveTracked =
+        targetTrackedType === 'string'
+        || targetTrackedType === 'number'
+        || targetTrackedType === 'boolean';
+      const inferred = isPrimitiveTracked
+        ? undefined
+        : (ctx.getShape((target as { name: string }).name) as
+            | import('./shape-infer.js').Shape
+            | undefined);
       const fromShape = inferred ? shapeToTypeNode(inferred) : null;
       // Parenthesise the RHS before wrapping in `as` — `as` binds
       // tighter than `||`/`??`/`&&`, so a bare `X || Y as T` would
@@ -2499,6 +2513,36 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       const f = expr.func;
       if (f.type === 'IndexName' && f.expr.type === 'Global' && ARITH_DATATYPES.has(f.expr.name)) {
         return `datatype:${f.expr.name}` as StaticValueType;
+      }
+      // String-returning method names. Covers both the namespace form
+      // (`string.lower(s)`, `string.gsub(s, p, r)`) AND the colon-method
+      // form (`s:lower()`, `s:reverse():gsub(...)`). Tracking this lets
+      // the reassign-cast pick the `string` primitive over the wider
+      // shape-method literal (`{gsub(...): unknown}`) for
+      // `withCommas = s:reverse():gsub(...)`-style reassignments.
+      const STRING_RETURNING = new Set([
+        'lower', 'upper', 'reverse', 'sub', 'rep', 'char',
+        'format', 'gsub', // gsub tuple's first element is string
+      ]);
+      // Namespace form: `string.<m>(...)`.
+      if (
+        f.type === 'IndexName'
+        && f.expr.type === 'Global'
+        && (f.expr as { name: string }).name === 'string'
+        && STRING_RETURNING.has(f.index)
+      ) {
+        return 'string';
+      }
+      // Colon-method form: `<anything>:<string-method>(...)`. The
+      // chained-call form `s:reverse():gsub(...)` lands here because
+      // the inner colon call is itself the receiver; we don't try to
+      // verify the receiver's type, just the method name.
+      if (
+        expr.self
+        && f.type === 'IndexName'
+        && STRING_RETURNING.has(f.index)
+      ) {
+        return 'string';
       }
       // Method-call chains: `v:add(w)` / `cf:mul(other)` on datatype-
       // typed receivers return the same datatype per @rbxts/types'
