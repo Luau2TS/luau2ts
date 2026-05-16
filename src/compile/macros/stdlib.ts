@@ -238,13 +238,29 @@ function emitMathPassthrough(name: string) {
   return ({ ctx, compiledArgs }: MacroArgs) => {
     const mathName = ctx.compatMode === 'rbxts' ? 'math' : 'Math';
     if (mathName === 'math') ctx.useAmbient('math');
+    // rbxts mode: cast each arg `as unknown as number` so unknown-
+    // typed values (from structural-shape leaves or unannotated
+    // params) flow into math's numeric slots without TS2345. The
+    // generic compileCall castArgsForCall hook doesn't fire for
+    // macro-rewritten calls (macros bypass it), so we apply the
+    // cast here.
+    const args = ctx.compatMode === 'rbxts'
+      ? compiledArgs.map((a) =>
+          factory.createAsExpression(
+            factory.createAsExpression(
+              a,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+          ))
+      : compiledArgs;
     return factory.createCallExpression(
       factory.createPropertyAccessExpression(
         factory.createIdentifier(mathName),
         factory.createIdentifier(name),
       ),
       undefined,
-      compiledArgs,
+      args,
     );
   };
 }

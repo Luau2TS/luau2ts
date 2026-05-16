@@ -253,7 +253,10 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     // roblox-ts strict mode. Keeping `math.floor` round-trips back to
     // Lua as the identity transform.
     const out = await emit('local f = math.floor(x)', 'rbxts');
-    expect(out).toContain('math.floor(x)');
+    // Args are cast `as unknown as number` so unknown-typed values
+    // flow into math.* numeric slots without TS2345; the namespace
+    // call still appears as `math.floor(...)`.
+    expect(out).toMatch(/math\.floor\(x as unknown as number\)/);
     expect(out).not.toContain('Math.floor(');
   });
 
