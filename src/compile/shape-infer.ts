@@ -134,6 +134,40 @@ export function collectShapes(body: Stat, vars: Set<string>): Map<string, Shape>
       }
       case 'Call': {
         const call = expr as Extract<Expr, { type: 'Call' }>;
+        // Recognize common Luau stdlib calls that the compiler later
+        // rewrites to instance methods on the first arg. Record the
+        // method on the first arg's shape so downstream typecheck
+        // sees the right interface:
+        //   table.insert(t, v)    → t.push(v)
+        //   table.remove(t, i)    → t.splice(...)[0]
+        //   table.concat(t, sep)  → t.join(sep)
+        //   table.sort(t, cmp)    → t.sort(cmp)
+        //   table.find(t, v)      → t.indexOf(v) + 1
+        const macroMap: Record<string, string> = {
+          'table.insert': 'push',
+          'table.remove': 'splice',
+          'table.concat': 'join',
+          'table.sort': 'sort',
+          'table.find': 'indexOf',
+          'table.clone': 'slice',
+        };
+        if (
+          call.func && call.func.type === 'IndexName'
+          && (call.func as { expr: Expr }).expr.type === 'Global'
+        ) {
+          const nsName = ((call.func as { expr: Expr }).expr as { name: string }).name;
+          const methodName = (call.func as { index: string }).index;
+          const key = `${nsName}.${methodName}`;
+          const macroMethod = macroMap[key];
+          if (macroMethod && call.args.length > 0) {
+            const tgtShape = visitExpr(call.args[0]);
+            if (tgtShape) {
+              recordMethod(tgtShape, macroMethod, call.args.length - 1);
+            }
+            for (const a of call.args.slice(1)) visitExpr(a);
+            return null;
+          }
+        }
         // Detect method call patterns first.
         if (call.func && call.func.type === 'IndexName') {
           const idx = (call.func as { index: string }).index;
