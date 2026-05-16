@@ -3151,6 +3151,20 @@ function compileBinary(
           factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
         );
       }
+      // Equality (`===` / `!==`): widen operands `as unknown` so
+      // TS doesn't fire TS2367 ("comparison appears unintentional
+      // because the types have no overlap") when our shape
+      // inference narrowed one side to a specific function/object
+      // type but the user's code compares against a primitive
+      // literal. The runtime semantics are unaffected — `===` /
+      // `!==` work on any pair of values.
+      if (op === '==' || op === '~=') {
+        const wrapU = (e: ts.Expression) =>
+          factory.createParenthesizedExpression(
+            factory.createAsExpression(e, factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+          );
+        return factory.createBinaryExpression(wrapU(left), direct, wrapU(right));
+      }
       return factory.createBinaryExpression(left, direct, right);
     }
     if (op === '//') {
