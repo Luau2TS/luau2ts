@@ -1820,6 +1820,13 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
     const value = stat.values[i];
     if (!value) continue;
     let valueExpr = compileExpr(value, ctx);
+    // Capture the tracked type BEFORE updating — the reassign-cast
+    // fallback below uses this to widen RHS for primitive-typed
+    // locals. After `assignLocal` updates to the RHS's static type,
+    // the original info is lost.
+    const targetTrackedType = target.type === 'Local'
+      ? ctx.lookupLocal((target as { name: string }).name)
+      : 'unknown';
     if (target.type === 'Local') ctx.assignLocal(target.name, staticTypeOfExpr(value, ctx));
     // rbxts mode: if the target is a local that has an inferred
     // structural shape, cast the RHS `as unknown as <shape>` so a
@@ -1831,16 +1838,16 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
         | import('./shape-infer.js').Shape
         | undefined;
       const fromShape = inferred ? shapeToTypeNode(inferred) : null;
+      // Parenthesise the RHS before wrapping in `as` — `as` binds
+      // tighter than `||`/`??`/`&&`, so a bare `X || Y as T` would
+      // parse as `X || (Y as T)` and leave the X branch untyped.
+      const inner = (
+        ts.isBinaryExpression(valueExpr)
+        || ts.isConditionalExpression(valueExpr)
+      )
+        ? factory.createParenthesizedExpression(valueExpr)
+        : valueExpr;
       if (fromShape) {
-        // Parenthesise the RHS before wrapping in `as` — `as` binds
-        // tighter than `||`/`??`/`&&`, so a bare `X || Y as T` would
-        // parse as `X || (Y as T)` and leave the X branch untyped.
-        const inner = (
-          ts.isBinaryExpression(valueExpr)
-          || ts.isConditionalExpression(valueExpr)
-        )
-          ? factory.createParenthesizedExpression(valueExpr)
-          : valueExpr;
         valueExpr = factory.createAsExpression(
           factory.createAsExpression(
             inner,
@@ -1848,6 +1855,30 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
           ),
           fromShape,
         );
+      } else {
+        // No inferred shape — fall back to the tracked static type
+        // so an unknown-typed RHS satisfies the local's declared
+        // type. Only kick in for the primitive kinds (string,
+        // number, boolean) — for these we cast to the WIDENED
+        // keyword type (string / number / boolean), not `typeof
+        // <local>` which TS resolves to a literal type for
+        // `let x = false` / `let x = "foo"` and that breaks
+        // subsequent literal comparisons (TS2367).
+        const tracked = targetTrackedType;
+        const primitiveTypeNode: ts.TypeNode | null =
+          tracked === 'string' ? factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword)
+          : tracked === 'number' ? factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword)
+          : tracked === 'boolean' ? factory.createKeywordTypeNode(ts.SyntaxKind.BooleanKeyword)
+          : null;
+        if (primitiveTypeNode) {
+          valueExpr = factory.createAsExpression(
+            factory.createAsExpression(
+              inner,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            primitiveTypeNode,
+          );
+        }
       }
     }
     // (Phase 2's earlier `as unknown as typeof obj.X` RHS cast was
