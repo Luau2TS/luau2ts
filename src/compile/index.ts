@@ -1822,9 +1822,18 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
         | undefined;
       const fromShape = inferred ? shapeToTypeNode(inferred) : null;
       if (fromShape) {
+        // Parenthesise the RHS before wrapping in `as` — `as` binds
+        // tighter than `||`/`??`/`&&`, so a bare `X || Y as T` would
+        // parse as `X || (Y as T)` and leave the X branch untyped.
+        const inner = (
+          ts.isBinaryExpression(valueExpr)
+          || ts.isConditionalExpression(valueExpr)
+        )
+          ? factory.createParenthesizedExpression(valueExpr)
+          : valueExpr;
         valueExpr = factory.createAsExpression(
           factory.createAsExpression(
-            valueExpr,
+            inner,
             factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
           ),
           fromShape,

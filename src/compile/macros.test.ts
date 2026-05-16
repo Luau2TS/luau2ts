@@ -46,20 +46,22 @@ describe('macros — datatype constructors (R.2)', () => {
   });
 
   it('rbxts mode keeps static factories as static calls', async () => {
-    const cases: [string, string][] = [
-      ['CFrame.Angles(1, 2, 3)', 'CFrame.Angles(1, 2, 3)'],
-      ['CFrame.fromEulerAnglesXYZ(0, 0, 0)', 'CFrame.fromEulerAnglesXYZ(0, 0, 0)'],
-      ['CFrame.lookAt(a, b)', 'CFrame.lookAt(a, b)'],
-      ['Color3.fromRGB(255, 0, 0)', 'Color3.fromRGB(255, 0, 0)'],
-      ['Color3.fromHSV(0.5, 0.5, 0.5)', 'Color3.fromHSV(0.5, 0.5, 0.5)'],
-      ['Color3.fromHex("#ff0000")', 'Color3.fromHex("#ff0000")'],
-      ['UDim2.fromScale(0.5, 0.5)', 'UDim2.fromScale(0.5, 0.5)'],
-      ['UDim2.fromOffset(10, 10)', 'UDim2.fromOffset(10, 10)'],
-      ['DateTime.now()', 'DateTime.now()'],
+    // The static-call shape stays the same; numeric factories cast each
+    // arg `as unknown as number` so unknown-typed callers flow through.
+    const cases: [string, RegExp][] = [
+      ['CFrame.Angles(1, 2, 3)', /CFrame\.Angles\(1, 2, 3\)/],
+      ['CFrame.fromEulerAnglesXYZ(0, 0, 0)', /CFrame\.fromEulerAnglesXYZ\(0, 0, 0\)/],
+      ['CFrame.lookAt(a, b)', /CFrame\.lookAt\(a, b\)/],
+      ['Color3.fromRGB(255, 0, 0)', /Color3\.fromRGB\(/],
+      ['Color3.fromHSV(0.5, 0.5, 0.5)', /Color3\.fromHSV\(/],
+      ['Color3.fromHex("#ff0000")', /Color3\.fromHex\("#ff0000"\)/],
+      ['UDim2.fromScale(0.5, 0.5)', /UDim2\.fromScale\(/],
+      ['UDim2.fromOffset(10, 10)', /UDim2\.fromOffset\(/],
+      ['DateTime.now()', /DateTime\.now\(\)/],
     ];
     for (const [src, expected] of cases) {
       const out = await emit(`local x = ${src}`, 'rbxts');
-      expect(out, src).toContain(expected);
+      expect(out, src).toMatch(expected);
       expect(out, src).not.toContain('new CFrame.');
     }
   });
@@ -270,9 +272,11 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
   it('math.clamp(x, lo, hi) keeps the real math.clamp call', async () => {
     // roblox-ts has a real `math.clamp` (Roblox Luau extension over
     // standard Lua); use it directly instead of decomposing into
-    // min/max.
+    // min/max. Args are cast `as unknown as number` so unknown-
+    // typed leaves flow into the numeric slot.
     const out = await emit('local c = math.clamp(x, 0, 1)', 'rbxts');
-    expect(out).toContain('math.clamp(x, 0, 1)');
+    expect(out).toMatch(/math\.clamp\(/);
+    expect(out).toContain('as unknown as number');
   });
 
   it('native mode keeps stdlib calls as namespace calls', async () => {
@@ -412,7 +416,7 @@ describe('macros — re-export grouping', () => {
     );
     expect(out).not.toContain('@rbxts/types');
     expect(out).toMatch(/new Vector3\(\s*1 as unknown as number/);
-    expect(out).toContain('Color3.fromRGB(255, 0, 0)');
+    expect(out).toMatch(/Color3\.fromRGB\(/);
     expect(out).toContain('new CFrame(0, 0, 0)');
   });
 });

@@ -33,16 +33,43 @@ for (const t of constructorTypes) {
 }
 
 // ─── Static factories → `TypeName.method(...)` ────────────────────────────
+
+/** Static-factory `TypeName.method` calls whose signatures expect
+ *  numeric args. We cast each compiled arg `as unknown as number`
+ *  so unknown-typed leaves from Phase-2 structural shapes
+ *  (a Local typed `{ X: unknown; ... }` reading `.X.Scale`, etc.)
+ *  flow through without TS2345 at the call site. */
+const NUMERIC_STATIC_FACTORIES = new Set([
+  'UDim2.fromScale', 'UDim2.fromOffset',
+  'Color3.fromRGB', 'Color3.fromHSV',
+  'Vector3.FromAxis', 'Vector3.FromNormalId',
+  'Vector2.FromAxis', 'Vector2.FromNormalId',
+]);
+
 function emitStaticCall(typeName: string, method: string): (a: MacroArgs) => ts.Expression {
+  const key = `${typeName}.${method}`;
+  const numeric = NUMERIC_STATIC_FACTORIES.has(key);
   return ({ ctx, compiledArgs }) => {
     ctx.useImport('@rbxts/types', typeName);
+    const args = numeric
+      ? compiledArgs.map((a) =>
+          factory.createAsExpression(
+            factory.createAsExpression(
+              ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
+                ? factory.createParenthesizedExpression(a)
+                : a,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+          ))
+      : compiledArgs;
     return factory.createCallExpression(
       factory.createPropertyAccessExpression(
         factory.createIdentifier(typeName),
         factory.createIdentifier(method),
       ),
       undefined,
-      compiledArgs,
+      args,
     );
   };
 }

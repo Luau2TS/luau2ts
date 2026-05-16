@@ -214,13 +214,26 @@ registerMacro(
 // `table.unpack(t)` → `...t`. The spread element only makes sense in a
 // call-position context, so emit `[...t]` to give a plain expression we can
 // reuse. Users who need actual unpacking write multi-return destructuring.
+//
+// The target gets cast `as unknown as Array<defined>` so unknown-typed
+// receivers (chained index access, function-call returns) still produce
+// an iterable spread without TS2488.
 registerMacro(
   'table.unpack',
   ({ compiledArgs }: MacroArgs) => {
     const [target] = compiledArgs;
     if (!target) return undefined;
+    const asArray = factory.createAsExpression(
+      factory.createAsExpression(
+        target,
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
+      factory.createTypeReferenceNode('Array', [
+        factory.createTypeReferenceNode('defined', undefined),
+      ]),
+    );
     return factory.createArrayLiteralExpression(
-      [factory.createSpreadElement(target)],
+      [factory.createSpreadElement(asArray)],
       false,
     );
   },
@@ -344,13 +357,23 @@ registerMacro(
     if (!x || !lo || !hi) return undefined;
     if (ctx.compatMode === 'rbxts') {
       ctx.useAmbient('math');
+      const num = (a: ts.Expression) =>
+        factory.createAsExpression(
+          factory.createAsExpression(
+            ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
+              ? factory.createParenthesizedExpression(a)
+              : a,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+        );
       return factory.createCallExpression(
         factory.createPropertyAccessExpression(
           factory.createIdentifier('math'),
           factory.createIdentifier('clamp'),
         ),
         undefined,
-        [x, lo, hi],
+        [num(x), num(lo), num(hi)],
       );
     }
     return factory.createCallExpression(
