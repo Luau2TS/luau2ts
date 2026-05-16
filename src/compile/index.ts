@@ -437,11 +437,9 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
           const fromShape = inferred ? shapeToTypeNode(inferred) : null;
           if (fromShape) {
             typeNode = fromShape;
-            // Route the initializer through `as unknown as <shape>`
-            // so even an `unknown` RHS satisfies the annotation.
-            // The cast is purely a TS-side hint; at runtime the
-            // value is whatever the source expression returns.
             if (initExpr) {
+              // Route the initializer through `as unknown as <shape>`
+              // so even an `unknown` RHS satisfies the annotation.
               initExpr = factory.createAsExpression(
                 factory.createAsExpression(
                   initExpr,
@@ -450,15 +448,32 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
                 fromShape,
               );
             }
+            // No initializer: emit `let X!: <shape>` (definite-
+            // assignment assertion). The user's Luau code assigns
+            // X later in a loop / branch that TS can't statically
+            // prove — `!` tells TS to trust us. Reads before
+            // assignment will still crash at runtime; that's
+            // identical to the Luau original.
           } else if (!initExpr || initIsNil) {
             typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
           }
         }
       }
+      // rbxts mode: a shape-typed local without an initializer needs
+      // a `!` (definite-assignment assertion) so TS doesn't fire
+      // TS2454 on later reads. The user's Luau code assigns the
+      // variable in a loop or branch we can't statically prove.
+      const needsDefiniteAssertion =
+        ctx.compatMode === 'rbxts'
+        && !initExpr
+        && typeNode !== undefined
+        && typeNode.kind !== ts.SyntaxKind.UnknownKeyword;
       newDecls.push(
         factory.createVariableDeclaration(
           factory.createIdentifier(jsName),
-          undefined,
+          needsDefiniteAssertion
+            ? factory.createToken(ts.SyntaxKind.ExclamationToken)
+            : undefined,
           typeNode,
           initExpr,
         ),
@@ -1665,8 +1680,28 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
     const target = stat.vars[i]!;
     const value = stat.values[i];
     if (!value) continue;
-    const valueExpr = compileExpr(value, ctx);
+    let valueExpr = compileExpr(value, ctx);
     if (target.type === 'Local') ctx.assignLocal(target.name, staticTypeOfExpr(value, ctx));
+    // rbxts mode: if the target is a local that has an inferred
+    // structural shape, cast the RHS `as unknown as <shape>` so a
+    // reassignment from an `unknown` source (`origSize = button.Size`
+    // where button.Size is a `Size: unknown` leaf in button's shape)
+    // still typechecks against the local's declared shape.
+    if (ctx.compatMode === 'rbxts' && target.type === 'Local') {
+      const inferred = ctx.getShape((target as { name: string }).name) as
+        | import('./shape-infer.js').Shape
+        | undefined;
+      const fromShape = inferred ? shapeToTypeNode(inferred) : null;
+      if (fromShape) {
+        valueExpr = factory.createAsExpression(
+          factory.createAsExpression(
+            valueExpr,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          fromShape,
+        );
+      }
+    }
     // `tbl[k] = v` with a non-literal numeric key compiles to a luaIndexSet
     // call; plain `target = v` would emit `luaIndex(tbl, k) = v` which is
     // not a valid LHS in TS. Literal numeric / string keys go through plain
@@ -3401,13 +3436,31 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     const meta = STRING_LIB_METHODS.get(methodName)!;
     if (ctx.compatMode === 'rbxts') {
       ctx.useAmbient('string');
+      // For `s:format(...)` (colon form) → `string.format(s, ...)`,
+      // cast each rest arg `as unknown as string | number` so
+      // unknown-typed leaves satisfy format's variadic slot.
+      let formattedArgs = args;
+      if (methodName === 'format' && args.length >= 1) {
+        const numStr = factory.createUnionTypeNode([
+          factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+          factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+        ]);
+        formattedArgs = args.map((a) =>
+          factory.createAsExpression(
+            factory.createAsExpression(
+              a,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            numStr,
+          ));
+      }
       const namespaceCall = factory.createCallExpression(
         factory.createPropertyAccessExpression(
           factory.createIdentifier('string'),
           factory.createIdentifier(methodName),
         ),
         undefined,
-        [compileExpr(expr.func.expr, ctx), ...args],
+        [compileExpr(expr.func.expr, ctx), ...formattedArgs],
       );
       // gsub/find/byte return `LuaTuple<[…]>` in @rbxts/types. Extract
       // the first value in single-value Luau positions (the default —
