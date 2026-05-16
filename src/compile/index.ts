@@ -452,9 +452,19 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
             if (initExpr) {
               // Route the initializer through `as unknown as <shape>`
               // so even an `unknown` RHS satisfies the annotation.
+              // Paren-wrap binary/conditional inits — `as` binds
+              // tighter than `||`/`??`/`&&`, so a bare `X || Y as T`
+              // would parse as `X || (Y as T)` and leave the X
+              // branch untyped.
+              const inner = (
+                ts.isBinaryExpression(initExpr)
+                || ts.isConditionalExpression(initExpr)
+              )
+                ? factory.createParenthesizedExpression(initExpr)
+                : initExpr;
               initExpr = factory.createAsExpression(
                 factory.createAsExpression(
-                  initExpr,
+                  inner,
                   factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
                 ),
                 fromShape,
@@ -3246,9 +3256,36 @@ function compileBinary(
       // have today — left for a future pass.)
       const arithmeticOps = new Set(['+', '-', '*', '/', '%', '^']);
       if (arithmeticOps.has(op)) {
+        // For PropertyAccess operands (`obj.X / 256`), rewrite the
+        // receiver through Record<string, unknown> first so the
+        // access itself typechecks even when `obj.X` doesn't exist on
+        // obj's declared type. Without this the inner `obj.X` fires
+        // TS2339 and the surrounding `as any` cast can't recover —
+        // semantic errors on sub-expressions aren't suppressed by an
+        // outer type assertion.
+        const widenAccess = (e: ts.Expression): ts.Expression => {
+          if (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.name)) {
+            return factory.createPropertyAccessExpression(
+              factory.createParenthesizedExpression(
+                factory.createAsExpression(
+                  factory.createAsExpression(
+                    e.expression,
+                    factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+                  ),
+                  factory.createTypeReferenceNode('Record', [
+                    factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+                    factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+                  ]),
+                ),
+              ),
+              e.name,
+            );
+          }
+          return e;
+        };
         const wrap = (e: ts.Expression) =>
           factory.createParenthesizedExpression(
-            factory.createAsExpression(e, factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword)),
+            factory.createAsExpression(widenAccess(e), factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword)),
           );
         return factory.createAsExpression(
           factory.createBinaryExpression(wrap(left), direct, wrap(right)),
