@@ -1702,6 +1702,36 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
         );
       }
     }
+    // rbxts mode: `obj.X = rhs` where rhs is `unknown` / `{}` and
+    // obj.X has a typed slot (TextLabel.Text: string, BasePart.
+    // BrickColor: BrickColor, etc.) — cast the RHS through
+    // `as unknown as typeof obj.X`. Requires obj to be a simple
+    // identifier so `typeof obj.X` is valid in type position.
+    // (We'd need entity-name chains for deeper paths; the simple
+    // case covers the dominant `lbl.Text = …` / `wrap.Name = …`
+    // patterns.)
+    if (
+      ctx.compatMode === 'rbxts'
+      && target.type === 'IndexName'
+      && (target.expr.type === 'Local' || target.expr.type === 'Global')
+      && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(target.index)
+    ) {
+      const compiledObj = compileExpr(target.expr, ctx);
+      if (ts.isIdentifier(compiledObj)) {
+        valueExpr = factory.createAsExpression(
+          factory.createAsExpression(
+            valueExpr,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createTypeQueryNode(
+            factory.createQualifiedName(
+              factory.createIdentifier(compiledObj.text),
+              factory.createIdentifier(target.index),
+            ),
+          ),
+        );
+      }
+    }
     // `tbl[k] = v` with a non-literal numeric key compiles to a luaIndexSet
     // call; plain `target = v` would emit `luaIndex(tbl, k) = v` which is
     // not a valid LHS in TS. Literal numeric / string keys go through plain
@@ -3409,13 +3439,19 @@ function castArgsForCall(
   });
 }
 
-/** True when `expr` is a simple reference (`Identifier` or a chain of
- *  property accesses anchored in an Identifier). `typeof expr` is
- *  valid in TS type position only for these forms. */
-function isSimpleCalleeRef(expr: ts.Expression): boolean {
+/** True when `expr` is a simple reference (`Identifier` or a short
+ *  chain of property accesses anchored in an Identifier). `typeof
+ *  expr` is valid in TS type position for these forms.
+ *
+ *  We cap the depth at 2 (`obj.method` is fine, `obj.field.method`
+ *  is not) because deeper chains often pass through a structurally-
+ *  typed `unknown` field — e.g. `ProfileService.IssueSignal.Fire`
+ *  where IssueSignal is typed `unknown` from class-field inference.
+ *  `typeof unknown.Fire` is invalid and fires TS2571. */
+function isSimpleCalleeRef(expr: ts.Expression, depth = 0): boolean {
   if (ts.isIdentifier(expr)) return true;
-  if (ts.isPropertyAccessExpression(expr)) {
-    return isSimpleCalleeRef(expr.expression);
+  if (ts.isPropertyAccessExpression(expr) && depth < 1) {
+    return isSimpleCalleeRef(expr.expression, depth + 1);
   }
   return false;
 }
