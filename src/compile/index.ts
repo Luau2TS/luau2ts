@@ -79,6 +79,21 @@ function compileBlockBody(block: BlockStat | Stat, ctx: CompileContext): ts.Stat
     // `<Class>.new(...)` calls in the same file are rewritten to
     // `new <Class>(...)` by the macro registry.
     ctx.recordDetectedClass(c.name);
+    // Register each INSTANCE method's name so IndexName compile can
+    // rewrite value-position `ClassName.method` reads to
+    // `ClassName.prototype.method`. Skip static methods (op === '.')
+    // — those are accessible statically and the prototype rewrite
+    // would fire TS2576 ("did you mean to access the static
+    // member?"). Colon-defined methods (op === ':') are always
+    // instance.
+    for (const method of c.methods) {
+      if (method.name.type === 'IndexName') {
+        const isStatic = (method.name as { op?: string }).op === '.';
+        if (!isStatic) {
+          ctx.recordDetectedClassMethod(c.name, (method.name as { index: string }).index);
+        }
+      }
+    }
     let lead = Infinity;
     for (const idx of c.consumed) {
       if (idx < lead) lead = idx;
@@ -419,10 +434,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
         // properly-typed value (Instance.new(…), function calls,
         // table literals, constructors), let TS infer from the init
         // — the inferred type is almost always better than what our
-        // structural shape would synthesize (e.g. `Part` vs.
-        // `{Name; Position; Size; Material; BrickColor}` — Part
-        // accepts `Vector3` on Position writes, the shape only
-        // accepts `unknown`).
+        // structural shape would synthesize.
         const initIsShapelyCandidate =
           !init
           || init.type === 'ConstantNil'
@@ -2593,15 +2605,29 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           );
         }
       }
-      // Phase 1 of rbxts cleanup dropped the blanket `<DetectedClass>
-      // .member` → `(class as any).member` cast. Static methods are
-      // already in the class declaration; reading them by name works
-      // without a cast. The case the cast originally caught — reading
-      // an INSTANCE method by name off the class identifier for
-      // metatable-style dispatch tables — is rare enough that we'd
-      // rather surface the TS error than poison every static access
-      // with `any`. Phase 2 will handle that case via class
-      // augmentation.
+      // Phase 2: when reading an INSTANCE method off the class
+      // identifier as a value (`local m = Class.method`), rewrite
+      // to `Class.prototype.method` so the method-descriptor is
+      // accessible. The Luau idiom of capturing method references
+      // (e.g. `setmetatable({}, {Connect = ScriptSignal.Connect})`)
+      // doesn't work via the class identifier in TS — instance
+      // methods only live on the prototype.
+      if (
+        ctx.compatMode === 'rbxts'
+        && (expr.expr.type === 'Global' || expr.expr.type === 'Local')
+        && ctx.isDetectedClassMethod(
+            (expr.expr as { name: string }).name,
+            expr.index,
+          )
+      ) {
+        return factory.createPropertyAccessExpression(
+          factory.createPropertyAccessExpression(
+            compileExpr(expr.expr, ctx),
+            factory.createIdentifier('prototype'),
+          ),
+          factory.createIdentifier(propertyName(expr.index)),
+        );
+      }
       const access = factory.createPropertyAccessExpression(
         compileExpr(expr.expr, ctx),
         factory.createIdentifier(propertyName(expr.index)),
@@ -3408,6 +3434,11 @@ function castArgsForCall(
   if (ctx.compatMode !== 'rbxts') return args;
   if (!isSimpleCalleeRef(callee)) return args;
   return args.map((arg, i) => {
+    // Spread elements (`...args`) need an iterable, not a single
+    // type. Casting `[..__varargs as Parameters<T>[i]]` would
+    // require __varargs to be iterable as Parameters[i] — usually
+    // false. Leave spread args alone.
+    if (ts.isSpreadElement(arg)) return arg;
     // Skip parenthesised-AsExpression — already cast.
     if (ts.isParenthesizedExpression(arg) && ts.isAsExpression(arg.expression)) {
       return arg;

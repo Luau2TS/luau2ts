@@ -171,6 +171,26 @@ export class CompileContext {
     return this.detectedClasses.has(name);
   }
 
+  /** Map class name → set of instance method names. Populated by the
+   *  class-shape pass. Used to rewrite value-position
+   *  `ClassName.method` reads to `ClassName.prototype.method`
+   *  (Luau's "method as function reference" idiom — TS doesn't
+   *  expose instance methods statically). */
+  private readonly detectedClassMethods = new Map<string, Set<string>>();
+
+  recordDetectedClassMethod(className: string, methodName: string): void {
+    let s = this.detectedClassMethods.get(className);
+    if (!s) {
+      s = new Set();
+      this.detectedClassMethods.set(className, s);
+    }
+    s.add(methodName);
+  }
+
+  isDetectedClassMethod(className: string, methodName: string): boolean {
+    return this.detectedClassMethods.get(className)?.has(methodName) ?? false;
+  }
+
   /** Mark a local identifier as already bound to an import of the same
    *  name. Subsequent `local <name> = <name>` declarations are dropped to
    *  avoid the redundant shadowing. */

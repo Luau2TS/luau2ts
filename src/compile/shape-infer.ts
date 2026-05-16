@@ -126,9 +126,14 @@ export function collectShapes(body: Stat, vars: Set<string>): Map<string, Shape>
         // receiver. Don't track the key expression as a property
         // name (it's a runtime value, not a static name); but DO
         // walk the key expression in case it references a tracked
-        // variable.
+        // variable. `empty = false` so shapeToTypeNode synthesizes
+        // an index-signature type for receivers used only via
+        // bracket access.
         const receiver = visitExpr((expr as { expr: Expr }).expr);
-        if (receiver) receiver.indexed = true;
+        if (receiver) {
+          receiver.indexed = true;
+          receiver.empty = false;
+        }
         visitExpr((expr as { index: Expr }).index);
         return null;
       }
