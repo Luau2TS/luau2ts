@@ -2500,6 +2500,21 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       if (f.type === 'IndexName' && f.expr.type === 'Global' && ARITH_DATATYPES.has(f.expr.name)) {
         return `datatype:${f.expr.name}` as StaticValueType;
       }
+      // Method-call chains: `v:add(w)` / `cf:mul(other)` on datatype-
+      // typed receivers return the same datatype per @rbxts/types'
+      // overloads (Vector3.add(Vector3) → Vector3, Vector3.mul(number)
+      // → Vector3, etc.). Follow the static type through so chained
+      // `(v + w) / 2` keeps the datatype path.
+      const ARITH_METHOD_NAMES = new Set(['add', 'sub', 'mul', 'div']);
+      if (
+        f.type === 'IndexName'
+        && ARITH_METHOD_NAMES.has(f.index)
+      ) {
+        const recvType = staticTypeOfExpr(f.expr, ctx);
+        if (typeof recvType === 'string' && recvType.startsWith('datatype:')) {
+          return recvType;
+        }
+      }
       return 'unknown';
     }
     case 'ConstantBool':
@@ -2508,8 +2523,29 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       return 'string';
     case 'ConstantNil':
       return 'nil';
-    case 'Local':
-      return ctx.lookupLocal(expr.name);
+    case 'Local': {
+      const tracked = ctx.lookupLocal(expr.name);
+      if (tracked !== 'unknown') return tracked;
+      // Phase 2: a shape-inferred Vector3 (X/Y/Z props) should be
+      // treated as the datatype for arithmetic dispatch — without
+      // this fallback compileBinaryExpr routes `v + w` through the
+      // generic operator path and returns `number`, breaking the
+      // subsequent `result.X` access or Vector3-typed slot.
+      if (ctx.compatMode === 'rbxts') {
+        const shape = ctx.getShape(expr.name) as
+          | { props: Map<string, unknown>; methods: Map<string, unknown> }
+          | undefined;
+        if (
+          shape
+          && (shape.props.has('X') || shape.methods.has('X'))
+          && (shape.props.has('Y') || shape.methods.has('Y'))
+          && (shape.props.has('Z') || shape.methods.has('Z'))
+        ) {
+          return 'datatype:Vector3';
+        }
+      }
+      return 'unknown';
+    }
     case 'Group':
       return staticTypeOfExpr(expr.expr, ctx);
     case 'TypeAssertion':
@@ -2520,10 +2556,19 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       return 'unknown';
     case 'Binary':
       if (['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
-        return staticTypeOfExpr(expr.left, ctx) === 'number'
-          && staticTypeOfExpr(expr.right, ctx) === 'number'
-          ? 'number'
-          : 'unknown';
+        const lt = staticTypeOfExpr(expr.left, ctx);
+        const rt = staticTypeOfExpr(expr.right, ctx);
+        if (lt === 'number' && rt === 'number') return 'number';
+        // Datatype arithmetic preserves the datatype on the LEFT
+        // operand. `(v + w) / 2` where v is Vector3 stays Vector3.
+        // The compileBinaryExpr datatype-fast-path uses the left's
+        // method overload to dispatch, so the result is whatever
+        // the left datatype returns (Vector3 + Vector3 → Vector3,
+        // Vector3 * number → Vector3, CFrame * Vector3 → Vector3 —
+        // but the latter mixed case is rare and not worth modeling
+        // here; left-side datatype is close enough).
+        if (typeof lt === 'string' && lt.startsWith('datatype:')) return lt;
+        return 'unknown';
       }
       if (['==', '~=', '<', '<=', '>', '>='].includes(expr.op)) return 'boolean';
       // Lua `..` produces a string when either side is statically string-
