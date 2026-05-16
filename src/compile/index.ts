@@ -1585,7 +1585,10 @@ function buildAssignmentStatement(
       // `any`. Round-trip back to Lua is identity (`t[k] = v`).
       const recv = factory.createParenthesizedExpression(
         factory.createAsExpression(
-          compileExpr(target.expr, ctx),
+          factory.createAsExpression(
+            compileExpr(target.expr, ctx),
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
           factory.createTypeReferenceNode('Record', [
             factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
             factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
@@ -2755,15 +2758,21 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       // variable indices), helper in native mode (handles 1-based at runtime).
       if (ctx.compatMode === 'rbxts') {
         // The index is a runtime variable (not a literal). Cast the
-        // receiver to `Record<string, unknown>` (not `any` — that
-        // would trip roblox-ts's no-any rule) so arbitrary string-
-        // keyed access yields `unknown`. Cast the index through
-        // `unknown as string` so Player/Instance-typed keys (common
-        // in Roblox dict lookups by player) coerce to a string slot
-        // without TS2538.
+        // receiver `as unknown as Record<string, unknown>` (not
+        // `any` — that would trip roblox-ts's no-any rule) so
+        // arbitrary string-keyed access yields `unknown`. Routing
+        // through `unknown` first sidesteps TS2352 when the source
+        // is a typed array (`defined[]`) or object that doesn't
+        // structurally overlap with `Record`. Cast the index
+        // through `unknown as string` so Player/Instance-typed
+        // keys (common in Roblox dict lookups by player) coerce to
+        // a string slot without TS2538.
         const dynamicTarget = factory.createParenthesizedExpression(
           factory.createAsExpression(
-            target,
+            factory.createAsExpression(
+              target,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
             factory.createTypeReferenceNode('Record', [
               factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
               factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
