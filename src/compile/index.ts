@@ -1671,10 +1671,20 @@ function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
     const isSelf =
       (target.expr.type === 'Local' && (target.expr as { name: string }).name === 'self')
       || (target.expr.type === 'Global' && (target.expr as { name: string }).name === 'self');
+    // Extended for IndexName chains too: `Players.LocalPlayer.Gui.X = value`
+    // — the receiver is `Players.LocalPlayer.Gui`, an IndexName chain whose
+    // type bottoms out at `_LuauChild`. Without a Record cast at the final
+    // hop, TS treats the assignment slot as `_LuauChild` and rejects any
+    // primitive value (TS2322). Wrapping the chain receiver in Record opens
+    // the slot to `unknown` (accepts anything) on the write.
+    const receiverIsChainable =
+      target.expr.type === 'Local'
+      || target.expr.type === 'Global'
+      || target.expr.type === 'IndexName';
     if (
       ctx.compatMode === 'rbxts'
       && !isSelf
-      && (target.expr.type === 'Local' || target.expr.type === 'Global')
+      && receiverIsChainable
       && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(target.index)
     ) {
       return factory.createPropertyAccessExpression(
@@ -2663,6 +2673,33 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           factory.createPropertyAccessExpression(
             compileExpr(expr.expr, ctx),
             factory.createIdentifier('prototype'),
+          ),
+          factory.createIdentifier(propertyName(expr.index)),
+        );
+      }
+      // rbxts mode: when reading `.X` off a value whose receiver is
+      // itself an IndexExpr (`obj[k].X`), the receiver's compiled type
+      // is `unknown` (from Record<string,unknown> casts). A direct
+      // PropertyAccess fires TS2571 ("Object is of type 'unknown'").
+      // Recast the receiver through Record<string, unknown> so `.X`
+      // resolves to an `unknown` slot, which subsequent operations
+      // (calls, indexing) can then re-route through their own casts.
+      if (
+        ctx.compatMode === 'rbxts'
+        && expr.expr.type === 'IndexExpr'
+      ) {
+        return factory.createPropertyAccessExpression(
+          factory.createParenthesizedExpression(
+            factory.createAsExpression(
+              factory.createAsExpression(
+                compileExpr(expr.expr, ctx),
+                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+              ),
+              factory.createTypeReferenceNode('Record', [
+                factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+              ]),
+            ),
           ),
           factory.createIdentifier(propertyName(expr.index)),
         );
@@ -3729,13 +3766,26 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
             numStr,
           ));
       }
+      // The colon-method receiver becomes the first positional arg
+      // to `string.<method>(...)`. Cast it `as unknown as string`
+      // so receivers typed as a structural shape (`{ lower(...): unknown }`,
+      // synthesized when Luau code only uses `s:lower()` and never reads
+      // `s` as a primitive) flow into `string.lower`'s `string` slot
+      // without TS2345.
+      const receiverExpr = factory.createAsExpression(
+        factory.createAsExpression(
+          compileExpr(expr.func.expr, ctx),
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+      );
       const namespaceCall = factory.createCallExpression(
         factory.createPropertyAccessExpression(
           factory.createIdentifier('string'),
           factory.createIdentifier(methodName),
         ),
         undefined,
-        [compileExpr(expr.func.expr, ctx), ...formattedArgs],
+        [receiverExpr, ...formattedArgs],
       );
       // gsub/find/byte return `LuaTuple<[…]>` in @rbxts/types. Extract
       // the first value in single-value Luau positions (the default —
@@ -3884,6 +3934,14 @@ const INSTANCE_LOOSE_METHODS = new Set([
   'FindFirstDescendant',
   'WaitForChild',
   'GetAttribute',
+  // Players service methods that return `Player | undefined` per
+  // @rbxts/types. Real scripts that call these inside a Touched/
+  // CharacterAdded handler trust that the value isn't nil (they're
+  // running because the right entity touched their part); the
+  // `as any` cast absorbs the optional so subsequent `.UserId`
+  // / `.Name` access typechecks.
+  'GetPlayerFromCharacter',
+  'GetPlayerByUserId',
 ]);
 
 function compileTableExpr(

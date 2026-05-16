@@ -25,6 +25,20 @@ registerMacro(
         ),
         factory.createTypeReferenceNode('defined', undefined),
       );
+    // Route the array target through `as unknown as Array<defined>` so
+    // an `unknown`-typed receiver (from chained `obj[k]` index access)
+    // exposes `.push` / `.insert` without TS2571.
+    const asArrayTarget = factory.createParenthesizedExpression(
+      factory.createAsExpression(
+        factory.createAsExpression(
+          target,
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createTypeReferenceNode('Array', [
+          factory.createTypeReferenceNode('defined', undefined),
+        ]),
+      ),
+    );
     if (third !== undefined) {
       const indexExpr = factory.createBinaryExpression(
         second!,
@@ -32,14 +46,14 @@ registerMacro(
         factory.createNumericLiteral(1),
       );
       return factory.createCallExpression(
-        factory.createPropertyAccessExpression(target, factory.createIdentifier('insert')),
+        factory.createPropertyAccessExpression(asArrayTarget, factory.createIdentifier('insert')),
         undefined,
         [indexExpr, asDefined(third)],
       );
     }
     if (second === undefined) return undefined;
     return factory.createCallExpression(
-      factory.createPropertyAccessExpression(target, factory.createIdentifier('push')),
+      factory.createPropertyAccessExpression(asArrayTarget, factory.createIdentifier('push')),
       undefined,
       [asDefined(second)],
     );
@@ -58,20 +72,39 @@ registerMacro(
   ({ compiledArgs }: MacroArgs) => {
     const [target, idx] = compiledArgs;
     if (!target) return undefined;
+    const asArrayTarget = factory.createParenthesizedExpression(
+      factory.createAsExpression(
+        factory.createAsExpression(
+          target,
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createTypeReferenceNode('Array', [
+          factory.createTypeReferenceNode('defined', undefined),
+        ]),
+      ),
+    );
     if (idx === undefined) {
       return factory.createCallExpression(
-        factory.createPropertyAccessExpression(target, factory.createIdentifier('pop')),
+        factory.createPropertyAccessExpression(asArrayTarget, factory.createIdentifier('pop')),
         undefined,
         [],
       );
     }
+    // Cast the index too — it might be an unknown-typed local.
+    const idxNum = factory.createAsExpression(
+      factory.createAsExpression(
+        idx,
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
+      factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+    );
     const indexExpr = factory.createBinaryExpression(
-      idx,
+      idxNum,
       factory.createToken(ts.SyntaxKind.MinusToken),
       factory.createNumericLiteral(1),
     );
     return factory.createCallExpression(
-      factory.createPropertyAccessExpression(target, factory.createIdentifier('remove')),
+      factory.createPropertyAccessExpression(asArrayTarget, factory.createIdentifier('remove')),
       undefined,
       [indexExpr],
     );

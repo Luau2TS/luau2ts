@@ -187,9 +187,10 @@ describe('macros — RuntimeLib.lua recognizer (R.8)', () => {
 describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
   it('table.insert(t, v) → t.push(v)', async () => {
     const out = await emit('table.insert(arr, x)', 'rbxts');
-    // The value is cast `as unknown as defined` so it satisfies
-    // the rbxts Array<defined>.push signature.
-    expect(out).toMatch(/arr\.push\(x as unknown as defined\)/);
+    // The receiver is routed through `as unknown as Array<defined>` so
+    // an `unknown`-typed receiver still exposes `.push`; the value is
+    // cast `as unknown as defined` so it satisfies the push signature.
+    expect(out).toMatch(/Array<defined>\)\.push\(x as unknown as defined\)/);
   });
 
   it('table.insert(t, i, v) → t.insert(i - 1, v)', async () => {
@@ -198,14 +199,14 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     // `table` (which doesn't even expose `.insert` in @rbxts/types) or
     // through `.splice` (also missing on Array<T>).
     const out = await emit('table.insert(arr, 2, x)', 'rbxts');
-    expect(out).toMatch(/arr\.insert\(2 - 1, x as unknown as defined\)/);
+    expect(out).toMatch(/Array<defined>\)\.insert\(2 - 1, x as unknown as defined\)/);
     expect(out).not.toContain('table.insert');
     expect(out).not.toContain('.splice(');
   });
 
   it('table.remove(t) → t.pop()', async () => {
     const out = await emit('local v = table.remove(arr)', 'rbxts');
-    expect(out).toContain('arr.pop()');
+    expect(out).toMatch(/Array<defined>\)\.pop\(\)/);
   });
 
   it('table.remove(t, i) → t.remove(i-1)', async () => {
@@ -214,7 +215,7 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     // emit used `t.splice(...)` (JS-style) — rbxts Array doesn't
     // have `splice` so that fired TS2339.
     const out = await emit('local v = table.remove(arr, 1)', 'rbxts');
-    expect(out).toMatch(/arr\.remove\(1 - 1\)/);
+    expect(out).toMatch(/Array<defined>\)\.remove\(/);
   });
 
   it('table.concat(t, sep) → t.join(sep)', async () => {
