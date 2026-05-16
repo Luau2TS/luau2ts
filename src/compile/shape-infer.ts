@@ -423,12 +423,21 @@ const PLAYER_DISCRIMINATORS = new Set([
   'GetRankInGroup', 'IsInGroup', 'Kick',
 ]);
 
-/** Pick the closest Roblox class for a structural shape — order
- *  matters: more-specific discriminators win. */
+/** Vector3 detection. A shape with X/Y/Z props is almost certainly
+ *  a Vector3 in Roblox code — Color3 uses R/G/B, CFrame has many
+ *  more members (Rotation, Position, LookVector...). Intersect with
+ *  Vector3 so arithmetic method calls (.add/.sub/.mul/.div, emitted
+ *  by Luau's +/-/* operators) resolve against the typed signatures
+ *  on Vector3 instead of failing TS2339 against the synthesized
+ *  structural literal. */
 function intersectionTypeName(shape: Shape): string | null {
   const has = (name: string) =>
     shape.props.has(name) || shape.methods.has(name);
   for (const d of PLAYER_DISCRIMINATORS) if (has(d)) return 'Player';
+  // Vector3 has X/Y/Z and nothing else of the Instance discriminator
+  // surface. Check this BEFORE Instance — instance has no X/Y/Z
+  // members so the discriminator overlap is empty.
+  if (has('X') && has('Y') && has('Z')) return 'Vector3';
   for (const d of INSTANCE_DISCRIMINATORS) if (has(d)) return 'Instance';
   return null;
 }
@@ -460,6 +469,9 @@ function intersectionTargetDeclaresName(target: string, name: string): boolean {
   if (target === 'Instance') return INSTANCE_DISCRIMINATORS.has(name);
   if (target === 'Player') return INSTANCE_DISCRIMINATORS.has(name)
     || PLAYER_DISCRIMINATORS.has(name);
+  if (target === 'Vector3') return name === 'X' || name === 'Y' || name === 'Z'
+    || name === 'add' || name === 'sub' || name === 'mul' || name === 'div'
+    || name === 'Magnitude' || name === 'Unit';
   return false;
 }
 

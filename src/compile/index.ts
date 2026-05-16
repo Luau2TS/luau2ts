@@ -4232,8 +4232,26 @@ function compileTableProp(item: TableItem, ctx: CompileContext): ts.PropertyAssi
   if (item.kind === 'Record' && item.key.type === 'ConstantString') {
     return factory.createPropertyAssignment(propNameFromString(item.key.value), value);
   }
+  // Computed key: `{[expr] = value}` → `{[expr]: value}`. TS requires
+  // computed keys to be `string | number | symbol | any`. In rbxts mode
+  // the key may be an `unknown`-typed local (shape-inferred parameter,
+  // index access result) so cast through `unknown as string | number`
+  // to satisfy the constraint without leaking `any`.
+  let keyExpr = compileExpr(item.key, ctx);
+  if (ctx.compatMode === 'rbxts') {
+    keyExpr = factory.createAsExpression(
+      factory.createAsExpression(
+        keyExpr,
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
+      factory.createUnionTypeNode([
+        factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+        factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+      ]),
+    );
+  }
   return factory.createPropertyAssignment(
-    factory.createComputedPropertyName(compileExpr(item.key, ctx)),
+    factory.createComputedPropertyName(keyExpr),
     value,
   );
 }
