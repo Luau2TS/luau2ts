@@ -2495,13 +2495,20 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           ),
         );
       }
-      // rbxts mode: property access on `game` / `workspace` / `script` /
-      // `plugin` returns Instance-typed values. Real Roblox scripts read
-      // service or child accesses freely; @rbxts/types only exposes the
-      // declared properties (Workspace.Camera etc.), missing every user
-      // folder (`game.MyFolder`, `workspace.Tycoons`, etc.). Cast the
-      // root to `any` so the entire access chain is dynamically typed.
-      // Subsequent `.Parent` / FindFirstChild casts compose with this.
+      // rbxts mode: property access on `game` / `workspace` / `script`
+      // / `plugin` returns Instance-typed values. Real Roblox scripts
+      // read service or child accesses freely; @rbxts/types only
+      // exposes the declared properties (Workspace.Camera etc.),
+      // missing every user folder (`game.MyFolder`,
+      // `workspace.Tycoons`, etc.). Cast the root to `any` so the
+      // entire access chain is dynamically typed. Subsequent
+      // `.Parent` / FindFirstChild casts compose with this.
+      //
+      // (We tried a recursive `_LuauChild` type alias instead of
+      // `any` to satisfy roblox-ts's no-any rule, but the
+      // intersection with Instance made `Instance | undefined` slots
+      // surface as TS2532. `as any` remains the working compromise
+      // for these few well-known roots.)
       if (
         ctx.compatMode === 'rbxts'
         && expr.expr.type === 'Global'
