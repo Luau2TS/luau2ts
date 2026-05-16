@@ -2509,18 +2509,59 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       // intersection with Instance made `Instance | undefined` slots
       // surface as TS2532. `as any` remains the working compromise
       // for these few well-known roots.)
-      if (
-        ctx.compatMode === 'rbxts'
-        && expr.expr.type === 'Global'
-        && RBX_DYNAMIC_ROOTS.has((expr.expr as { name: string }).name)
-      ) {
-        return factory.createPropertyAccessExpression(
-          factory.createAsExpression(
-            compileExpr(expr.expr, ctx),
-            factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
-          ),
-          factory.createIdentifier(propertyName(expr.index)),
-        );
+      if (ctx.compatMode === 'rbxts') {
+        // Check both the Luau-AST receiver (Global name) AND the
+        // compiled-receiver identifier so macros that rewrite
+        // `game:GetService("X")` to a bare `X` identifier still
+        // benefit from the service-cast path.
+        const luauReceiverName =
+          expr.expr.type === 'Global' ? (expr.expr as { name: string }).name : null;
+        if (luauReceiverName && RBX_DYNAMIC_ROOTS.has(luauReceiverName)) {
+          return factory.createPropertyAccessExpression(
+            factory.createAsExpression(
+              compileExpr(expr.expr, ctx),
+              factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+            ),
+            factory.createIdentifier(propertyName(expr.index)),
+          );
+        }
+        // For services imported from `@rbxts/services`, route
+        // through the recursive `_LuauChild` interface so dynamic-
+        // child access (`ReplicatedStorage.BindableEvents`,
+        // `ServerScriptService.PlayerData`) typechecks without `any`.
+        // Services don't have the `Parent` / `FindFirstChild`
+        // pattern that broke the _LuauChild + Instance intersection
+        // for `game` / `workspace` — they're plain Instance-derived
+        // containers whose children are runtime-named.
+        //
+        // Detect a service receiver either via the Luau AST (bare
+        // `ServerScriptService.Foo`) OR via the compiled receiver
+        // when a macro produced the identifier (`game:GetService(
+        // "ServerScriptService").Foo` → the inner Call macros to
+        // identifier `ServerScriptService`, then we compile its
+        // IndexName here).
+        const compiledReceiver = compileExpr(expr.expr, ctx);
+        const compiledIdent =
+          ts.isIdentifier(compiledReceiver) ? compiledReceiver.text : null;
+        const serviceName =
+          (luauReceiverName && ctx.isRbxService(luauReceiverName)) ? luauReceiverName
+          : (compiledIdent && ctx.isRbxService(compiledIdent)) ? compiledIdent
+          : null;
+        if (serviceName) {
+          ctx.useLuauChildType();
+          return factory.createPropertyAccessExpression(
+            factory.createParenthesizedExpression(
+              factory.createAsExpression(
+                factory.createAsExpression(
+                  compiledReceiver,
+                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+                ),
+                factory.createTypeReferenceNode('_LuauChild', undefined),
+              ),
+            ),
+            factory.createIdentifier(propertyName(expr.index)),
+          );
+        }
       }
       // Phase 1 of rbxts cleanup dropped the blanket `<DetectedClass>
       // .member` → `(class as any).member` cast. Static methods are
@@ -4250,6 +4291,48 @@ export async function compile(
         ),
       );
     }
+  }
+  // rbxts mode: when any property access has used the `_LuauChild`
+  // cast (service.X dynamic-child accesses), inject the interface
+  // declaration. `_LuauChild` is a recursive structural type that
+  // models "anything Luau lets you index into, treat as a function,
+  // or chain further property access on" — every property returns
+  // _LuauChild, the type itself is callable (with any args, any
+  // return), so `service.Foo.Bar.FireServer(x, y)` chains work
+  // without TS2339.
+  if (ctx.compatMode === 'rbxts' && ctx.luauChildTypeUsed) {
+    allStatements.push(
+      factory.createInterfaceDeclaration(
+        undefined,
+        factory.createIdentifier('_LuauChild'),
+        undefined,
+        undefined,
+        [
+          factory.createIndexSignature(
+            undefined,
+            [factory.createParameterDeclaration(
+              undefined,
+              undefined,
+              factory.createIdentifier('k'),
+              undefined,
+              factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+            )],
+            factory.createTypeReferenceNode('_LuauChild', undefined),
+          ),
+          factory.createCallSignature(
+            undefined,
+            [factory.createParameterDeclaration(
+              undefined,
+              factory.createToken(ts.SyntaxKind.DotDotDotToken),
+              factory.createIdentifier('args'),
+              undefined,
+              factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+            )],
+            factory.createTypeReferenceNode('_LuauChild', undefined),
+          ),
+        ],
+      ),
+    );
   }
   allStatements.push(...implicitGlobalDecls);
   allStatements.push(...stmts);

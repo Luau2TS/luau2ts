@@ -89,6 +89,24 @@ export class CompileContext {
    *  the first element instead of as a tuple. */
   preferMultiReturn = false;
 
+  /** rbxts-mode Phase 2: set to true the first time a service /
+   *  Instance-root access casts through the `_LuauChild` recursive
+   *  type. The emitter prepends an `interface _LuauChild` declaration
+   *  once when this is true. */
+  private _luauChildTypeUsed = false;
+  useLuauChildType(): void { this._luauChildTypeUsed = true; }
+  get luauChildTypeUsed(): boolean { return this._luauChildTypeUsed; }
+
+  /** Service names recorded via `@rbxts/services` imports. IndexName
+   *  compile uses this to identify root-service references and route
+   *  them through the `_LuauChild` cast for dynamic-child access. */
+  isRbxService(name: string): boolean {
+    for (const { module, names } of this.extraImportEntries()) {
+      if (module === '@rbxts/services' && names.includes(name)) return true;
+    }
+    return false;
+  }
+
   /** Names of file-local functions whose return type is annotated as
    *  `LuaTuple<[…]>` (rbxts mode, uniform multi-return paths). Calls
    *  to these functions in single-LHS positions need a `[0]` extract
