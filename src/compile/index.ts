@@ -5199,6 +5199,12 @@ function expectedSlotTypes(callee: ts.Expression): ExpectedSlots | undefined {
     case 'error':
     case 'assert':
       return { 0: 'any', rest: 'any' };
+    case 'require':
+      // The require-call site pre-wraps the arg as ModuleScript before
+      // castArgsForCall runs (see compileCall line ~5380); 'any' here
+      // suppresses the redundant `as Parameters<typeof require>[0]`
+      // wrap that would otherwise stack on top.
+      return { 0: 'any' };
     // Roblox task library — `task.wait(seconds)` is the common
     // pattern; spawn/delay take a callback first and need the cast.
     case 'task.wait':
@@ -5376,14 +5382,28 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     && args[0]
     && !ts.isSpreadElement(args[0])
   ) {
+    // ModuleScript extends Instance; an arg already typed `as Instance`
+    // (typical chain: WaitForChild result, script.Parent navigation)
+    // can downcast directly without the `as unknown` bridge.
+    const arg0 = args[0];
+    const innerIsInstance =
+      ts.isAsExpression(arg0)
+      && ts.isTypeReferenceNode(arg0.type)
+      && ts.isIdentifier(arg0.type.typeName)
+      && arg0.type.typeName.text === 'Instance';
     args = [
-      factory.createAsExpression(
-        factory.createAsExpression(
-          args[0],
-          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-        ),
-        factory.createTypeReferenceNode('ModuleScript', undefined),
-      ),
+      innerIsInstance
+        ? factory.createAsExpression(
+            arg0,
+            factory.createTypeReferenceNode('ModuleScript', undefined),
+          )
+        : factory.createAsExpression(
+            factory.createAsExpression(
+              arg0,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createTypeReferenceNode('ModuleScript', undefined),
+          ),
       ...args.slice(1),
     ];
   }
