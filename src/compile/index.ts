@@ -3380,6 +3380,58 @@ function typeFromAnnotation(
   }
 }
 
+/** What type TS sees post-emit, ignoring our tracked reassign types.
+ *  Different from `staticTypeOfExpr` for Locals that have been
+ *  reassigned: tracked says the latest assigned type, but TS sees the
+ *  declared annotation type (or `unknown` if none).
+ *
+ *  Used by cast-skip predicates so we don't drop a needed cast when the
+ *  tracked type happens to match the expected slot but the TS-side
+ *  declared type does not. */
+function tsVisibleType(expr: Expr, ctx: CompileContext): StaticValueType {
+  switch (expr.type) {
+    case 'ConstantInteger':
+    case 'ConstantNumber':
+      return 'number';
+    case 'ConstantString':
+      return 'string';
+    case 'ConstantBool':
+      return 'boolean';
+    case 'ConstantNil':
+      return 'nil';
+    case 'Local': {
+      // Param-inferred primitive — paramsFromLocals emits this as the
+      // declared annotation, so TS sees the primitive.
+      const preInferred = ctx.preInferredParamType.get(expr.name);
+      if (preInferred) return preInferred;
+      // Local-type-inferred primitive — same: annotation is emitted.
+      if (ctx.tsTypedPrimitiveLocal.has(expr.name)) {
+        const localPrim = ctx.localTypeMap.byName.get(expr.name);
+        if (localPrim) return localPrim;
+      }
+      return 'unknown';
+    }
+    case 'Group':
+    case 'TypeAssertion':
+      return tsVisibleType(expr.expr, ctx);
+    case 'Call': {
+      // Call results: rely on staticTypeOfExpr's Call handling, which
+      // doesn't read tracked state — it walks oracle / macro paths.
+      return staticTypeOfExpr(expr, ctx);
+    }
+    case 'Binary': {
+      // Arithmetic results: rely on the same logic as staticTypeOfExpr.
+      return staticTypeOfExpr(expr, ctx);
+    }
+    case 'Unary':
+      if (expr.op === 'not') return 'boolean';
+      if (expr.op === '#' || expr.op === '-') return 'number';
+      return 'unknown';
+    default:
+      return 'unknown';
+  }
+}
+
 function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
   switch (expr.type) {
     case 'ConstantInteger':
@@ -4946,10 +4998,13 @@ function castArgsForCall(
       if (expected === 'any') return arg;
       if (luauArgs?.[i]) {
         const luau = luauArgs[i]!;
-        const t = staticTypeOfExpr(luau, ctx);
-        const trusted = isTrustedTypedExpr(luau, ctx);
-        if (trusted && t === expected) return arg;
-        if (trusted && expected === 'number|string' && (t === 'number' || t === 'string')) return arg;
+        // Use TS-visible type (not tracked reassign type) so we don't
+        // skip a cast that TS would actually need. `targetUserId =
+        // tonumber(targetUserId)` tracks as `number` but TS-visible
+        // type stays `unknown`/`string` — the cast must still apply.
+        const tsT = tsVisibleType(luau, ctx);
+        if (tsT === expected) return arg;
+        if (expected === 'number|string' && (tsT === 'number' || tsT === 'string')) return arg;
       }
     } else if (
       luauArgs?.[i]
