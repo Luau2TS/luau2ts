@@ -40,6 +40,7 @@ import { hoistInnerLuaTupleCalls } from './luatuple-hoist.js';
 import { inferLocalTypes, type LocalTypeMap } from './local-type-infer.js';
 import { runFlowPass, type FlowFact } from './flow.js';
 import { inferInstanceLocals } from './backprop-class.js';
+import { rewriteGameServices } from './service-rewrite.js';
 import { compileType, compileTypePack, setAliasArities, setTypeCompatMode } from './type.js';
 import {
   buildSourceMap,
@@ -6183,6 +6184,13 @@ export async function compile(
   // rbxts mode: split inline `:WaitForChild():WaitForChild()` instance-nav
   // chains into named locals so each link's oracle-resolved class flows
   // cleanly (instead of getting absorbed by a single `as X` at the end).
+  // Pre-pass: rewrite `game.<service>:Method(...)` to bare `<service>` access.
+  // Adds the services to a set that flows into the implicit-globals path so
+  // each gets a `const X = game.GetService("X")` predecl. roblox-ts forbids
+  // direct property access on game/workspace for services.
+  const serviceRewrite = ctx.compatMode === 'rbxts'
+    ? rewriteGameServices(parsed, ctx.oracle)
+    : { servicesUsed: new Set<string>() };
   if (ctx.compatMode === 'rbxts') {
     splitInstanceChains(parsed);
     hoistInnerLuaTupleCalls(parsed);
@@ -6459,6 +6467,10 @@ export async function compile(
   if (ctx.compatMode === 'rbxts') {
     for (const name of implicitGlobals) {
       if (ctx.oracle.isService(name)) serviceImplicitGlobals.add(name);
+    }
+    // Services discovered via the `game.<service>` rewrite pre-pass.
+    for (const name of serviceRewrite.servicesUsed) {
+      serviceImplicitGlobals.add(name);
     }
   }
   for (const name of serviceImplicitGlobals) {
