@@ -77,7 +77,13 @@ function exprType(expr: P.Expr): LocalKind | 'unknown' {
         const ns = fn.expr.name;
         if (ns === 'math' && NUMBER_RETURNING_MATH.has(fn.index)) return 'number';
         if (ns === 'string' && STRING_RETURNING_LIB.has(fn.index)) return 'string';
+        // `os.clock`/`os.time`/`tick` return number per @rbxts/types.
+        if (ns === 'os' && (fn.index === 'clock' || fn.index === 'time' || fn.index === 'difftime')) {
+          return 'number';
+        }
       }
+      // Bare globals: `tick()` returns number.
+      if (fn.type === 'Global' && fn.name === 'tick') return 'number';
       // Method-form string lib on a (presumed) string-typed receiver.
       if (fn.type === 'IndexName' && expr.self) {
         if (STRING_RETURNING_LIB.has(fn.index)) return 'string';

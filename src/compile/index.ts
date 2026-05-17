@@ -3324,6 +3324,12 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
         ]);
         if (MATH_NUMBER_RETURNS.has(f.index)) return 'number';
       }
+      // os.X (clock/time/difftime) and bare `tick()` return number.
+      if (f.type === 'IndexName' && f.expr.type === 'Global' && f.expr.name === 'os'
+          && (f.index === 'clock' || f.index === 'time' || f.index === 'difftime')) {
+        return 'number';
+      }
+      if (f.type === 'Global' && f.name === 'tick') return 'number';
       // String-returning string-lib methods (namespace + colon forms).
       // Lets the reassign-cast pick `string` over the wider shape-method literal.
       const STRING_RETURNING = new Set([
