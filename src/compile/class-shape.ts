@@ -10,6 +10,7 @@ import type {
 } from '../parser/index.js';
 import type { CompileContext } from './context.js';
 import { collectLocalNames, collectShapes, mergeShape, shapeToTypeNode } from './shape-infer.js';
+import { inferParamPrimitives, type Primitive as ParamPrimitive } from './param-infer.js';
 import { compileType } from './type.js';
 
 const { factory } = ts;
@@ -401,9 +402,38 @@ export function compileClassPattern(
         optionalFrom = lastShapeRequired + 1;
       }
     }
+    const paramPrimitives = ctx.compatMode === 'rbxts' && fnExpr.body
+      ? inferParamPrimitives(fnExpr as unknown as Parameters<typeof inferParamPrimitives>[0])
+      : new Map<string, ParamPrimitive>();
+    // A param with an inferred primitive can't be `?: unknown` (its declared
+    // type is `number`/`string`/`boolean`); push optionalFrom past it so
+    // earlier params don't trigger `A required parameter cannot follow an
+    // optional parameter`.
+    if (paramPrimitives.size > 0) {
+      let lastPrimitiveRequired = -1;
+      fnArgs.forEach((a, i) => {
+        if (a.annotation) return;
+        if (paramPrimitives.has(a.name)) lastPrimitiveRequired = i;
+      });
+      if (lastPrimitiveRequired + 1 > optionalFrom) {
+        optionalFrom = lastPrimitiveRequired + 1;
+      }
+    }
     const params = fnArgs.map((a, idx) =>
-      paramDecl(a, idx >= optionalFrom, methodShapes?.get(a.name) ?? null),
+      paramDecl(
+        a,
+        idx >= optionalFrom,
+        methodShapes?.get(a.name) ?? null,
+        paramPrimitives.get(a.name) ?? null,
+      ),
     );
+    // Make the inferred primitives visible inside the body so call sites
+    // can drop the redundant `as unknown as <prim>` arg casts.
+    const prevPreInferred = new Map<string, ParamPrimitive | undefined>();
+    for (const [k, v] of paramPrimitives) {
+      prevPreInferred.set(k, ctx.preInferredParamType.get(k));
+      ctx.preInferredParamType.set(k, v);
+    }
     // Variadic `:method(...)` → `...__varargs: unknown[]`.
     if ((fnExpr as { vararg?: boolean }).vararg) {
       params.push(
@@ -431,6 +461,11 @@ export function compileClassPattern(
     });
     ctx.selfFieldShapes = prevSelfFieldShapes;
     if (methodShapes) ctx.popShapeScope();
+    // Restore preInferredParamType snapshot.
+    for (const [k, v] of prevPreInferred) {
+      if (v === undefined) ctx.preInferredParamType.delete(k);
+      else ctx.preInferredParamType.set(k, v);
+    }
     const bodyStmts = rawBody
       .map((s) => rewriteSelfToThis(s))
       .filter((s) => !isSelfThisBinding(s));
@@ -602,11 +637,19 @@ function paramDecl(
   a: { name: string; annotation?: import('../parser/index.js').TypeNode | null },
   isTrailingUnannotated = false,
   shape?: import('./shape-infer.js').Shape | null,
+  paramPrimitive?: ParamPrimitive | null,
 ): ts.ParameterDeclaration {
   let ty: ts.TypeNode;
   let hasInferredShape = false;
   if (a.annotation) {
     ty = compileType(a.annotation);
+  } else if (paramPrimitive) {
+    ty = factory.createKeywordTypeNode(
+      paramPrimitive === 'number' ? ts.SyntaxKind.NumberKeyword
+        : paramPrimitive === 'string' ? ts.SyntaxKind.StringKeyword
+        : ts.SyntaxKind.BooleanKeyword,
+    );
+    hasInferredShape = true;
   } else if (shape) {
     const fromShape = shapeToTypeNode(shape);
     if (fromShape) {
