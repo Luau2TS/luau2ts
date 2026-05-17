@@ -2746,12 +2746,37 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
         } else {
           // Non-primitive tracked (`unknown`, `datatype:X`) — `typeof <local>`
           // catches array-init and table-init locals, plus `x = nil` resets.
-          valueExpr = assertExpression(
-            inner,
-            factory.createTypeQueryNode(
-              factory.createIdentifier(safeIdentifier((target as { name: string }).name)),
-            ),
-          );
+          // Skip the cast when RHS's resolved class matches the local's
+          // tracked class AND the local isn't tracked as optional — TS
+          // rejects `Instance | undefined` → `Instance` without the
+          // bridge even if the class name agrees.
+          const localCls = target.type === 'Local'
+            ? ctx.tsTypedClassLocal.get(target.name)
+            : undefined;
+          const localIsOptional = target.type === 'Local'
+            && ctx.tsOptionalClassLocal.has(target.name);
+          const rhsCls = resolveOracleClassOfExpr(value, ctx);
+          const rhsFact = flowFactOf(value, ctx);
+          const rhsNullable =
+            (rhsFact?.kind === 'class' && !!rhsFact.nullable)
+            || (
+              value.type === 'Call'
+              && (value.func.type === 'Local' || value.func.type === 'Global')
+              && ctx.userFunctionMayReturnNil.has((value.func as { name: string }).name)
+            );
+          if (
+            localCls && rhsCls && rhsCls === localCls
+            && (localIsOptional || !rhsNullable)
+          ) {
+            valueExpr = inner;
+          } else {
+            valueExpr = assertExpression(
+              inner,
+              factory.createTypeQueryNode(
+                factory.createIdentifier(safeIdentifier((target as { name: string }).name)),
+              ),
+            );
+          }
         }
       }
     }
@@ -2766,10 +2791,16 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
       )
         ? factory.createParenthesizedExpression(valueExpr)
         : valueExpr;
-      valueExpr = assertExpression(
-        inner,
-        factory.createTypeQueryNode(factory.createIdentifier(safeIdentifier(target.name))),
-      );
+      // Skip the second-pass typeof cast when valueExpr is already an
+      // AsExpression — the inner pass put the right type on it.
+      if (ts.isAsExpression(valueExpr)) {
+        // No-op: the first-pass cast already converged.
+      } else {
+        valueExpr = assertExpression(
+          inner,
+          factory.createTypeQueryNode(factory.createIdentifier(safeIdentifier(target.name))),
+        );
+      }
     }
     // Non-literal numeric `tbl[k] = v` routes through luaIndexSet (plain
     // `=` would emit `luaIndex(tbl, k) = v`, not a valid lvalue).
