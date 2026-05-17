@@ -157,6 +157,12 @@ export class CompileContext {
    *  same Roblox class (possibly with nil fallthrough). */
   readonly userFunctionReturnClass = new Map<string, string>();
 
+  /** User functions with at least one `return nil` / bare `return` path,
+   *  meaning their declared class result is actually `Class | undefined`.
+   *  Call sites that use the result as a method receiver (`f().Method()`)
+   *  prepend `!` so TS doesn't surface TS2532. */
+  readonly userFunctionMayReturnNil = new Set<string>();
+
   /** Set by the pre-pass that detects user functions whose params are all
    *  effectively `unknown` (no annotation, no shape-inferred type, no
    *  primitive constraint from param-infer). Call sites can drop the

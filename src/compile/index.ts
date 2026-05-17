@@ -4755,18 +4755,25 @@ function scanUserFunctionReturnClasses(root: BlockStat, ctx: CompileContext): vo
     }
   });
 
-  const collectReturns = (stat: Stat | null | undefined, classes: Set<string>, state: { bad: boolean }): void => {
+  const collectReturns = (stat: Stat | null | undefined, classes: Set<string>, state: { bad: boolean; mayBeNil: boolean }): void => {
     if (!stat || state.bad) return;
     switch (stat.type) {
       case 'Return': {
         const value = stat.values[0];
-        if (!value) return;
+        if (!value) {
+          state.mayBeNil = true;
+          return;
+        }
         const fact = flowFactOf(value, ctx);
         if (fact?.kind === 'class') {
           classes.add(fact.name);
+          if (fact.nullable) state.mayBeNil = true;
           return;
         }
-        if (value.type === 'ConstantNil') return;
+        if (value.type === 'ConstantNil') {
+          state.mayBeNil = true;
+          return;
+        }
         state.bad = true;
         return;
       }
@@ -4793,10 +4800,11 @@ function scanUserFunctionReturnClasses(root: BlockStat, ctx: CompileContext): vo
 
   for (const [name, body] of funcBodies) {
     const classes = new Set<string>();
-    const state = { bad: false };
+    const state = { bad: false, mayBeNil: false };
     collectReturns(body, classes, state);
     if (!state.bad && classes.size === 1) {
       ctx.userFunctionReturnClass.set(name, [...classes][0]!);
+      if (state.mayBeNil) ctx.userFunctionMayReturnNil.add(name);
     }
   }
 }
@@ -4889,12 +4897,30 @@ function castArgsForCall(
       ),
       factory.createIndexedAccessTypeNode(
         factory.createTypeReferenceNode('Parameters', [
-          factory.createTypeQueryNode(callee as ts.EntityName),
+          factory.createTypeQueryNode(calleeAsEntityName(callee)),
         ]),
         factory.createLiteralTypeNode(factory.createNumericLiteral(i)),
       ),
     );
   });
+}
+
+/** Build a TS `EntityName` for `typeof <callee>` queries. NonNullExpression
+ *  (`x!.method`) is stripped — the `!` is purely a runtime hint that the
+ *  reference itself produces. */
+function calleeAsEntityName(expr: ts.Expression): ts.EntityName {
+  if (ts.isIdentifier(expr)) return expr;
+  if (ts.isNonNullExpression(expr)) return calleeAsEntityName(expr.expression);
+  if (ts.isParenthesizedExpression(expr)) return calleeAsEntityName(expr.expression);
+  if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.name)) {
+    return factory.createQualifiedName(
+      calleeAsEntityName(expr.expression),
+      factory.createIdentifier(expr.name.text),
+    );
+  }
+  // Fallback: stringify the expression's leading identifier. Should be
+  // unreachable because callers gate via isSimpleCalleeRef.
+  return factory.createIdentifier('unknown');
 }
 
 /** Per-callee expected slot static types. Populated from known stdlib /
@@ -4905,14 +4931,21 @@ function castArgsForCall(
 type SlotKind = 'string' | 'number' | 'boolean' | 'number|string' | 'instance' | 'any';
 type ExpectedSlots = { [i: number]: SlotKind } & { rest?: SlotKind };
 function expectedSlotTypes(callee: ts.Expression): ExpectedSlots | undefined {
+  // Peel off NonNullExpression / Parenthesized wrappers — the method name
+  // is what matters for slot lookup. `folder!.FindFirstChild` and
+  // `folder.FindFirstChild` both want the FindFirstChild slot table.
+  let unwrapped: ts.Expression = callee;
+  while (ts.isNonNullExpression(unwrapped) || ts.isParenthesizedExpression(unwrapped)) {
+    unwrapped = unwrapped.expression;
+  }
   let path = '';
   let methodName = '';
-  if (ts.isIdentifier(callee)) path = callee.text;
-  else if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && ts.isIdentifier(callee.name)) {
-    path = `${callee.expression.text}.${callee.name.text}`;
-    methodName = callee.name.text;
-  } else if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name)) {
-    methodName = callee.name.text;
+  if (ts.isIdentifier(unwrapped)) path = unwrapped.text;
+  else if (ts.isPropertyAccessExpression(unwrapped) && ts.isIdentifier(unwrapped.expression) && ts.isIdentifier(unwrapped.name)) {
+    path = `${unwrapped.expression.text}.${unwrapped.name.text}`;
+    methodName = unwrapped.name.text;
+  } else if (ts.isPropertyAccessExpression(unwrapped) && ts.isIdentifier(unwrapped.name)) {
+    methodName = unwrapped.name.text;
   } else {
     return undefined;
   }
@@ -5086,6 +5119,7 @@ function isTrustedTypedExpr(expr: Expr, ctx: CompileContext): boolean {
  *  generate `typeof unknown.X` (TS2571). */
 function isSimpleCalleeRef(expr: ts.Expression, depth = 0): boolean {
   if (ts.isIdentifier(expr)) return true;
+  if (ts.isNonNullExpression(expr)) return isSimpleCalleeRef(expr.expression, depth);
   if (ts.isPropertyAccessExpression(expr) && depth < 1) {
     return isSimpleCalleeRef(expr.expression, depth + 1);
   }
@@ -5346,14 +5380,28 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       || dynamicInstanceMethod
       || receiverIsObservedShape
       || receiverIsUnknownChain;
+    // Detect receivers whose TS type is `Class | undefined`: nullable flow
+    // fact, optional-tracked local, or a Call to a user function whose
+    // declared return is an Instance class (the function body might still
+    // return nil through paths flow can't narrow — TS otherwise rejects
+    // `f().Method(...)` with TS2532).
+    const recv = expr.func.expr;
+    const receiverIsCallToOptionalUserFn =
+      recv.type === 'Call'
+      && (recv.func.type === 'Local' || recv.func.type === 'Global')
+      && (
+        ctx.userFunctionMayReturnNil.has((recv.func as { name: string }).name)
+        || ctx.userFunctionReturnClass.has((recv.func as { name: string }).name)
+      );
     const compiledReceiverForMethod =
       ctx.compatMode === 'rbxts'
       && (
         (receiverFactForMethod?.kind === 'class' && receiverFactForMethod.nullable)
-        || (expr.func.expr.type === 'Local' && ctx.tsOptionalClassLocal.has(expr.func.expr.name))
+        || (recv.type === 'Local' && ctx.tsOptionalClassLocal.has(recv.name))
+        || receiverIsCallToOptionalUserFn
       )
-        ? factory.createNonNullExpression(compileExpr(expr.func.expr, ctx))
-        : compileExpr(expr.func.expr, ctx);
+        ? factory.createNonNullExpression(compileExpr(recv, ctx))
+        : compileExpr(recv, ctx);
     // Signal-method receiver cast. Default: cast the immediate receiver
     // (Tween.Completed etc, which have the signal as a typed property).
     // When the chain root is a typed Instance whose oracle entry does
@@ -5481,7 +5529,14 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
   ) {
     const method = expr.func.index;
     if (method === 'GetAttribute') {
-      call = factory.createAsExpression(call, factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword));
+      // @rbxts/types declares Instance.GetAttribute → AttributeValue, the
+      // union of every possible attribute primitive. Emitting `as unknown`
+      // wasted information and forced every downstream use through a
+      // second cast; route the call result to the oracle-declared type.
+      call = factory.createAsExpression(
+        call,
+        factory.createTypeReferenceNode('AttributeValue', undefined),
+      );
     } else {
       const resolved = resolveLooseMethodCastType(expr, ctx);
       if (resolved.kind === 'class') {
@@ -5849,21 +5904,14 @@ function resolveLooseMethodCastType(
     : undefined;
   switch (method) {
     case 'WaitForChild': {
-      // Literal arg in name-table → concrete class. Otherwise stay loose so
-      // chained method calls on unknown-name children don't surface TS2339.
+      // Honest @rbxts/types fallback: `Instance` (1-arg) / `Instance |
+      // undefined` (2-arg). Concrete class only when the literal arg is
+      // in the oracle name-table.
       const r = ctx.oracle.waitForChildResult(receiverClass, literalArg, callExpr.args.length === 1 ? 1 : 2);
-      if (r.type === 'Instance' && (!literalArg || !ctx.oracle.childNameClass(literalArg))) {
-        ctx.useLuauChildType();
-        return { kind: 'class', text: '_LuauChild' };
-      }
       return { kind: 'class', text: r.nullable ? `${r.type} | undefined` : r.type };
     }
     case 'FindFirstChild': {
       const r = ctx.oracle.findFirstChildResult(receiverClass, literalArg);
-      if (r.type === 'Instance' && (!literalArg || !ctx.oracle.childNameClass(literalArg))) {
-        ctx.useLuauChildType();
-        return { kind: 'class', text: '_LuauChild | undefined' };
-      }
       return { kind: 'class', text: `${r.type} | undefined` };
     }
     case 'FindFirstChildOfClass':
