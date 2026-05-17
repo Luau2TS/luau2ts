@@ -157,6 +157,13 @@ export class CompileContext {
    *  same Roblox class (possibly with nil fallthrough). */
   readonly userFunctionReturnClass = new Map<string, string>();
 
+  /** Set by the pre-pass that detects user functions whose params are all
+   *  effectively `unknown` (no annotation, no shape-inferred type, no
+   *  primitive constraint from param-infer). Call sites can drop the
+   *  `as unknown as Parameters<typeof f>[i]` wrap for these — passing
+   *  `unknown` to an `unknown`-typed slot is a no-op. */
+  readonly userFunctionUnknownParams = new Set<string>();
+
   /** Injected by compile/index.ts so macros (in a sibling module) can ask
    *  for an expression's static Luau type without re-importing the
    *  monolithic compileExpr surface. Returns 'unknown' before injection. */

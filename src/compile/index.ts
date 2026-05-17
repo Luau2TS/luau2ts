@@ -125,6 +125,18 @@ function isLuauChildTypeText(text: string): boolean {
   return text === '_LuauChild' || text.includes('_LuauChild');
 }
 
+function assertExpression(expr: ts.Expression, type: ts.TypeNode): ts.AsExpression {
+  const inner = (
+    ts.isBinaryExpression(expr)
+    || ts.isConditionalExpression(expr)
+    || ts.isArrowFunction(expr)
+    || ts.isFunctionExpression(expr)
+  )
+    ? factory.createParenthesizedExpression(expr)
+    : expr;
+  return factory.createAsExpression(inner, type);
+}
+
 
 function exprsStructurallyEqual(a: Expr, b: Expr): boolean {
   if (a.type !== b.type) return false;
@@ -172,11 +184,8 @@ function nodeReferencesSelf(node: ts.Node): boolean {
 
 function recordCastExpression(expr: ts.Expression): ts.Expression {
   return factory.createParenthesizedExpression(
-    factory.createAsExpression(
-      factory.createAsExpression(
-        expr,
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-      ),
+    assertExpression(
+      expr,
       factory.createTypeReferenceNode('Record', [
         factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
         factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
@@ -188,11 +197,8 @@ function recordCastExpression(expr: ts.Expression): ts.Expression {
 function luauChildCastExpression(expr: ts.Expression, ctx: CompileContext): ts.Expression {
   ctx.useLuauChildType();
   return factory.createParenthesizedExpression(
-    factory.createAsExpression(
-      factory.createAsExpression(
-        expr,
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-      ),
+    assertExpression(
+      expr,
       factory.createTypeReferenceNode('_LuauChild', undefined),
     ),
   );
@@ -214,11 +220,8 @@ function unknownCallableTypeNode(): ts.FunctionTypeNode {
 
 function unknownCallableCastExpression(expr: ts.Expression): ts.Expression {
   return factory.createParenthesizedExpression(
-    factory.createAsExpression(
-      factory.createAsExpression(
-        expr,
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-      ),
+    assertExpression(
+      expr,
       unknownCallableTypeNode(),
     ),
   );
@@ -549,11 +552,8 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
     ctx.preferMultiReturn = savedMR;
     // rbxts: cast RHS `as any` — `as [any, any]` fails TS2352 against LuaTuple.
     const init = ctx.compatMode === 'rbxts'
-      ? factory.createAsExpression(
-          factory.createAsExpression(
-            rawInit,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
+      ? assertExpression(
+          rawInit,
           factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
         )
       : factory.createCallExpression(
@@ -756,10 +756,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
                 ? factory.createParenthesizedExpression(initExpr)
                 : initExpr;
               initExpr = factory.createAsExpression(
-                factory.createAsExpression(
-                  inner,
-                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-                ),
+                inner,
                 typeNode,
               );
             }
@@ -801,13 +798,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
               )
                 ? factory.createParenthesizedExpression(initExpr)
                 : initExpr;
-              initExpr = factory.createAsExpression(
-                factory.createAsExpression(
-                  inner,
-                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-                ),
-                fromShape,
-              );
+              initExpr = assertExpression(inner, fromShape);
             }
             // No init → `let X!: <shape>`; user's Luau assigns X in a branch TS can't prove.
           } else if (!initExpr || initIsNil) {
@@ -835,13 +826,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
         )
           ? factory.createParenthesizedExpression(initExpr)
           : initExpr;
-        initExpr = factory.createAsExpression(
-          factory.createAsExpression(
-            inner,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
-          factory.createTypeReferenceNode('Instance', undefined),
-        );
+        initExpr = assertExpression(inner, factory.createTypeReferenceNode('Instance', undefined));
       }
       // rbxts: shape-typed local without init needs `!` (definite assignment) to avoid TS2454.
       const needsDefiniteAssertion =
@@ -1652,13 +1637,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     } else {
       elementType = factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
     }
-    const castedIterable = factory.createAsExpression(
-      factory.createAsExpression(
-        iterableExpr,
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-      ),
-      factory.createArrayTypeNode(elementType),
-    );
+    const castedIterable = assertExpression(iterableExpr, factory.createArrayTypeNode(elementType));
     if (stat.vars.length === 1) {
       // `for v in arr do` — single binding, value-only iteration.
       return [
@@ -1706,11 +1685,8 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     // Keep the iterable typed as tuple entries. A bare `any` iterable
     // makes roblox-ts assert when lowering the binding pattern.
     const iterableForFor: ts.Expression = userWantsPairs
-      ? factory.createAsExpression(
-          factory.createAsExpression(
-            iterCall,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
+      ? assertExpression(
+          iterCall,
           factory.createArrayTypeNode(factory.createTupleTypeNode([
             factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
             factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
@@ -2198,11 +2174,8 @@ function buildAssignmentStatement(
         && (target.expr.type === 'IndexExpr' || target.expr.type === 'IndexName')
       ) {
         recv = factory.createParenthesizedExpression(
-          factory.createAsExpression(
-            factory.createAsExpression(
-              recv,
-              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-            ),
+          assertExpression(
+            recv,
             factory.createTypeReferenceNode('Record', [
               factory.createUnionTypeNode([
                 factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
@@ -2242,24 +2215,15 @@ function buildAssignmentStatement(
       // any RHS; cast key through `unknown as string` so Instance/Player
       // keys flow without TS2538.
       const recv = factory.createParenthesizedExpression(
-        factory.createAsExpression(
-          factory.createAsExpression(
-            compileExpr(target.expr, ctx),
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
+        assertExpression(
+          compileExpr(target.expr, ctx),
           factory.createTypeReferenceNode('Record', [
             factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
             factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
           ]),
         ),
       );
-      const key = factory.createAsExpression(
-        factory.createAsExpression(
-          compileExpr(indexExpr, ctx),
-          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-        ),
-        factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
-      );
+      const key = assertExpression(compileExpr(indexExpr, ctx), factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword));
       return factory.createExpressionStatement(
         factory.createAssignment(
           factory.createElementAccessExpression(recv, key),
@@ -2304,11 +2268,8 @@ function compileLValueReceiver(expr: Expr, ctx: CompileContext): ts.Expression {
   if (inner.type === 'Local' || inner.type === 'Global') {
     ctx.useLuauChildType();
     const wrapped = factory.createParenthesizedExpression(
-      factory.createAsExpression(
-        factory.createAsExpression(
-          compileExpr(inner, ctx),
-          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-        ),
+      assertExpression(
+        compileExpr(inner, ctx),
         factory.createTypeReferenceNode('_LuauChild', undefined),
       ),
     );
@@ -2484,13 +2445,7 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
       ),
     );
     const valueExpr = ctx.compatMode === 'rbxts'
-      ? factory.createAsExpression(
-          factory.createAsExpression(
-            rawRhs,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
-          assignmentTupleType,
-        )
+      ? assertExpression(rawRhs, assignmentTupleType)
       : factory.createCallExpression(
           factory.createIdentifier(ctx.use('multiret')),
           undefined,
@@ -2565,18 +2520,7 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
           ? factory.createParenthesizedExpression(valueExpr)
           : valueExpr;
         // unknown overlaps with anything → single `as <shape>` ok.
-        // Concrete-mismatched types need the unknown bridge to satisfy TS2352.
-        if ((valStatic as StaticValueType) === 'unknown') {
-          valueExpr = factory.createAsExpression(innerVE, fieldTypeNode);
-        } else {
-          valueExpr = factory.createAsExpression(
-            factory.createAsExpression(
-              innerVE,
-              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-            ),
-            fieldTypeNode,
-          );
-        }
+        valueExpr = assertExpression(innerVE, fieldTypeNode);
       }
     }
     // rbxts Phase 3e: when target is `localClass.prop` (a known class
@@ -2600,20 +2544,8 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
       if (propType && propType.kind === 'class') {
         const valIsBareUnknown = isBareUnknownTyped(value, ctx);
         const propTypeNode = factory.createTypeReferenceNode(propType.name, undefined);
-        if (valIsBareUnknown) {
-          valueExpr = factory.createAsExpression(valueExpr, propTypeNode);
-        } else {
-          // Disjoint concrete types: route through unknown.
-          valueExpr = factory.createAsExpression(
-            factory.createAsExpression(
-              ts.isBinaryExpression(valueExpr) || ts.isConditionalExpression(valueExpr)
-                ? factory.createParenthesizedExpression(valueExpr)
-                : valueExpr,
-              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-            ),
-            propTypeNode,
-          );
-        }
+        void valIsBareUnknown;
+        valueExpr = assertExpression(valueExpr, propTypeNode);
       } else if (propType?.kind === 'primitive' && propType.name !== 'unknown') {
         const valStatic = staticTypeOfExpr(value, ctx);
         if (valStatic !== propType.name) {
@@ -2625,17 +2557,7 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
           const inner = ts.isBinaryExpression(valueExpr) || ts.isConditionalExpression(valueExpr)
             ? factory.createParenthesizedExpression(valueExpr)
             : valueExpr;
-          if ((valStatic as StaticValueType) === 'unknown') {
-            valueExpr = factory.createAsExpression(inner, primNode);
-          } else {
-            valueExpr = factory.createAsExpression(
-              factory.createAsExpression(
-                inner,
-                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-              ),
-              primNode,
-            );
-          }
+          valueExpr = assertExpression(inner, primNode);
         }
       }
       // For non-class non-primitive property types (Enum unions, raw
@@ -2679,13 +2601,7 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
         ? factory.createParenthesizedExpression(valueExpr)
         : valueExpr;
       if (fromShape) {
-        valueExpr = factory.createAsExpression(
-          factory.createAsExpression(
-            inner,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
-          fromShape,
-        );
+        valueExpr = assertExpression(inner, fromShape);
       } else {
         // Primitive keywords (not `typeof <local>`) — TS's typeof resolves to
         // the literal `false`/`"foo"` for `let x = false`, breaking TS2367.
@@ -2702,22 +2618,13 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
           if (rhsStatic === tracked) {
             valueExpr = inner;
           } else {
-            valueExpr = factory.createAsExpression(
-              factory.createAsExpression(
-                inner,
-                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-              ),
-              primitiveTypeNode,
-            );
+            valueExpr = assertExpression(inner, primitiveTypeNode);
           }
         } else {
           // Non-primitive tracked (`unknown`, `datatype:X`) — `typeof <local>`
           // catches array-init and table-init locals, plus `x = nil` resets.
-          valueExpr = factory.createAsExpression(
-            factory.createAsExpression(
-              inner,
-              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-            ),
+          valueExpr = assertExpression(
+            inner,
             factory.createTypeQueryNode(
               factory.createIdentifier(safeIdentifier((target as { name: string }).name)),
             ),
@@ -2736,11 +2643,8 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
       )
         ? factory.createParenthesizedExpression(valueExpr)
         : valueExpr;
-      valueExpr = factory.createAsExpression(
-        factory.createAsExpression(
-          inner,
-          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-        ),
+      valueExpr = assertExpression(
+        inner,
         factory.createTypeQueryNode(factory.createIdentifier(safeIdentifier(target.name))),
       );
     }
@@ -3700,11 +3604,8 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           ctx.useLuauChildType();
           return factory.createPropertyAccessExpression(
             factory.createParenthesizedExpression(
-              factory.createAsExpression(
-                factory.createAsExpression(
-                  compiledReceiver,
-                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-                ),
+              assertExpression(
+                compiledReceiver,
                 factory.createTypeReferenceNode('_LuauChild', undefined),
               ),
             ),
@@ -3720,11 +3621,8 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           ctx.useLuauChildType();
           return factory.createPropertyAccessExpression(
             factory.createParenthesizedExpression(
-              factory.createAsExpression(
-                factory.createAsExpression(
-                  compiledReceiver,
-                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-                ),
+              assertExpression(
+                compiledReceiver,
                 factory.createTypeReferenceNode('_LuauChild', undefined),
               ),
             ),
@@ -3743,11 +3641,8 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           ctx.useLuauChildType();
           return factory.createPropertyAccessExpression(
             factory.createParenthesizedExpression(
-              factory.createAsExpression(
-                factory.createAsExpression(
-                  compiledReceiver,
-                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-                ),
+              assertExpression(
+                compiledReceiver,
                 factory.createTypeReferenceNode('_LuauChild', undefined),
               ),
             ),
@@ -3781,11 +3676,8 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       ) {
         return factory.createPropertyAccessExpression(
           factory.createParenthesizedExpression(
-            factory.createAsExpression(
-              factory.createAsExpression(
-                compileExpr(expr.expr, ctx),
-                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-              ),
+            assertExpression(
+              compileExpr(expr.expr, ctx),
               factory.createTypeReferenceNode('Record', [
                 factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
                 factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
@@ -3805,11 +3697,8 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       ) {
         return factory.createPropertyAccessExpression(
           factory.createParenthesizedExpression(
-            factory.createAsExpression(
-              factory.createAsExpression(
-                compileExpr(expr.expr, ctx),
-                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-              ),
+            assertExpression(
+              compileExpr(expr.expr, ctx),
               factory.createTypeReferenceNode('Record', [
                 factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
                 factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
@@ -3859,13 +3748,7 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           );
         }
         ctx.useLuauChildType();
-        return factory.createAsExpression(
-          factory.createAsExpression(
-            access,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
-          factory.createTypeReferenceNode('_LuauChild', undefined),
-        );
+        return assertExpression(access, factory.createTypeReferenceNode('_LuauChild', undefined));
       }
       if (
         ctx.compatMode === 'rbxts'
@@ -3874,11 +3757,8 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       ) {
         return factory.createPropertyAccessExpression(
           factory.createParenthesizedExpression(
-            factory.createAsExpression(
-              factory.createAsExpression(
-                compileExpr(expr.expr, ctx),
-                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-              ),
+            assertExpression(
+              compileExpr(expr.expr, ctx),
               factory.createTypeReferenceNode('Record', [
                 factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
                 factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
@@ -3987,11 +3867,8 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           && (expr.expr.type === 'IndexExpr' || expr.expr.type === 'IndexName')
         ) {
           target = factory.createParenthesizedExpression(
-            factory.createAsExpression(
-              factory.createAsExpression(
-                target,
-                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-              ),
+            assertExpression(
+              target,
               factory.createTypeReferenceNode('Record', [
                 factory.createUnionTypeNode([
                   factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
@@ -4014,11 +3891,8 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         // Route through `unknown` so typed arrays / records don't TS2352.
         // Index → string so Player/Instance keys don't TS2538.
         const dynamicTarget = factory.createParenthesizedExpression(
-          factory.createAsExpression(
-            factory.createAsExpression(
-              target,
-              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-            ),
+          assertExpression(
+            target,
             factory.createTypeReferenceNode('Record', [
               factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
               factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
@@ -4036,13 +3910,7 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         )
           ? factory.createParenthesizedExpression(index)
           : index;
-        const coercedIndex = factory.createAsExpression(
-          factory.createAsExpression(
-            innerIndex,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
-          factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
-        );
+        const coercedIndex = assertExpression(innerIndex, factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword));
         return factory.createElementAccessExpression(dynamicTarget, coercedIndex);
       }
       const luaIndexFn = ctx.use('luaIndex');
@@ -4093,13 +3961,7 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           || expr.expr.type === 'IndexName'
         )
       ) {
-        return factory.createAsExpression(
-          factory.createAsExpression(
-            inner,
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ),
-          targetTy,
-        );
+        return assertExpression(inner, targetTy);
       }
       return factory.createAsExpression(inner, targetTy);
     }
@@ -4134,11 +3996,8 @@ function compileUnary(expr: Extract<Expr, { type: 'Unary' }>, ctx: CompileContex
         return factory.createCallExpression(
           factory.createPropertyAccessExpression(
             factory.createParenthesizedExpression(
-              factory.createAsExpression(
-                factory.createAsExpression(
-                  inner,
-                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-                ),
+              assertExpression(
+                inner,
                 factory.createTypeReferenceNode('Array', [
                   factory.createTypeReferenceNode('defined', undefined),
                 ]),
@@ -4775,6 +4634,60 @@ function scanYieldingFunctions(root: BlockStat, ctx: CompileContext): void {
   }
 }
 
+function scanUserFunctionAllUnknownParams(root: BlockStat, ctx: CompileContext): void {
+  const userFunctions = new Map<string, { args: { name: string; annotation: unknown }[]; body: BlockStat }>();
+  walkLuauNodes(root, (n) => {
+    if (n.type === 'LocalFunction') {
+      const s = n as unknown as LocalFunctionStat;
+      userFunctions.set(s.name.name, { args: s.func.args as { name: string; annotation: unknown }[], body: s.func.body });
+    } else if (n.type === 'Function' && 'func' in n && 'name' in n) {
+      const s = n as unknown as { name: Expr; func: { args: { name: string; annotation: unknown }[]; body: BlockStat } };
+      if (s.name && (s.name.type === 'Global' || s.name.type === 'Local')) {
+        userFunctions.set((s.name as { name: string }).name, { args: s.func.args, body: s.func.body });
+      }
+    } else if (n.type === 'Local' && 'vars' in n && 'values' in n) {
+      const s = n as unknown as LocalStat;
+      for (let i = 0; i < s.vars.length; i += 1) {
+        const init = s.values[i];
+        if (init && init.type === 'Function' && 'args' in init && 'body' in init) {
+          const fn = init as unknown as { args: { name: string; annotation: unknown }[]; body: BlockStat };
+          userFunctions.set(s.vars[i]!.name, { args: fn.args, body: fn.body });
+        }
+      }
+    }
+  });
+  for (const [name, fn] of userFunctions) {
+    if (fn.args.length === 0) {
+      ctx.userFunctionUnknownParams.add(name);
+      continue;
+    }
+    // Any explicit annotation disqualifies the all-unknown shortcut.
+    if (fn.args.some((a) => a.annotation)) continue;
+    // Param-infer: if any param picks up a primitive constraint, the
+    // emitted declaration uses that primitive type — the cast bridge is
+    // load-bearing then.
+    const primitives = inferParamPrimitives({
+      args: fn.args as unknown,
+      body: fn.body,
+    } as unknown as Parameters<typeof inferParamPrimitives>[0]);
+    if (primitives.size > 0) continue;
+    // Shape-infer: same story for structural shapes.
+    const trackedNames = new Set<string>(fn.args.map((a) => a.name));
+    for (const n of collectLocalNames(fn.body)) trackedNames.add(n);
+    const shapes = collectShapes(fn.body, trackedNames);
+    let anyShape = false;
+    for (const arg of fn.args) {
+      const s = shapes.get(arg.name) as { empty?: boolean } | undefined;
+      if (s && !s.empty) {
+        anyShape = true;
+        break;
+      }
+    }
+    if (anyShape) continue;
+    ctx.userFunctionUnknownParams.add(name);
+  }
+}
+
 function scanUserFunctionReturnClasses(root: BlockStat, ctx: CompileContext): void {
   if (!ctx.flowFactByExpr) return;
   const funcBodies = new Map<string, BlockStat>();
@@ -4905,6 +4818,14 @@ function castArgsForCall(
       // trusted-typed arg is safe without the `Parameters<>` wrap.
       // PropertyAccess callees (X.Y) may have typed slots (Players.
       // GetPlayerByUserId expects number) — leave those casts intact.
+      return arg;
+    } else if (
+      ts.isIdentifier(callee)
+      && ctx.userFunctionUnknownParams.has(callee.text)
+    ) {
+      // Callee's declared params are all `?: unknown`. Passing any value
+      // (including untyped locals) is a type-safe no-op — `X as unknown
+      // as unknown` is equivalent to `X`. Skip the wrap entirely.
       return arg;
     }
     if (ts.isParenthesizedExpression(arg) && ts.isAsExpression(arg.expression) && !expected && !ts.isIdentifier(callee)) return arg;
@@ -6223,6 +6144,7 @@ export async function compile(
     ctx.flowFactByExpr = flow.facts;
     ctx.flowFinalLocalFacts = flow.localFinalFacts;
     scanUserFunctionReturnClasses(rootBlock, ctx);
+    scanUserFunctionAllUnknownParams(rootBlock, ctx);
     // Backprop: locals whose downstream usage only consists of Instance
     // members get marked `tsTypedClassLocal = Instance` so receiver gates
     // skip the Record routing and the init is widened via `as unknown as
