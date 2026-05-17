@@ -57,9 +57,10 @@ export function registerConstructorMacro(
             const luauArg = call.args[i];
             // Skip cast when the source arg is already a numeric
             // primitive in TS's view — Constant literals, math.X calls,
-            // arithmetic on trusted operands, etc.
+            // arithmetic on trusted operands, param-inferred number
+            // locals, etc.
             if (luauArg && ctx.staticTypeOf(luauArg) === 'number'
-                && isStaticallyNumberLuau(luauArg)) {
+                && isStaticallyNumberLuau(luauArg, ctx)) {
               return a;
             }
             return factory.createAsExpression(
@@ -85,18 +86,27 @@ export function registerConstructorMacro(
 
 /** True when a Luau expression compiles to a TS-side `number`-typed
  *  expression. Constant literals are the safe baseline; arithmetic /
- *  math.X / tonumber chains stay trusted. */
-function isStaticallyNumberLuau(expr: Expr): boolean {
+ *  math.X / tonumber chains stay trusted; locals are trusted when the
+ *  compiler has annotated them as `number` (param-infer or
+ *  local-type-infer). */
+function isStaticallyNumberLuau(expr: Expr, ctx?: MacroArgs['ctx']): boolean {
   if (expr.type === 'ConstantNumber' || expr.type === 'ConstantInteger') return true;
-  if (expr.type === 'Group') return isStaticallyNumberLuau(expr.expr);
-  if (expr.type === 'Unary' && expr.op === '-') return isStaticallyNumberLuau(expr.expr);
+  if (expr.type === 'Group') return isStaticallyNumberLuau(expr.expr, ctx);
+  if (expr.type === 'Unary' && expr.op === '-') return isStaticallyNumberLuau(expr.expr, ctx);
   if (expr.type === 'Binary' && ['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
-    return isStaticallyNumberLuau(expr.left) && isStaticallyNumberLuau(expr.right);
+    // rbxts compileBinary casts unknown operands to `number`, so when one
+    // side is statically number the TS-emitted expression types as number.
+    return isStaticallyNumberLuau(expr.left, ctx) || isStaticallyNumberLuau(expr.right, ctx);
   }
   if (expr.type === 'Call') {
     const fn = expr.func;
     if (fn.type === 'Global' && fn.name === 'tonumber') return true;
     if (fn.type === 'IndexName' && fn.expr.type === 'Global' && fn.expr.name === 'math') return true;
+  }
+  if (expr.type === 'Local' && ctx) {
+    if (ctx.preInferredParamType.get(expr.name) === 'number') return true;
+    if (ctx.tsTypedPrimitiveLocal.has(expr.name)
+        && ctx.localTypeMap.byName.get(expr.name) === 'number') return true;
   }
   return false;
 }

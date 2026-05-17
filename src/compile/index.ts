@@ -3488,6 +3488,13 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
         if (lt === 'number' && rt === 'number') return 'number';
         // Datatype arithmetic preserves the LEFT operand's datatype.
         if (typeof lt === 'string' && lt.startsWith('datatype:')) return lt;
+        // rbxts mode: compileBinary casts unknown operands to `number` at
+        // emit time, so the TS-typed result of `<number> op <unknown>` is
+        // `number`. Mirror that here so downstream reassign/return casts
+        // can skip the outer `as unknown as number` wrap.
+        if (ctx.compatMode === 'rbxts' && (lt === 'number' || rt === 'number')) {
+          return 'number';
+        }
         return 'unknown';
       }
       if (['==', '~=', '<', '<=', '>', '>='].includes(expr.op)) return 'boolean';
@@ -5085,9 +5092,21 @@ function isTrustedTypedExpr(expr: Expr, ctx: CompileContext): boolean {
       return false;
     }
     case 'Binary':
-      // Arithmetic on trusted operands → trusted number.
+      // Arithmetic on trusted operands → trusted number. In rbxts mode
+      // compileBinary casts unknown operands to `number` at emit time, so
+      // when at least one operand is statically `number`, the TS-emitted
+      // expression types as `number` regardless of the other side's
+      // static type.
       if (['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
-        return isTrustedTypedExpr(expr.left, ctx) && isTrustedTypedExpr(expr.right, ctx);
+        if (isTrustedTypedExpr(expr.left, ctx) && isTrustedTypedExpr(expr.right, ctx)) {
+          return true;
+        }
+        if (ctx.compatMode === 'rbxts') {
+          const lt = staticTypeOfExpr(expr.left, ctx);
+          const rt = staticTypeOfExpr(expr.right, ctx);
+          if (lt === 'number' || rt === 'number') return true;
+        }
+        return false;
       }
       if (expr.op === '..') return true;
       return false;
@@ -5337,11 +5356,27 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     const dynamicInstanceMethod =
       ctx.compatMode === 'rbxts'
       && (expr.func.index === 'GetPivot' || expr.func.index === 'PivotTo');
+    // `_LuauChild` is callable + indexable, so direct `x.Method(...)`
+    // type-checks (returns `_LuauChild`). Route only when the method
+    // is *not* an Instance navigation method — those have specific
+    // post-cast result types (`Instance | undefined`, etc.) that the
+    // direct path on `_LuauChild` doesn't surface correctly. Skip the
+    // routing in the LuauChild-receiver case.
+    const skipLuauChildRouting =
+      receiverEmitsLuauChild
+      && (
+        INSTANCE_LOOSE_METHODS.has(expr.func.index)
+        || expr.func.index === 'Clone'
+        || expr.func.index === 'Destroy'
+        || expr.func.index === 'IsA'
+        || expr.func.index === 'GetChildren'
+        || expr.func.index === 'GetDescendants'
+      );
     const needsReceiverCast =
       receiverIsIndexExpr
       || isSignalMethod
       || methodMissingOnKnownInstance
-      || receiverEmitsLuauChild
+      || (receiverEmitsLuauChild && !skipLuauChildRouting)
       || dynamicInstanceMethod
       || receiverIsObservedShape
       || receiverIsUnknownChain;
