@@ -25,12 +25,22 @@ describe('macros — datatype constructors (R.2)', () => {
     // Vector3 is a globally-declared class in @rbxts/types (no exports —
     // the module isn't importable). We DON'T emit `import { Vector3 }
     // from "@rbxts/types"` in rbxts mode; the bare `new Vector3(...)`
-    // resolves via the ambient declaration. Phase 2 of the rbxts
-    // cleanup wraps each numeric-constructor arg in `as unknown as
-    // number` so unknown leaves from inferred shapes flow in.
+    // resolves via the ambient declaration. Phase 3: literal numeric
+    // args don't get the `as unknown as number` wrap — they're already
+    // TS-typed as number. The cast still fires for unknown-typed args
+    // (covered by the next test).
     const out = await emit('local v = Vector3.new(1, 2, 3)', 'rbxts');
-    expect(out).toMatch(/new Vector3\(\s*1 as unknown as number/);
+    expect(out).toMatch(/new Vector3\(\s*1\s*,\s*2\s*,\s*3\s*\)/);
     expect(out).not.toContain('@rbxts/types');
+  });
+
+  it('rbxts mode casts non-literal numeric constructor args through unknown', async () => {
+    // When the arg's TS-side type isn't known to be number (e.g. a
+    // function param without an annotation, or a property access that
+    // returns unknown), the `as unknown as number` wrap routes it into
+    // the numeric slot.
+    const out = await emit('local function f(x) return Vector3.new(x, 0, 0) end', 'rbxts');
+    expect(out).toMatch(/new Vector3\(\s*x as unknown as number/);
   });
 
   it('rbxts mode rewrites every datatype constructor', async () => {
@@ -95,7 +105,7 @@ describe('macros — datatype constructors (R.2)', () => {
 
   it('game:GetService("Workspace") → Workspace + services import', async () => {
     const out = await emit('local ws = game:GetService("Workspace")', 'rbxts');
-    expect(out).toContain('let ws = Workspace');
+    expect(out).toContain('const ws = Workspace');
     expect(out).toMatch(/import \{[^}]*Workspace[^}]*\} from "@rbxts\/services"/);
   });
 
@@ -220,9 +230,12 @@ describe('macros — stdlib calls (R.10, rbxts mode only)', () => {
     expect(out).toMatch(/Array<defined>\)\.remove\(/);
   });
 
-  it('table.concat(t, sep) → t.join(sep)', async () => {
+  it('table.concat(t, sep) → (t as Array<defined>).join(sep)', async () => {
+    // Bare `arr.join(",")` fails when arr is Record-typed (the common
+    // `local arr = {}` declaration). Route through Array<defined> so
+    // `.join` resolves and the call typechecks.
     const out = await emit('local s = table.concat(arr, ",")', 'rbxts');
-    expect(out).toContain('arr.join(",")');
+    expect(out).toMatch(/Array<defined>\)\.join\(","\)/);
   });
 
   it('table.create(n, v) → new Array(n).fill(v)', async () => {
@@ -415,7 +428,7 @@ describe('macros — re-export grouping', () => {
       'rbxts',
     );
     expect(out).not.toContain('@rbxts/types');
-    expect(out).toMatch(/new Vector3\(\s*1 as unknown as number/);
+    expect(out).toMatch(/new Vector3\(\s*1\s*,\s*2\s*,\s*3\s*\)/);
     expect(out).toMatch(/Color3\.fromRGB\(/);
     expect(out).toContain('new CFrame(0, 0, 0)');
   });
@@ -439,7 +452,7 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
     // satisfies roblox-ts's no-any rule, unlike the prior `: any`
     // annotation.
     const out = await emit('local x = nil', 'rbxts');
-    expect(out).toMatch(/let x:\s*unknown\s*=\s*undefined/);
+    expect(out).toMatch(/(let|const) x:\s*unknown\s*=\s*undefined/);
     expect(out).not.toContain('let x = null');
   });
 
@@ -518,6 +531,62 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
     // (no overlap with `any[]`) don't trip TS2352. Array-shaped sources
     // pass through unchanged at runtime.
     expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs as unknown as any\[\]\)\)/);
+  });
+
+  it('rbxts mode uses Instance[] for safe GetDescendants ipairs loops', async () => {
+    const out = await emit(
+      `local function f(rootGui)
+        for _, d in ipairs(rootGui:GetDescendants()) do
+          if d:IsA("GuiButton") then print(d.Name) end
+        end
+      end`,
+      'rbxts',
+    );
+    expect(out).toMatch(/ipairs\(rootGui\.GetDescendants\(\) as unknown as Instance\[\]\)/);
+    expect(out).not.toContain('GetDescendants() as unknown as any[]');
+  });
+
+  it('rbxts mode uses Instance[] for safe GetChildren ipairs loops', async () => {
+    const out = await emit(
+      `local function f(model)
+        for _, c in ipairs(model:GetChildren()) do
+          if c:IsA("BasePart") then print(c.Name) end
+        end
+      end`,
+      'rbxts',
+    );
+    expect(out).toMatch(/ipairs\(model\.GetChildren\(\) as unknown as Instance\[\]\)/);
+    expect(out).not.toContain('GetChildren() as unknown as any[]');
+  });
+
+  it('rbxts mode casts vararg spreads to the callee parameter tuple', async () => {
+    const out = await emit(
+      `local function g(fn, ...) fn(...) end
+       local function f(...) g(...) end`,
+      'rbxts',
+    );
+    expect(out).toMatch(/g\(\.\.\.__varargs as Parameters<typeof g>\)/);
+  });
+
+  it('rbxts mode routes unknown truthy property reads through Record', async () => {
+    const out = await emit(
+      `local rarity = getRarity()
+       local color = (rarity and rarity.color) or Color3.fromRGB(255, 255, 255)`,
+      'rbxts',
+    );
+    expect(out).toContain('(rarity as unknown as Record<string, unknown>).color');
+  });
+
+  it('rbxts mode trusts oracle-typed numeric properties in math macros', async () => {
+    const out = await emit(
+      `local player = Players.LocalPlayer
+       local x = math.floor(player.UserId)`,
+      'rbxts',
+    );
+    expect(out).toContain('math.floor(player.UserId)');
+    expect(out).toContain('const player = Players.LocalPlayer');
+    expect(out).not.toContain('Players as unknown as _LuauChild');
+    expect(out).not.toContain('UserId as unknown as number');
   });
 
   it('rbxts mode skips the `declare const X: any;` preamble', async () => {

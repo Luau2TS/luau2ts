@@ -115,6 +115,9 @@ function compileTypeReference(t: TypeReferenceNode): ts.TypeNode {
 
   const kw = PRIMITIVE_TYPE_NAMES[t.name];
   if (kw !== undefined && !t.prefix && t.parameters.length === 0) {
+    if (currentCompatMode === 'rbxts' && t.name === 'any') {
+      return factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+    }
     return factory.createKeywordTypeNode(kw);
   }
 

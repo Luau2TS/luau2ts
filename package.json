@@ -33,6 +33,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "prebuild": "node scripts/build-oracle.mjs",
     "build": "tsc -b && node scripts/copy-wasm.mjs",
     "clean": "tsc -b --clean",
     "test": "vitest run",
@@ -44,6 +45,7 @@
     "typescript": "^5.5.0"
   },
   "devDependencies": {
+    "@rbxts/types": "^1.0.920",
     "@types/node": "^22.10.0",
     "@vitest/coverage-v8": "^2.0.0",
     "vitest": "^2.0.0"

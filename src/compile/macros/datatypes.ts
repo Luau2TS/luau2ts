@@ -5,10 +5,8 @@ import { registerConstructorMacro, registerMacro } from './index.js';
 const { factory } = ts;
 
 // ─── `.new` constructors → `new TypeName(...)` ─────────────────────────────
-// Constructors whose `.new(…)` signature is `(number, number, …)`. We
-// cast each compiled arg `as unknown as number` so unknown-typed
-// leaves from Phase-2 structural shapes (`frame.X.Scale`,
-// `instance.Position.Magnitude`, …) flow through without TS2345.
+// Numeric-arg constructors: each arg gets `as unknown as number` so
+// unknown-typed leaves from structural shapes flow through without TS2345.
 const numericConstructorTypes = new Set<string>([
   'Vector3', 'Vector2', 'Vector3int16', 'Vector2int16',
   'UDim', 'UDim2',
@@ -34,11 +32,7 @@ for (const t of constructorTypes) {
 
 // ─── Static factories → `TypeName.method(...)` ────────────────────────────
 
-/** Static-factory `TypeName.method` calls whose signatures expect
- *  numeric args. We cast each compiled arg `as unknown as number`
- *  so unknown-typed leaves from Phase-2 structural shapes
- *  (a Local typed `{ X: unknown; ... }` reading `.X.Scale`, etc.)
- *  flow through without TS2345 at the call site. */
+/** Static factories with numeric signatures — args get `as unknown as number`. */
 const NUMERIC_STATIC_FACTORIES = new Set([
   'UDim2.fromScale', 'UDim2.fromOffset',
   'Color3.fromRGB', 'Color3.fromHSV',
@@ -49,11 +43,18 @@ const NUMERIC_STATIC_FACTORIES = new Set([
 function emitStaticCall(typeName: string, method: string): (a: MacroArgs) => ts.Expression {
   const key = `${typeName}.${method}`;
   const numeric = NUMERIC_STATIC_FACTORIES.has(key);
-  return ({ ctx, compiledArgs }) => {
+  return ({ call, ctx, compiledArgs }) => {
     ctx.useImport('@rbxts/types', typeName);
     const args = numeric
-      ? compiledArgs.map((a) =>
-          factory.createAsExpression(
+      ? compiledArgs.map((a, i) => {
+          const luauArg = call.args[i];
+          // Skip cast when the arg is statically a number per Luau
+          // type inference — constant numerics, math.X results,
+          // arithmetic on trusted operands.
+          if (luauArg && ctx.staticTypeOf(luauArg) === 'number' && isLuauStaticallyNumber(luauArg)) {
+            return a;
+          }
+          return factory.createAsExpression(
             factory.createAsExpression(
               ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
                 ? factory.createParenthesizedExpression(a)
@@ -61,7 +62,8 @@ function emitStaticCall(typeName: string, method: string): (a: MacroArgs) => ts.
               factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
             ),
             factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
-          ))
+          );
+        })
       : compiledArgs;
     return factory.createCallExpression(
       factory.createPropertyAccessExpression(
@@ -74,7 +76,21 @@ function emitStaticCall(typeName: string, method: string): (a: MacroArgs) => ts.
   };
 }
 
-// CFrame static factories.
+function isLuauStaticallyNumber(expr: import('../../parser/index.js').Expr): boolean {
+  if (expr.type === 'ConstantNumber' || expr.type === 'ConstantInteger') return true;
+  if (expr.type === 'Group') return isLuauStaticallyNumber(expr.expr);
+  if (expr.type === 'Unary' && expr.op === '-') return isLuauStaticallyNumber(expr.expr);
+  if (expr.type === 'Binary' && ['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
+    return isLuauStaticallyNumber(expr.left) && isLuauStaticallyNumber(expr.right);
+  }
+  if (expr.type === 'Call') {
+    const fn = expr.func;
+    if (fn.type === 'Global' && fn.name === 'tonumber') return true;
+    if (fn.type === 'IndexName' && fn.expr.type === 'Global' && fn.expr.name === 'math') return true;
+  }
+  return false;
+}
+
 for (const m of [
   'Angles',
   'fromAxisAngle',
@@ -88,44 +104,36 @@ for (const m of [
   'identity',
 ]) registerMacro(`CFrame.${m}`, emitStaticCall('CFrame', m), 'rbxts');
 
-// Color3.
 for (const m of ['fromRGB', 'fromHSV', 'fromHex']) {
   registerMacro(`Color3.${m}`, emitStaticCall('Color3', m), 'rbxts');
 }
 
-// BrickColor.
 for (const m of ['Random', 'palette', 'White', 'Gray', 'DarkGray', 'Black', 'Red', 'Yellow', 'Green', 'Blue']) {
   registerMacro(`BrickColor.${m}`, emitStaticCall('BrickColor', m), 'rbxts');
 }
 
-// UDim2.
 for (const m of ['fromScale', 'fromOffset']) {
   registerMacro(`UDim2.${m}`, emitStaticCall('UDim2', m), 'rbxts');
 }
 
-// DateTime.
 for (const m of ['now', 'fromIsoDate', 'fromUnixTimestamp', 'fromUnixTimestampMillis', 'fromUniversalTime', 'fromLocalTime']) {
   registerMacro(`DateTime.${m}`, emitStaticCall('DateTime', m), 'rbxts');
 }
 
-// Font.
 for (const m of ['fromName', 'fromEnum', 'fromId']) {
   registerMacro(`Font.${m}`, emitStaticCall('Font', m), 'rbxts');
 }
 
-// Vector3 / Vector2 static factories (zero, one, axis vectors).
 for (const t of ['Vector3', 'Vector2'] as const) {
   for (const m of ['zero', 'one', 'xAxis', 'yAxis', 'zAxis', 'FromAxis', 'FromNormalId']) {
     registerMacro(`${t}.${m}`, emitStaticCall(t, m), 'rbxts');
   }
 }
 
-// Region3 static factories.
 for (const m of ['fromCFrame']) {
   registerMacro(`Region3.${m}`, emitStaticCall('Region3', m), 'rbxts');
 }
 
-// Path2DControlPoint static (rare).
 for (const m of ['fromPosition']) {
   registerMacro(`Path2DControlPoint.${m}`, emitStaticCall('Path2DControlPoint', m), 'rbxts');
 }

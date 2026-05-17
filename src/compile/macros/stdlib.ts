@@ -1,17 +1,52 @@
 import ts from 'typescript';
 import { registerMacro, type MacroArgs } from './index.js';
+import type { Expr } from '../../parser/index.js';
+import type { CompileContext } from '../context.js';
 
 const { factory } = ts;
 
+/** True for Luau exprs that compile to a TS expression already typed as
+ *  `number`. Used by the math.X macros to skip the `as unknown as number`
+ *  arg cast in cases where the cast would be a no-op. Conservative: a
+ *  bare reassigned local is not trusted even if `ctx.staticTypeOf` says
+ *  number — TS doesn't carry the tracked type into the `let` declaration. */
+function argIsTrustedNumber(expr: Expr, ctx: CompileContext): boolean {
+  if (expr.type === 'ConstantNumber' || expr.type === 'ConstantInteger') return true;
+  if (expr.type === 'Group') return argIsTrustedNumber(expr.expr, ctx);
+  if (expr.type !== 'Local' && ctx.staticTypeOf(expr) === 'number') return true;
+  if (expr.type === 'TypeAssertion') {
+    const ann = expr.annotation;
+    if (ann.type === 'TypeReference' && ann.name === 'number') return true;
+  }
+  if (expr.type === 'Call') {
+    const fn = expr.func;
+    if (fn.type === 'Global' && fn.name === 'tonumber') return true;
+    if (
+      fn.type === 'IndexName'
+      && fn.expr.type === 'Global'
+      && fn.expr.name === 'math'
+    ) return true;
+  }
+  if (expr.type === 'Local') {
+    // Function param whose primitive was inferred as number — those emit
+    // with a `: number` annotation, so TS sees them as number. Or an
+    // un-reassigned local that TS already knows as number.
+    return ctx.preInferredParamType.get(expr.name) === 'number'
+      || ctx.tsTypedPrimitiveLocal.has(expr.name);
+  }
+  // Arithmetic on trusted operands stays trusted-number.
+  if (expr.type === 'Binary' && ['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
+    return argIsTrustedNumber(expr.left, ctx) && argIsTrustedNumber(expr.right, ctx);
+  }
+  if (expr.type === 'Unary' && expr.op === '-') {
+    return argIsTrustedNumber(expr.expr, ctx);
+  }
+  return false;
+}
+
 // ─── table.* ───────────────────────────────────────────────────────────────
 
-// `table.insert(t, v)` → `t.push(v)`
-// `table.insert(t, i, v)` → `t.insert(i - 1, v)`. roblox-ts's Array<T>
-//   interface exposes its own `insert(index, value)` method (0-indexed,
-//   matching JS conventions), so a positional insert maps cleanly. The
-//   `i - 1` shift mirrors what we do for literal numeric indices on
-//   read access — the round-trip back to Lua adds the 1 back via
-//   roblox-ts's index translation.
+// `table.insert(t, v)` → `t.push(v)`; `table.insert(t, i, v)` → `t.insert(i - 1, v)`.
 registerMacro(
   'table.insert',
   ({ compiledArgs }: MacroArgs) => {
@@ -25,9 +60,7 @@ registerMacro(
         ),
         factory.createTypeReferenceNode('defined', undefined),
       );
-    // Route the array target through `as unknown as Array<defined>` so
-    // an `unknown`-typed receiver (from chained `obj[k]` index access)
-    // exposes `.push` / `.insert` without TS2571.
+    // Cast through `as unknown as Array<defined>` so unknown-typed receivers expose `.push`/`.insert`.
     const asArrayTarget = factory.createParenthesizedExpression(
       factory.createAsExpression(
         factory.createAsExpression(
@@ -61,12 +94,8 @@ registerMacro(
   'rbxts',
 );
 
-// `table.remove(t)` → `t.pop()`
-// `table.remove(t, i)` → `t.remove(i - 1)`. @rbxts/compiler-types'
-// Array<T> exposes `remove(index)` (0-indexed, returns removed
-// element); roblox-ts maps it back to Lua's `table.remove(t, i)`.
-// We use `remove`, NOT `splice` — the rbxts Array doesn't have
-// `splice` and TS would fire TS2339.
+// `table.remove(t)` → `t.pop()`; `table.remove(t, i)` → `t.remove(i - 1)`.
+// rbxts Array uses `remove`, not `splice` (which doesn't exist on the type).
 registerMacro(
   'table.remove',
   ({ compiledArgs }: MacroArgs) => {
@@ -90,7 +119,6 @@ registerMacro(
         [],
       );
     }
-    // Cast the index too — it might be an unknown-typed local.
     const idxNum = factory.createAsExpression(
       factory.createAsExpression(
         idx,
@@ -112,14 +140,26 @@ registerMacro(
   'rbxts',
 );
 
-// `table.concat(t, sep)` → `t.join(sep)`
+// `table.concat(t, sep)` → `(t as unknown as Array<defined>).join(sep)`.
+// Bare `t.join(...)` fails when t is Record-typed (`local t = {}`).
 registerMacro(
   'table.concat',
   ({ compiledArgs }: MacroArgs) => {
     const [target, sep] = compiledArgs;
     if (!target) return undefined;
+    const asArrayTarget = factory.createParenthesizedExpression(
+      factory.createAsExpression(
+        factory.createAsExpression(
+          target,
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createTypeReferenceNode('Array', [
+          factory.createTypeReferenceNode('defined', undefined),
+        ]),
+      ),
+    );
     return factory.createCallExpression(
-      factory.createPropertyAccessExpression(target, factory.createIdentifier('join')),
+      factory.createPropertyAccessExpression(asArrayTarget, factory.createIdentifier('join')),
       undefined,
       sep ? [sep] : [],
     );
@@ -127,35 +167,65 @@ registerMacro(
   'rbxts',
 );
 
-// `table.sort(t, cmp?)` → `t.sort(cmp)`
+// `table.sort(t, cmp?)` → `(t as unknown as Array<defined>).sort(cmp)`.
+// Cast target so `.sort` resolves (Record-typed locals don't have it);
+// cast cmp's signature to the Array's `(a: defined, b: defined) =>
+// boolean` shape so user callbacks with synthesized-shape params don't
+// trip TS2345.
 registerMacro(
   'table.sort',
   ({ compiledArgs }: MacroArgs) => {
     const [target, cmp] = compiledArgs;
     if (!target) return undefined;
+    const asArrayTarget = factory.createParenthesizedExpression(
+      factory.createAsExpression(
+        factory.createAsExpression(
+          target,
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createTypeReferenceNode('Array', [
+          factory.createTypeReferenceNode('defined', undefined),
+        ]),
+      ),
+    );
+    const castedCmp = cmp
+      ? factory.createAsExpression(
+          factory.createAsExpression(
+            cmp,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createFunctionTypeNode(
+            undefined,
+            [
+              factory.createParameterDeclaration(
+                undefined, undefined, 'a', undefined,
+                factory.createTypeReferenceNode('defined', undefined),
+              ),
+              factory.createParameterDeclaration(
+                undefined, undefined, 'b', undefined,
+                factory.createTypeReferenceNode('defined', undefined),
+              ),
+            ],
+            factory.createKeywordTypeNode(ts.SyntaxKind.BooleanKeyword),
+          ),
+        )
+      : undefined;
     return factory.createCallExpression(
-      factory.createPropertyAccessExpression(target, factory.createIdentifier('sort')),
+      factory.createPropertyAccessExpression(asArrayTarget, factory.createIdentifier('sort')),
       undefined,
-      cmp ? [cmp] : [],
+      castedCmp ? [castedCmp] : [],
     );
   },
   'rbxts',
 );
 
-// `table.find(t, v)` → `t.indexOf(v) + 1` (Lua returns 1-indexed; nil → 0+1 = 1
-// would clash, so the conversion is approximate. Use `t.indexOf(v) !== -1`
-// idioms in TS instead. We emit `t.indexOf(v) + 1` which gives 0 on miss
-// — matching the Lua semantics shape since 0 is falsy in Luau but TRUTHY
-// in JS. This divergence is documented; users who rely on the falsy-on-
-// miss should rewrite to `t.indexOf(v) !== -1`).
+// `table.find(t, v)` → `t.indexOf(v) + 1`. Miss returns 0 (truthy in JS,
+// falsy in Lua — divergence; use `t.indexOf(v) !== -1` for falsy-on-miss).
 registerMacro(
   'table.find',
   ({ compiledArgs }: MacroArgs) => {
     const [target, value] = compiledArgs;
     if (!target || !value) return undefined;
-    // Cast the search value `as unknown as defined` so the call
-    // typechecks against `indexOf(this: ReadonlyArray<defined>,
-    // searchElement: T)` even when `value` came in as `unknown`.
     const castValue = factory.createAsExpression(
       factory.createAsExpression(
         value,
@@ -211,13 +281,8 @@ registerMacro(
   'rbxts',
 );
 
-// `table.unpack(t)` → `...t`. The spread element only makes sense in a
-// call-position context, so emit `[...t]` to give a plain expression we can
-// reuse. Users who need actual unpacking write multi-return destructuring.
-//
-// The target gets cast `as unknown as Array<defined>` so unknown-typed
-// receivers (chained index access, function-call returns) still produce
-// an iterable spread without TS2488.
+// `table.unpack(t)` → `[...t]` (spread needs a call context; emit array form).
+// Target cast to `Array<defined>` so unknown-typed receivers iterate.
 registerMacro(
   'table.unpack',
   ({ compiledArgs }: MacroArgs) => {
@@ -240,21 +305,10 @@ registerMacro(
   'rbxts',
 );
 
-// ─── string.* — keep namespace form in rbxts mode ─────────────────────────
-//
-// roblox-ts's @rbxts/types declares `string` as a Lua-global namespace
-// (lua.d.ts has every method we care about EXCEPT `len`). Letting
-// `string.split(s, sep)` survive as-is round-trips back to Lua
-// identity AND avoids the imports-from-luau2ts-runtime that earlier
-// helper-form macros would route through (stringFormat, stringMatch,
-// etc.). For the missing-in-typesignature `string.len`, route to
-// the method form `s.size()` instead (declared on String via
-// @rbxts/compiler-types).
-
-// `string.len(s)` → `(s as string).size()`. @rbxts/types' `string`
-// namespace doesn't expose `.len` (only its method-form lives on the
-// String interface, and it's named `size` there). Without this rewrite
-// every `string.len(x)` fires TS2339.
+// ─── string.* ─────────────────────────────────────────────────────────────
+// rbxts mode keeps the namespace form (`string.foo`) — round-trips clean
+// to Lua. Only `string.len` needs rewriting since @rbxts/types' string
+// namespace doesn't expose it; route to the method form `s.size()`.
 registerMacro(
   'string.len',
   ({ compiledArgs }: MacroArgs) => {
@@ -274,12 +328,7 @@ registerMacro(
   'rbxts',
 );
 
-// `table.pack(...)` → `[...args]`. Luau returns `{n=N, [1]=v1, ...}`;
-// roblox-ts's table namespace doesn't expose `pack` and most use sites
-// only consume `t[i]` (we shift to 0-indexed) or `t.n` (the array's
-// `.size()`). Emit an array literal — callers that depend on `.n`
-// will need to rewrite, callers that just want a captured tuple are
-// fine.
+// `table.pack(...)` → `[...args]`. Callers depending on `.n` must rewrite.
 registerMacro(
   'table.pack',
   ({ compiledArgs }: MacroArgs) => {
@@ -288,33 +337,22 @@ registerMacro(
   'rbxts',
 );
 
-// ─── math.* — direct JS Math passthrough ──────────────────────────────────
-//
-// roblox-ts has `math` declared as a typed Lua-global namespace in
-// @rbxts/types (lua.d.ts). Keep the lowercase `math.<fn>` form so the
-// emit type-checks under roblox-ts AND survives the round-trip back
-// to Lua as the identity transform. Using `Math` (the JS global)
-// would produce TS2304 ("Cannot find name 'Math'") under rbxts mode.
-//
-// In native mode the JS global Math is the correct target — the host
-// runtime is JS, not Lua.
-
+// ─── math.* ───────────────────────────────────────────────────────────────
+// rbxts: keep `math.<fn>` (typed as Lua namespace). native: emit `Math.<fn>`.
 function emitMathPassthrough(name: string) {
-  return ({ ctx, compiledArgs }: MacroArgs) => {
+  return ({ ctx, call, compiledArgs }: MacroArgs) => {
     const mathName = ctx.compatMode === 'rbxts' ? 'math' : 'Math';
     if (mathName === 'math') ctx.useAmbient('math');
-    // rbxts mode: cast each arg `as unknown as number` so unknown-
-    // typed values (from structural-shape leaves or unannotated
-    // params) flow into math's numeric slots without TS2345. The
-    // generic compileCall castArgsForCall hook doesn't fire for
-    // macro-rewritten calls (macros bypass it), so we apply the
-    // cast here. Wrap the inner expression in parens first — `??`
-    // and other binary operators bind LOOSER than `as`, so a bare
-    // `X ?? 0 as unknown as number` would parse as `X ?? (0 as
-    // unknown as number)` and miss the X branch.
+    // rbxts: cast args `as unknown as number` — macros bypass the generic
+    // compileCall castArgsForCall hook. Skip only when the Luau arg is a
+    // numeric Constant, a math.X call result, a tonumber call, or a
+    // param whose primitive was inferred as `number` (because those emit
+    // with concrete TS number typing already).
     const args = ctx.compatMode === 'rbxts'
-      ? compiledArgs.map((a) =>
-          factory.createAsExpression(
+      ? compiledArgs.map((a, i) => {
+          const luauArg = call.args[i];
+          if (luauArg && argIsTrustedNumber(luauArg, ctx)) return a;
+          return factory.createAsExpression(
             factory.createAsExpression(
               ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
                 ? factory.createParenthesizedExpression(a)
@@ -322,7 +360,8 @@ function emitMathPassthrough(name: string) {
               factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
             ),
             factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
-          ))
+          );
+        })
       : compiledArgs;
     return factory.createCallExpression(
       factory.createPropertyAccessExpression(
@@ -344,12 +383,7 @@ for (const m of [
   registerMacro(`math.${m}`, emitMathPassthrough(m), 'rbxts');
 }
 
-// `math.huge` and `math.pi` are property accesses, not calls — handled
-// separately as expression-level rewrites would need a different hook. Our
-// `math` namespace export already exposes them, so they pass through.
-
-// `math.clamp(x, lo, hi)` → `Math.min(Math.max(x, lo), hi)` in native;
-// in rbxts mode roblox-ts has a real `math.clamp`, so keep the call.
+// `math.clamp(x, lo, hi)` → rbxts: real `math.clamp`; native: nested min/max.
 registerMacro(
   'math.clamp',
   ({ ctx, compiledArgs }: MacroArgs) => {

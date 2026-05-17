@@ -14,42 +14,24 @@ import { compileType } from './type.js';
 
 const { factory } = ts;
 
-/** A detected class definition. The compiler will emit a single
- *  `ts.ClassDeclaration` covering every statement in `consumed`; the
- *  caller skips those statements when building its own output. */
+/** A detected class definition — compiled into one `ts.ClassDeclaration`. */
 export interface ClassPattern {
-  /** Class name. */
   name: string;
-  /** Optional superclass identifier (from the metatable's `__index`). */
   superclass: string | null;
-  /** Indexes (within the parent block's body) of every statement that
-   *  contributes to the class — declaration, __index, .new factory,
-   *  :constructor, and every :method. The block compiler skips these. */
+  /** Indexes of statements in the parent block that contribute to the class. */
   consumed: Set<number>;
-  /** The .new factory statement (only used to harvest the constructor
-   *  body if `:constructor` is missing). */
   ctorFactory: FunctionStat | null;
-  /** The :constructor method statement, if any. */
   constructor: FunctionStat | null;
-  /** All :method statements, in source order. */
   methods: FunctionStat[];
-  /** True if a `type <Name>` (or `export type <Name>`) alias matching
-   *  the class name was found and consumed. The class emit drops the
-   *  alias so TS doesn't error on the merged declaration. */
+  /** True if a `type <Name>` alias was found and consumed. */
   consumedTypeAlias: boolean;
-  /** True if the consumed type alias was `export`ed. The class emit
-   *  picks up the same modifier so the public type stays exported. */
+  /** True if the consumed type alias was `export`ed. */
   exported: boolean;
-  /** Generic type parameters and generic-packs harvested from the
-   *  consumed type alias. The class declaration carries them so
-   *  references like `Signal<T...>` elsewhere still resolve. */
   generics: GenericType[];
   genericPacks: GenericTypePack[];
 }
 
-/** Walk a flat list of statements and detect class patterns. Returns the
- *  detected classes plus the union of consumed indexes (so callers can
- *  skip them in the regular pipeline). */
+/** Detect class patterns in a flat statement list. */
 export function detectClasses(stmts: Stat[]): ClassPattern[] {
   const out: ClassPattern[] = [];
 
@@ -57,8 +39,6 @@ export function detectClasses(stmts: Stat[]): ClassPattern[] {
     const candidate = matchClassDeclaration(stmts, i);
     if (!candidate) continue;
 
-    // Walk forward, collecting __index, .new, :constructor, :method
-    // statements that belong to this class.
     const pattern: ClassPattern = {
       name: candidate.name,
       superclass: candidate.superclass,
@@ -74,18 +54,12 @@ export function detectClasses(stmts: Stat[]): ClassPattern[] {
 
     for (let j = i + 1; j < stmts.length; j++) {
       const s = stmts[j]!;
-      // Stop if we hit another class declaration — that's a sibling, not
-      // a continuation of this one. Real Luau modules interleave class
-      // methods with free helper functions and top-level locals; we keep
-      // scanning past those so a `local emit = …` between methods
-      // doesn't truncate the class.
+      // Sibling class — stop. Interleaved helpers/locals are skipped via the no-op path below.
       if (j !== i && matchClassDeclaration(stmts, j)) break;
 
       const idxMatch = matchIndexAssignment(s, pattern.name);
       if (idxMatch) {
         pattern.consumed.add(j);
-        // `<Name>.__index = <Other>` (Other != Name) marks the superclass.
-        // Self-assigning (`__index = <Name>`) is just prototype bookkeeping.
         if (idxMatch.rhsName && idxMatch.rhsName !== pattern.name && !pattern.superclass) {
           pattern.superclass = idxMatch.rhsName;
         }
@@ -98,26 +72,18 @@ export function detectClasses(stmts: Stat[]): ClassPattern[] {
           pattern.ctorFactory = s as FunctionStat;
         } else if (fnMatch.kind === 'method' && fnMatch.methodName === 'constructor') {
           pattern.constructor = s as FunctionStat;
-        } else if (fnMatch.kind === 'method') {
-          pattern.methods.push(s as FunctionStat);
         } else {
-          // Static non-`new` method — drop into instance methods for now.
+          // Static non-`new` methods also land here (treated as instance methods).
           pattern.methods.push(s as FunctionStat);
         }
         continue;
       }
-      // Non-matching statement — leave it in place and keep scanning.
     }
 
-    // Require at least a `.new` factory or a `:constructor` to be confident
-    // we matched a real class — bare `setmetatable({}, …)` blocks aren't
-    // necessarily classes.
+    // Require ctor/method evidence — bare `setmetatable({}, …)` isn't a class.
     if (!pattern.ctorFactory && !pattern.constructor && pattern.methods.length === 0) continue;
 
-    // Scan the whole block for a `type <Name>` (or `export type <Name>`)
-    // alias matching the class. TS errors on a `class Signal` declared
-    // next to a `type Signal = ...` alias (merged-declaration visibility
-    // mismatch). Consume the alias and inherit its `export` modifier.
+    // Consume a same-named `type` alias (TS errors on class+alias merge).
     for (let k = 0; k < stmts.length; k++) {
       const s = stmts[k];
       if (!s || s.type !== 'TypeAlias') continue;
@@ -131,8 +97,6 @@ export function detectClasses(stmts: Stat[]): ClassPattern[] {
       pattern.consumed.add(k);
       pattern.consumedTypeAlias = true;
       if (ta.exported) pattern.exported = true;
-      // First matching alias wins for the generic shape — multiple aliases
-      // with the same name is a Luau error already, so we don't merge.
       if (pattern.generics.length === 0 && pattern.genericPacks.length === 0) {
         pattern.generics = ta.generics ?? [];
         pattern.genericPacks = ta.genericPacks ?? [];
@@ -144,9 +108,7 @@ export function detectClasses(stmts: Stat[]): ClassPattern[] {
   return out;
 }
 
-/** Check whether a statement is `local <Name> = setmetatable({}, <table>)`.
- *  Returns the class name + (optional) superclass identifier read from the
- *  metatable's `__index` field. */
+/** Match `local <Name> = setmetatable({}, <meta>)` or `local <Name> = {} :: T`. */
 function matchClassDeclaration(stmts: Stat[], i: number): { name: string; superclass: string | null } | null {
   const stat = stmts[i];
   if (!stat || stat.type !== 'Local') return null;
@@ -155,8 +117,7 @@ function matchClassDeclaration(stmts: Stat[], i: number): { name: string; superc
   const name = ls.vars[0]!.name;
   const value = ls.values[0]!;
 
-  // Pattern A — `local <Name> = setmetatable({}, {__index = Super})`.
-  // The classic Luau OOP idiom; superclass falls out of the metatable.
+  // Pattern A: `local <Name> = setmetatable({}, {__index = Super})`.
   if (value.type === 'Call') {
     const call = value as Extract<Expr, { type: 'Call' }>;
     if (call.func.type !== 'Global' || call.func.name !== 'setmetatable') return null;
@@ -176,12 +137,8 @@ function matchClassDeclaration(stmts: Stat[], i: number): { name: string; superc
     return { name, superclass };
   }
 
-  // Pattern B — `local <Name> = {} :: <ImplType>` or plain `local <Name> = {}`.
-  // The "impl-table" idiom: the class table starts empty (often annotated
-  // with its method-bearing impl type), methods get attached via
-  // `function <Name>:foo() ... end`, and the actual setmetatable lives
-  // inside `<Name>.new`. Superclass — if any — is recovered later from a
-  // separate `<Name>.__index = <Super>` assignment.
+  // Pattern B: `local <Name> = {} :: T` (impl-table idiom).
+  // Methods attach via `function <Name>:foo`; superclass via separate `<Name>.__index = Super`.
   const inner = value.type === 'TypeAssertion'
     ? (value as { expr: Expr }).expr
     : value;
@@ -191,10 +148,7 @@ function matchClassDeclaration(stmts: Stat[], i: number): { name: string; superc
   return null;
 }
 
-/** Match `<Class>.__index = <Class>` (or `= <Superclass>`). Returns the
- *  RHS identifier name if it's a Global/Local reference, so callers can
- *  detect superclass-via-`__index` assignments. Returns null if the
- *  statement doesn't match the shape. */
+/** Match `<Class>.__index = <Class|Super>`. Returns the RHS identifier name. */
 function matchIndexAssignment(stat: Stat, className: string): { rhsName: string | null } | null {
   if (stat.type !== 'Assign') return null;
   const a = stat as AssignStat;
@@ -218,8 +172,6 @@ function matchClassFunction(
 ): { kind: 'static' | 'method'; methodName: string } | null {
   if (stat.type !== 'Function') return null;
   const fs = stat as FunctionStat;
-  // The name expr is an IndexName with `op` = '.' or ':'. We want the
-  // root to be `<className>` and the index to be the method name.
   const nameExpr = fs.name;
   if (nameExpr.type !== 'IndexName') return null;
   if (nameExpr.expr.type !== 'Global' && nameExpr.expr.type !== 'Local') return null;
@@ -231,8 +183,7 @@ function matchClassFunction(
   };
 }
 
-/** Compile a detected class pattern into a TS `class` declaration. The
- *  returned node replaces the consumed statements in the output. */
+/** Compile a detected class pattern into a TS `class` declaration. */
 export function compileClassPattern(
   pattern: ClassPattern,
   ctx: CompileContext,
@@ -241,16 +192,9 @@ export function compileClassPattern(
 ): ts.ClassDeclaration {
   const members: ts.ClassElement[] = [];
 
-  // Field declarations + initializers from the `.new` factory's
-  // setmetatable init. Source patterns like
-  //     local self = setmetatable({ name = name or "X", _y = 0 }, Class)
-  // become class fields plus `this.name = name ?? "X"`-style assignments
-  // at the start of the constructor body. We can't emit them as class-
-  // body initializers (`name = name ?? "X"`) because field initializers
-  // run in class-body scope where the constructor's `name` parameter
-  // isn't visible — the bare `name` would self-reference the field. So
-  // declare the field unannotated/uninitialized here, and emit the
-  // assignment inside the constructor below.
+  // Harvest fields + initializers from `.new`'s setmetatable init.
+  // Inits run in the ctor body (not as field initializers) since the ctor
+  // params share names with the field initializer expressions.
   const fieldNames = new Set<string>();
   const fieldInitStmts: ts.Statement[] = [];
   if (pattern.ctorFactory) {
@@ -294,19 +238,13 @@ export function compileClassPattern(
     }
   }
 
-  // Phase 2: scan every method body (and the ctor body) for `self.X`
-  // reads and writes. Aggregate into a single Shape representing the
-  // class instance's full surface, then emit property declarations
-  // for any field NOT already captured by the setmetatable init.
-  // This catches the common Luau idiom where fields are assigned
-  // lazily inside methods (`self._is_connected = false`) instead of
-  // up-front. Before Phase 2 we used a `[k: string]: any` index sig
-  // to absorb these — that fired roblox-ts's no-any rule. With
-  // structural declarations the class is roblox-ts-clean.
+  // Aggregate `self.X` access across ctor + methods to declare lazy-assigned
+  // fields as typed properties (the index-sig fallback fires roblox-ts no-any).
+  // Lifted out of the rbxts-only block so the methods loop can expose the
+  // shape map to compileAssign via ctx.selfFieldShapes.
+  let aggregatedSelfShape: import('./shape-infer.js').Shape | null = null;
   if (ctx.compatMode === 'rbxts') {
-    const selfShape = (() => {
-      // collectShapes returns a fresh shape per call; aggregate by
-      // re-running into the same map.
+    aggregatedSelfShape = (() => {
       let aggregated: import('./shape-infer.js').Shape | null = null;
       const merge = (body: Stat | null | undefined): void => {
         if (!body) return;
@@ -324,38 +262,25 @@ export function compileClassPattern(
       for (const method of pattern.methods) merge(method.func.body);
       return aggregated;
     })();
-    if (selfShape) {
-      // Collect the names of methods we're about to emit so the
-      // self-shape pass doesn't shadow them with `name!: unknown`
-      // field declarations (TS2300, duplicate identifier).
+    if (aggregatedSelfShape) {
+      // Skip method names to avoid TS2300 duplicate identifier on field declarations.
       const methodNames = new Set<string>();
       for (const method of pattern.methods) {
         const mn = method.name;
         if (mn.type === 'IndexName') methodNames.add(mn.index);
       }
-      for (const [name, childShape] of (selfShape as import('./shape-infer.js').Shape).props) {
+      for (const [name, childShape] of (aggregatedSelfShape as import('./shape-infer.js').Shape).props) {
         if (fieldNames.has(name)) continue;
         if (methodNames.has(name)) continue;
-        // Skip names that aren't legal identifiers (we use them as
-        // class member names, not via [string] indexing).
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
         fieldNames.add(name);
-        // Use the child shape as the field type when it's non-empty
-        // (`this._script_signal._head` chains need `_script_signal`
-        // declared with the `_head`/etc. sub-shape, not just
-        // `unknown`). Falls back to `unknown` for leaves we never
-        // chain into.
         const fieldType = shapeToTypeNode(childShape)
           ?? factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
         members.push(
           factory.createPropertyDeclaration(
             undefined,
             factory.createIdentifier(name),
-            // `!` (definite-assignment) marker — TS doesn't see the
-            // method-body write that initializes the field, so the
-            // strict-mode `Property has no initializer and is not
-            // definitely assigned in the constructor` warning would
-            // fire otherwise.
+            // `!` definite-assignment: TS can't see method-body writes that initialize the field.
             factory.createToken(ts.SyntaxKind.ExclamationToken),
             fieldType,
             undefined,
@@ -373,19 +298,13 @@ export function compileClassPattern(
     let ctorOptionalFrom = ctx.compatMode === 'rbxts'
       ? trailingMissingStart(ctorArgs)
       : ctorArgs.length;
-    // Phase 2: scan the ctor body for per-param AND per-local access
-    // patterns. The map is pushed onto ctx around the ctor-body
-    // compile so `let x = …` declarations inside the body can
-    // consult shapes for their structural-type annotations.
     let ctorShapes: Map<string, import('./shape-infer.js').Shape> | null = null;
     if (ctx.compatMode === 'rbxts' && fnExpr.body) {
       const trackedNames = new Set<string>(ctorArgs.map((a) => a.name));
       for (const n of collectLocalNames(fnExpr.body)) trackedNames.add(n);
       ctorShapes = collectShapes(fnExpr.body, trackedNames);
     }
-    // Shape-typed params are required (body assumes existence). Push
-    // ctorOptionalFrom past the last shape-required param so TS
-    // doesn't see required-after-optional (TS1016).
+    // Shape-typed params are required — push optionalFrom past them (TS1016).
     if (ctorShapes) {
       let lastShapeRequired = -1;
       ctorArgs.forEach((a, i) => {
@@ -403,8 +322,6 @@ export function compileClassPattern(
     if (ctorShapes) ctx.pushShapeScope(ctorShapes as Map<string, unknown>);
     const body = ctorBody(fnExpr.body, pattern, ctx, compileBlockBody, compileExpr);
     if (ctorShapes) ctx.popShapeScope();
-    // Prepend the harvested field-init statements so constructor params
-    // are in scope when their values flow into `this.X`.
     members.push(
       factory.createConstructorDeclaration(
         undefined,
@@ -414,19 +331,8 @@ export function compileClassPattern(
     );
   }
 
-  // Backward-compat: keep the `<Class>.new(...)` call (and value-position
-  // `<Class>.new` reference) working by emitting a `static new(...)`
-  // method that forwards to the real constructor. The `Class.new` macro
-  // rewrites *call* sites to `new Class(...)`; this static handles the
-  // bare-reference case (e.g. `export default { new: Class.new }`) and
-  // older code that hasn't been ported.
-  //
-  // Skip in rbxts mode — roblox-ts reserves `new` as a class member name
-  // (it auto-generates a `Class.new()` Lua factory from `new Class()` TS
-  // calls), so emitting our own collides with TS roblox-ts: "Cannot use
-  // class field reserved for compiler internal usage." Value-position
-  // `<Class>.new` references aren't roblox-ts-clean to begin with; the
-  // user should refactor to `() => new Class(...)`.
+  // native mode: emit `static new(...)` forwarder for value-position `<Class>.new` references.
+  // rbxts skips — roblox-ts reserves `.new` and auto-generates the factory.
   if (ctx.compatMode !== 'rbxts' && pattern.ctorFactory && !members.some((m) =>
     ts.isMethodDeclaration(m)
       && m.modifiers?.some((mod) => mod.kind === ts.SyntaxKind.StaticKeyword)
@@ -450,11 +356,7 @@ export function compileClassPattern(
         undefined,
         factory.createBlock(
           [factory.createReturnStatement(
-            // Cast the class to `any` before `new` so the spread succeeds
-            // regardless of the constructor's static arity. Plain
-            // `new Class(...args)` fails when Class's ctor takes 0
-            // params (TS2556: spread requires tuple type or rest param
-            // on the callee).
+            // Cast to `any` before `new` so the spread works regardless of ctor arity (TS2556).
             factory.createNewExpression(
               factory.createParenthesizedExpression(
                 factory.createAsExpression(
@@ -478,27 +380,16 @@ export function compileClassPattern(
     if (nameExpr.type !== 'IndexName') continue;
     const methodName = nameExpr.index;
     const fnExpr = method.func;
-    // rbxts-mode-only: mark the trailing run of unannotated/nilable params
-    // optional. Lets the call site pass fewer args (Luau missing-args
-    // → nil semantics) without tripping arity checks.
     const fnArgs = (fnExpr.args ?? []);
     let optionalFrom = ctx.compatMode === 'rbxts'
       ? trailingMissingStart(fnArgs)
       : fnArgs.length;
-    // Phase 2: collect per-param AND per-local shapes from the method
-    // body so paramDecl AND compileLocal can synthesize structural
-    // type annotations. We track every Local introduced in the
-    // method scope along with params; the resulting shape map is
-    // pushed onto ctx so compileBlockBody → compileLocal can read
-    // it when emitting `let x = …` declarations.
     let methodShapes: Map<string, import('./shape-infer.js').Shape> | null = null;
     if (ctx.compatMode === 'rbxts' && fnExpr.body) {
       const trackedNames = new Set<string>(fnArgs.map((a) => a.name));
       for (const n of collectLocalNames(fnExpr.body)) trackedNames.add(n);
       methodShapes = collectShapes(fnExpr.body, trackedNames);
     }
-    // Shape-typed params are required; pull optionalFrom past them
-    // to avoid TS1016 (required-after-optional).
     if (methodShapes) {
       let lastShapeRequired = -1;
       fnArgs.forEach((a, i) => {
@@ -513,10 +404,7 @@ export function compileClassPattern(
     const params = fnArgs.map((a, idx) =>
       paramDecl(a, idx >= optionalFrom, methodShapes?.get(a.name) ?? null),
     );
-    // Variadic `function obj:method(...)` carries a `vararg` flag on the
-    // FunctionExpr; surface it as a `...__varargs: unknown[]` rest param
-    // so body uses of `__varargs[…]` resolve. compileFunctionShape does
-    // the same for top-level functions.
+    // Variadic `:method(...)` → `...__varargs: unknown[]`.
     if ((fnExpr as { vararg?: boolean }).vararg) {
       params.push(
         factory.createParameterDeclaration(
@@ -529,31 +417,23 @@ export function compileClassPattern(
       );
     }
     const isStatic = (nameExpr as { op?: string }).op === '.';
-    // Method bodies have the same `self` → `this` requirement as the
-    // constructor. Rewrite once after compileBlockBody so the emitted
-    // method reads `return this.x + arg` rather than `return self.x + arg`.
-    // Also drop the `const self = this;` plumbing we emit for colon-
-    // methods (it binds the captured `self` local; inside a TS class the
-    // body refers to `this` directly so the rebind is dead code).
-    //
-    // Wrap in withScope so each method's locals (e.g. `let record = ...`
-    // declared in both addState and addTransition) don't collide via
-    // ctx.hasLocalInCurrentScope() and degrade to assignment-without-let
-    // form in subsequent methods.
-    // Push the method's shape map so compileLocal inside the body
-    // sees per-variable structural shapes. Popped after compile.
+    // Each method gets its own withScope so locals don't bleed between sibling methods.
     if (methodShapes) ctx.pushShapeScope(methodShapes as Map<string, unknown>);
+    // Expose the class's self-shape so compileAssign for `self.X = Y`
+    // can cast RHS through the field's declared type.
+    const prevSelfFieldShapes = ctx.selfFieldShapes;
+    if (aggregatedSelfShape) {
+      ctx.selfFieldShapes = (aggregatedSelfShape as import('./shape-infer.js').Shape).props as unknown as Map<string, unknown>;
+    }
     const rawBody = ctx.withScope(() => {
       for (const a of fnExpr.args ?? []) ctx.defineLocal(a.name, 'unknown');
       return compileBlockBody(fnExpr.body as Stat, ctx);
     });
+    ctx.selfFieldShapes = prevSelfFieldShapes;
     if (methodShapes) ctx.popShapeScope();
     const bodyStmts = rawBody
       .map((s) => rewriteSelfToThis(s))
       .filter((s) => !isSelfThisBinding(s));
-    // Mark the method `async` when its body uses `await`. compileBlockBody
-    // already inserts the awaits for yielding calls (pcall, wait, etc.);
-    // without the modifier TS flags every one of them.
     const methodModifiers: ts.ModifierLike[] = [];
     if (isStatic) methodModifiers.push(factory.createModifier(ts.SyntaxKind.StaticKeyword));
     if (bodyStmts.some((s) => statementContainsAwait(s))) {
@@ -573,7 +453,6 @@ export function compileClassPattern(
     );
   }
 
-  // Inheritance.
   const heritage = pattern.superclass
     ? [
         factory.createHeritageClause(ts.SyntaxKind.ExtendsKeyword, [
@@ -588,9 +467,7 @@ export function compileClassPattern(
   const modifiers = pattern.exported
     ? [factory.createModifier(ts.SyntaxKind.ExportKeyword)]
     : undefined;
-  // Generic params: harvested from the consumed type alias. Type packs
-  // (`<T...>`) become `<T extends unknown[] = unknown[]>` so tuple-style
-  // references still resolve.
+  // Type packs (`<T...>`) become `<T extends unknown[] = unknown[]>`.
   const typeParams: ts.TypeParameterDeclaration[] = [];
   for (const g of pattern.generics) {
     typeParams.push(
@@ -607,16 +484,6 @@ export function compileClassPattern(
       ),
     );
   }
-  // Phase 1 of the rbxts cleanup dropped this index signature. It used
-  // to be `[k: string]: any` to absorb lazily-assigned fields (Luau
-  // `self.X = …` writes that aren't visible in setmetatable init), but
-  // the `any` value type fires roblox-ts's no-any rule on every
-  // subsequent `instance.X` access — death by a thousand cuts.
-  // Phase 2 will scan method bodies for `this.X = …` writes and emit
-  // typed property declarations for each, so the class shape is
-  // complete without the catch-all. Until then, classes that
-  // monkey-patch their own fields will surface TS2339s — those are
-  // the surface area for Phase 2.
   return factory.createClassDeclaration(
     modifiers,
     pattern.name,
@@ -626,10 +493,8 @@ export function compileClassPattern(
   );
 }
 
-/** Compile the body of a `:constructor` or `.new` factory. The factory
- *  body typically contains `local self = setmetatable({}, Class)` and
- *  `self:constructor(...)`; we skip those bookkeeping lines and emit the
- *  rest verbatim. The constructor body itself becomes the TS constructor. */
+/** Compile a `:constructor` or `.new` factory body. Skips the
+ *  `local self = setmetatable(...)` / `self:constructor(...)` plumbing. */
 function ctorBody(
   body: Stat,
   pattern: ClassPattern,
@@ -637,49 +502,28 @@ function ctorBody(
   compileBlockBody: (body: Stat, ctx: CompileContext) => ts.Statement[],
   compileExpr: (expr: Expr, ctx: CompileContext) => ts.Expression,
 ): ts.Statement[] {
-  // If `:constructor` exists, use its body. Otherwise, the factory body
-  // typically wraps a `self:constructor(...)` call — we inline the
-  // factory body instead, keeping the user's actual init statements.
   const stmts = body.type === 'Block' ? body.body : [body];
   const filtered = stmts.filter((s) => !isClassPlumbing(s, pattern));
   let compiled = filtered.flatMap((s) => compileBlockBody(s, ctx));
 
-  // Rewrite `self` → `this` and `Superclass.constructor(this, ...)` →
-  // `super(...)` so the synthesized class body uses TS-idiomatic names.
   compiled = compiled.map((s) => rewriteSelfToThis(s));
   if (pattern.superclass) {
     compiled = compiled.map((s) => rewriteSuperCall(s, pattern.superclass!));
   }
   return compiled;
-  // `compileExpr` is unused here today but kept in the signature for the
-  // future where we'll inline literal field assignments as TS class fields
-  // (`x: number = 0` syntax) instead of `this.x = …` constructor stmts.
   void compileExpr;
 }
 
-/** Rewrite every `Identifier('self')` reference in a TS statement to
- *  `this`. The class-shape detector copies Luau bodies that bind `self`
- *  via `self = setmetatable({}, Class)`; once we elevate the body into a
- *  TS class, every `self.X` is the synthesized `this.X`.
- *
- *  Nested function expressions / declarations need extra care: a plain
- *  `function () { this.X }` would bind `this` to its own call-time
- *  receiver, not the enclosing class instance. Convert them to ARROW
- *  functions so `this` inherits lexically from the surrounding method.
- *  This matches Luau's semantics (a nested function captures `self`
- *  through closure, not through its own receiver). */
+/** Rewrite `self` → `this`. Nested function expressions/declarations
+ *  become arrow functions so `this` inherits lexically (matches Luau closure semantics). */
 function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
   function topLevel(node: ts.Node): ts.Node {
-    // Property access — only recurse into the `expression`, never rewrite
-    // the `name` (so `obj.self` keeps `self` as the property name).
+    // Don't rewrite the `name` of property access — `obj.self` keeps `self` as the name.
     if (ts.isPropertyAccessExpression(node)) {
       const expr = topLevel(node.expression) as ts.Expression;
       return factory.createPropertyAccessExpression(expr, node.name);
     }
-    // Variable / binding / parameter — only recurse into the initializer
-    // and type, never rewrite the `name`. Without this guard a
-    // `const self = this` inside a nested closure becomes
-    // `const this = this` which is invalid TS.
+    // Don't rewrite binding names — would produce invalid `const this = this`.
     if (ts.isVariableDeclaration(node)) {
       return factory.createVariableDeclaration(
         node.name,
@@ -706,7 +550,7 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
         node.initializer ? (topLevel(node.initializer) as ts.Expression) : undefined,
       );
     }
-    // Nested `function () { … }` expression → arrow `() => { … }`.
+    // Nested `function () {}` → arrow `() => {}` so `this` binds lexically.
     if (ts.isFunctionExpression(node)) {
       const newBody = topLevel(node.body) as ts.Block;
       const params = node.parameters.filter((p) =>
@@ -722,9 +566,7 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
         newBody,
       );
     }
-    // Nested `function f() { … }` declaration → `const f = () => { … };`.
-    // (Luau-local functions don't hoist either, so the visible semantics
-    // are equivalent.)
+    // Nested `function f() {}` decl → `const f = () => {}` (Luau locals don't hoist).
     if (ts.isFunctionDeclaration(node) && node.name && node.body) {
       const newBody = topLevel(node.body) as ts.Block;
       const params = node.parameters.filter((p) =>
@@ -755,20 +597,10 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
   return topLevel(stat) as ts.Statement;
 }
 
-/** Build a typed parameter declaration from a Luau Local arg. Pulls the
- *  TS type from the annotation when present; falls back to `any` so
- *  roblox-ts's strict mode doesn't trip on implicit `any` (TS7006).
- *  Using `unknown` instead would satisfy strict-mode but then cause
- *  TS18046 ("'X' is of type 'unknown'") on every property access in
- *  the body — `any` lets the access through and roblox-ts's "any
- *  banned" rule only fires in narrow contexts (assignment targets,
- *  not method bodies). */
+/** Build a parameter decl. Uses annotation, falls back to shape-inferred type, else `unknown`. */
 function paramDecl(
   a: { name: string; annotation?: import('../parser/index.js').TypeNode | null },
   isTrailingUnannotated = false,
-  /** Phase 2: pre-collected access shape for this param. When the
-   *  shape isn't empty, synthesize a structural type literal instead
-   *  of the default `: unknown` annotation. */
   shape?: import('./shape-infer.js').Shape | null,
 ): ts.ParameterDeclaration {
   let ty: ts.TypeNode;
@@ -784,30 +616,17 @@ function paramDecl(
       ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
     }
   } else {
-    // Unannotated rbxts-mode params default to `: unknown` (not `:
-    // any`) so roblox-ts's no-any rule doesn't fire on every body
-    // usage. Without a shape map (native mode or method outside
-    // inference path), this is the fallback.
     ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
   }
-  // Unannotated trailing params mirror the Luau-call calling convention
-  // (missing positional args become `nil`); mark them optional so a
-  // 1-arg call site of a 2-param method still typechecks under strict.
-  // Annotated params keep their declared shape — if the user wrote
-  // `: number` without `?`, that's an explicit "required" signal.
-  // When Phase 2 inferred a shape, the body assumes the value exists;
-  // marking it optional would turn every `param.X` access into
-  // TS18048, so drop the `?` and require callers to supply.
+  // Trailing unannotated params → `?` (Luau missing-arg → nil semantics).
+  // Inferred shapes skip `?` since the body assumes existence.
   const question = isTrailingUnannotated && !a.annotation && !hasInferredShape
     ? factory.createToken(ts.SyntaxKind.QuestionToken)
     : undefined;
   return factory.createParameterDeclaration(undefined, undefined, a.name, question, ty);
 }
 
-/** True for params whose runtime type is "missing → nil" (unannotated)
- *  or whose annotation explicitly admits nil. Used to decide which
- *  trailing run to mark optional. Mirrors annotationIsNilable from
- *  ../compile/index.ts — duplicated here to avoid a circular import. */
+/** Params whose runtime type admits missing (unannotated or nilable). */
 function paramAllowsMissing(
   a: { name: string; annotation?: import('../parser/index.js').TypeNode | null },
 ): boolean {
@@ -824,9 +643,7 @@ function paramAllowsMissing(
   return false;
 }
 
-/** Index of the first trailing param that admits a missing arg. Used by
- *  class-method param emission to enable the `?` marker without
- *  violating TS's "required-after-optional" rule. */
+/** First index of the trailing run of missing-admitting params. */
 function trailingMissingStart(
   args: readonly { name: string; annotation?: import('../parser/index.js').TypeNode | null }[],
 ): number {
@@ -841,11 +658,7 @@ function trailingMissingStart(
   return firstTrailing;
 }
 
-/** Walk the `.new` factory body looking for the canonical
- *      local self = setmetatable({ field1 = val1, ... }, Class)
- *  pattern. Returns the init table (the first arg to setmetatable) so
- *  callers can harvest its fields onto the synthesized class declaration.
- *  Returns null if the factory doesn't follow this shape. */
+/** Find `local self = setmetatable({fields...}, Class)` and return the init table. */
 function findSetmetatableInit(
   body: Stat,
   className: string,
@@ -861,9 +674,6 @@ function findSetmetatableInit(
     const call = v as Extract<Expr, { type: 'Call' }>;
     if (call.func.type !== 'Global' || call.func.name !== 'setmetatable') continue;
     if (call.args.length < 1 || call.args[0]!.type !== 'Table') continue;
-    // The second arg points back at the class (e.g. `Class`); not strictly
-    // required to match, but skipping unrelated setmetatable shapes keeps
-    // false positives low.
     if (call.args.length >= 2) {
       const meta = call.args[1]!;
       if (meta.type === 'Global' || meta.type === 'Local') {
@@ -876,16 +686,12 @@ function findSetmetatableInit(
   return null;
 }
 
-/** True if a TS statement contains an `await` expression anywhere in
- *  its subtree (excluding nested function declarations, which have their
- *  own async scope). Used to decide whether a class method needs an
- *  `async` modifier. */
+/** True if `stat` contains an `await` (not counting nested function scopes). */
 function statementContainsAwait(stat: ts.Statement): boolean {
   let found = false;
   function visit(node: ts.Node): void {
     if (found) return;
-    // Don't cross function boundaries — a nested `async function` has
-    // its own awaits that don't make the OUTER method async.
+    // Don't cross function boundaries.
     if (
       ts.isFunctionExpression(node)
       || ts.isArrowFunction(node)
@@ -902,11 +708,7 @@ function statementContainsAwait(stat: ts.Statement): boolean {
   return found;
 }
 
-/** True for a `const self = this;` (or `let`/`var`) declaration — the
- *  plumbing line our colon-method emit produces to bind a `self` local
- *  inside a function taking `this: any`. Inside a TS class body the rebind
- *  is dead code (callers already reference `this` directly), so we drop
- *  it after the self → this rewrite. */
+/** True for `const self = this;` — dead code after the self→this rewrite. */
 function isSelfThisBinding(stat: ts.Statement): boolean {
   if (!ts.isVariableStatement(stat)) return false;
   const decls = stat.declarationList.declarations;
@@ -916,10 +718,9 @@ function isSelfThisBinding(stat: ts.Statement): boolean {
   return d.initializer?.kind === ts.SyntaxKind.ThisKeyword;
 }
 
-/** Statements that are pure metatable plumbing — `local self = setmetatable(...)`,
- *  `self:constructor(...)`, `return self`. Kept out of the TS constructor body. */
+/** Skipped from the TS ctor body: `local self = setmetatable(...)`,
+ *  `self:constructor(...)`, `return self`. */
 function isClassPlumbing(stat: Stat, pattern: ClassPattern): boolean {
-  // `local self = setmetatable({}, Class)` — first line of .new factory.
   if (stat.type === 'Local') {
     const ls = stat as LocalStat;
     if (ls.vars.length === 1 && ls.vars[0]!.name === 'self' && ls.values.length === 1) {
@@ -929,7 +730,6 @@ function isClassPlumbing(stat: Stat, pattern: ClassPattern): boolean {
       }
     }
   }
-  // `self:constructor(...)` call — second line of .new factory.
   if (stat.type === 'Expr') {
     const e = (stat as { expr: Expr }).expr;
     if (e.type === 'Call' && e.func.type === 'IndexName') {
@@ -941,7 +741,6 @@ function isClassPlumbing(stat: Stat, pattern: ClassPattern): boolean {
       ) return true;
     }
   }
-  // `return self` — last line of .new factory.
   if (stat.type === 'Return') {
     const r = stat as { values: Expr[] };
     if (r.values.length === 1) {
@@ -953,8 +752,7 @@ function isClassPlumbing(stat: Stat, pattern: ClassPattern): boolean {
   return false;
 }
 
-/** Best-effort: rewrite any `Superclass.constructor(this, ...)` call in a
- *  TS statement to `super(...)`. */
+/** Rewrite `Superclass.constructor(this, ...)` → `super(...)`. */
 function rewriteSuperCall(stat: ts.Statement, superclass: string): ts.Statement {
   function visit(node: ts.Node): ts.Node {
     if (
@@ -965,12 +763,7 @@ function rewriteSuperCall(stat: ts.Statement, superclass: string): ts.Statement 
       && ts.isIdentifier(node.expression.name)
       && node.expression.name.text === 'constructor'
     ) {
-      // Drop the first arg if it's `this` / `self` — both forms
-      // appear depending on whether the self→this rewrite ran first
-      // (which produces a ts.ThisExpression node, not an identifier).
-      // Look through any `(<expr>) as T as U` wrappers too: the
-      // call-arg cast we inserted wraps `this` in an AsExpression
-      // chain, but the semantic content is still `this`.
+      // Drop a leading `this`/`self` arg, looking through `as` cast chains.
       const args = node.arguments.slice();
       const unwrap = (e: ts.Expression): ts.Expression => {
         if (ts.isParenthesizedExpression(e)) return unwrap(e.expression);

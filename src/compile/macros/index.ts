@@ -50,17 +50,28 @@ export function registerConstructorMacro(
 ): void {
   registerMacro(
     key,
-    ({ ctx, compiledArgs }) => {
+    ({ call, ctx, compiledArgs }) => {
       ctx.useImport('@rbxts/types', typeName);
       const args = numericArgs
-        ? compiledArgs.map((a) =>
-            factory.createAsExpression(
+        ? compiledArgs.map((a, i) => {
+            const luauArg = call.args[i];
+            // Skip cast when the source arg is already a numeric
+            // primitive in TS's view — Constant literals, math.X calls,
+            // arithmetic on trusted operands, etc.
+            if (luauArg && ctx.staticTypeOf(luauArg) === 'number'
+                && isStaticallyNumberLuau(luauArg)) {
+              return a;
+            }
+            return factory.createAsExpression(
               factory.createAsExpression(
-                a,
+                ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
+                  ? factory.createParenthesizedExpression(a)
+                  : a,
                 factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
               ),
               factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
-            ))
+            );
+          })
         : compiledArgs;
       return factory.createNewExpression(
         factory.createIdentifier(typeName),
@@ -70,6 +81,24 @@ export function registerConstructorMacro(
     },
     mode,
   );
+}
+
+/** True when a Luau expression compiles to a TS-side `number`-typed
+ *  expression. Constant literals are the safe baseline; arithmetic /
+ *  math.X / tonumber chains stay trusted. */
+function isStaticallyNumberLuau(expr: Expr): boolean {
+  if (expr.type === 'ConstantNumber' || expr.type === 'ConstantInteger') return true;
+  if (expr.type === 'Group') return isStaticallyNumberLuau(expr.expr);
+  if (expr.type === 'Unary' && expr.op === '-') return isStaticallyNumberLuau(expr.expr);
+  if (expr.type === 'Binary' && ['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
+    return isStaticallyNumberLuau(expr.left) && isStaticallyNumberLuau(expr.right);
+  }
+  if (expr.type === 'Call') {
+    const fn = expr.func;
+    if (fn.type === 'Global' && fn.name === 'tonumber') return true;
+    if (fn.type === 'IndexName' && fn.expr.type === 'Global' && fn.expr.name === 'math') return true;
+  }
+  return false;
 }
 
 /** Look up the call shape and return a fired macro's TS expression, or

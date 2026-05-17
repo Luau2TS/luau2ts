@@ -381,7 +381,7 @@ describe('compile — functions', () => {
   });
 
   it('method with self bound to this', async () => {
-    const r = await compile('function t:greet(name) return name end');
+    const r = await compile('function t:greet(name) return self.prefix .. name end');
     // The self-binding line is generated inside the method body.
     expect(r.source).toContain('const self = this');
   });
@@ -762,8 +762,9 @@ describe('compile — header / sourcemap / comments', () => {
   it('pretty-prints output via Prettier by default', async () => {
     // Compile through the un-wrapped function so Prettier runs.
     const r = await _compile('local function greet(name)\n  print("hi " .. name)\nend\ngreet("world")');
-    // Prettier flips double-quoted string literals to single-quote (per .prettierrc).
-    expect(r.source).toContain("greet('world')");
+    // Prettier preserves double-quoted string literals (Phase 3: rbxts emit
+    // matches the source's double-quote style; canary expects the same).
+    expect(r.source).toContain('greet("world")');
     // Prettier uses 2-space indents, the TS factory printer uses 4.
     expect(r.source).toMatch(/\n {2}print\(/);
     expect(r.source).not.toMatch(/\n {4}print\(/);

@@ -1,11 +1,10 @@
+import { getOracle, type ClassOracle } from './oracle/index.js';
+import type { FlowFact } from './flow.js';
+
 export const RUNTIME_MODULE = 'luau2ts/runtime';
 
-/** What we know about a value at compile time.
- *
- *  Primitives use plain string tags. Roblox datatypes (Vector3, CFrame,
- *  Color3, …) use the `'datatype:<Name>'` form so the compiler can fast-
- *  path arithmetic operators to the underlying instance methods. Anything
- *  we can't narrow falls back to `'unknown'`. */
+/** Static type info for a value. Roblox datatypes use `'datatype:<Name>'`
+ *  so arithmetic operators can fast-path to metamethod calls. */
 export type StaticValueType =
   | 'number'
   | 'boolean'
@@ -14,92 +13,47 @@ export type StaticValueType =
   | 'unknown'
   | `datatype:${string}`;
 
-/** Roblox datatypes that expose `__add`/`__sub`/`__mul`/`__div`/`__unm`
- *  metamethods we can fast-path. The compiler narrows constructor calls
- *  and annotated locals to `'datatype:<Name>'`; arithmetic between two
- *  values of the same datatype emits `a.add(b)` instead of `luaAdd(a, b)`. */
+/** Roblox datatypes with `__add`/`__sub`/`__mul`/`__div`/`__unm` metamethods
+ *  the compiler can fast-path to instance methods. */
 export const ARITH_DATATYPES = new Set([
   'Vector3', 'Vector2', 'Vector3int16', 'Vector2int16', 'CFrame',
 ]);
 
 /** Compatibility mode for emitted TypeScript.
  *
- *  - `native`: emit TS that imports stdlib helpers from `luau2ts/runtime`.
- *    `Vector3.new(...)`, `game:GetService(...)`, 1-indexed array semantics.
- *  - `rbxts`:  emit TS that mirrors what roblox-ts would accept as input.
- *    `new Vector3(...)`, `import { Workspace } from "@rbxts/services"`,
- *    `new ClassName()` for `Instance.new("ClassName")`, optional 0-indexed
- *    arrays for statically-array-typed expressions.
+ *  - `native`: imports stdlib helpers from `luau2ts/runtime`.
+ *  - `rbxts`:  emits TS compatible with roblox-ts (`new Vector3(...)`,
+ *    `@rbxts/services` imports, `new ClassName()` for `Instance.new`, etc).
  */
 export type CompatMode = 'native' | 'rbxts';
 
 export class CompileContext {
   private readonly imports = new Set<string>();
   private readonly scopes: Map<string, StaticValueType>[] = [new Map()];
-  /** Per-scope Luau-name → JS-name override map. Used when a `local X = expr`
-   *  whose `expr` captures the outer `X` forces us to rename the new local
-   *  to a fresh name (so the inner reference still binds to the outer). */
   private readonly jsNameOverrides: Map<string, string>[] = [new Map()];
-  /** Names of user-defined functions in this file whose bodies transitively
-   *  contain a yielding call. Calls to these names are themselves yielding
-   *  and the compiler must wrap each call site in `await`. Populated by a
-   *  pre-pass over the AST before code emission. */
+  /** Names of user-defined functions whose bodies transitively yield. Call
+   *  sites to these must be wrapped in `await`. Populated by a pre-pass. */
   readonly yieldingFunctions = new Set<string>();
   private tempCounter = 0;
 
-  /** Reserved-import bookkeeping for module paths other than RUNTIME_MODULE.
-   *  Used by the macro registry to collect e.g. `@rbxts/services` symbols so
-   *  the emitter can prepend the right imports alongside the runtime helpers. */
   private readonly extraImports = new Map<string, Set<string>>();
 
-  /** Host-environment globals the script touched (game, workspace, task, …).
-   *  The emitter prepends a `declare const X: any;` for each so tsc's
-   *  type-check stops surfacing "Cannot find name". Distinct from `imports`
-   *  because these aren't sourced from `luau2ts/runtime`; the host
-   *  environment provides the actual runtime values. */
   private readonly ambientGlobalsUsed = new Set<string>();
 
-  /** Map of type-alias names → number of leading regular generics. Used by
-   *  the type-reference compiler so that `Foo<a, b, c>` for a Luau alias
-   *  `type Foo<T...>` collapses its args into a tuple (`Foo<[a, b, c]>`)
-   *  rather than emitting them as positional TS generics that Foo can't
-   *  accept. Populated by a pre-scan pass before codegen. */
   private readonly aliasGenericArities = new Map<string, { generics: number; hasPack: boolean }>();
 
-  /** Names of classes the class-shape detector inferred from
-   *  metatable-OOP patterns. Recorded so subsequent `<Class>.new(...)`
-   *  calls in the same file are lowered to `new <Class>(...)` rather than
-   *  staying as static-method references. */
   private readonly detectedClasses = new Set<string>();
 
-  /** Names locally bound to imported module identifiers — used to suppress
-   *  redundant `let X = X` declarations when a macro rewrote the RHS to
-   *  the same name as the LHS variable (e.g. `local Workspace =
-   *  game:GetService('Workspace')` after the macro fires). The key is the
-   *  Luau-level local name; the value is the imported module name (used
-   *  for diagnostics). */
   private readonly suppressedLocals = new Set<string>();
 
-  /** Compile-time signal: while truthy, calls that return `LuaTuple<...>`
-   *  (string.gsub / find / match / byte under @rbxts/types) should NOT
-   *  auto-extract the first element. Set by destructure-assignment and
-   *  multi-return-call sites that genuinely consume the tuple. Defaults
-   *  to false: single-value Luau positions (`f(string.gsub(...))`,
-   *  `local x = string.gsub(...)`) auto-extract so the result types as
-   *  the first element instead of as a tuple. */
+  /** While truthy, calls returning `LuaTuple<...>` should not auto-extract
+   *  the first element. Set by destructure / multi-return call sites. */
   preferMultiReturn = false;
 
-  /** rbxts-mode Phase 2: set to true the first time a service /
-   *  Instance-root access casts through the `_LuauChild` recursive
-   *  type. The emitter prepends an `interface _LuauChild` declaration
-   *  once when this is true. */
   private _luauChildTypeUsed = false;
   useLuauChildType(): void { this._luauChildTypeUsed = true; }
   get luauChildTypeUsed(): boolean { return this._luauChildTypeUsed; }
 
-  /** Service names recorded via `@rbxts/services` imports. IndexName
-   *  compile uses this to identify root-service references and route
-   *  them through the `_LuauChild` cast for dynamic-child access. */
   isRbxService(name: string): boolean {
     for (const { module, names } of this.extraImportEntries()) {
       if (module === '@rbxts/services' && names.includes(name)) return true;
@@ -107,21 +61,10 @@ export class CompileContext {
     return false;
   }
 
-  /** Names of file-local functions whose return type is annotated as
-   *  `LuaTuple<[…]>` (rbxts mode, uniform multi-return paths). Calls
-   *  to these functions in single-LHS positions need a `[0]` extract
-   *  so the receiver picks up the first element instead of the whole
-   *  tuple — without it `let x = f()` types `x` as `LuaTuple<[…]>`
-   *  and every `x.field` access fires TS2339. */
+  /** Names of file-local functions returning `LuaTuple<[…]>`. Single-LHS
+   *  call sites need a `[0]` extract or downstream property access fails. */
   readonly luaTupleReturningFunctions = new Set<string>();
 
-  /** Phase 2 shape inference: a stack of per-function shape maps.
-   *  Pushed by compileFunctionShape on entry, popped on exit. The
-   *  top map is consulted by compileLocal/paramsFromLocals to emit
-   *  structural type annotations from observed access patterns.
-   *  Uses a stack (not a single map) so nested functions get their
-   *  own shape scope without inner locals bleeding into the outer
-   *  function's shape map. */
   private readonly shapeStack: Map<string, unknown>[] = [];
 
   pushShapeScope(shapes: Map<string, unknown>): void {
@@ -138,10 +81,98 @@ export class CompileContext {
     return undefined;
   }
 
+  readonly oracle: ClassOracle = getOracle();
+
+  /** Per-local flow facts produced by the forward pass in flow.ts.
+   *  null means flow pass hasn't run yet for this compile. */
+  flowFactByExpr: WeakMap<object, FlowFact> | null = null;
+  flowFinalLocalFacts: Map<string, FlowFact> | null = null;
+
+  /** Param primitive type inferred by param-infer.ts at function-shape time,
+   *  consulted by staticTypeOfExpr so `n` in `function f(n)` propagates as
+   *  number when the body does `math.floor(n)`. Keyed by local name; outer
+   *  shadowing is governed by the static scopes mechanism in defineLocal. */
+  readonly preInferredParamType = new Map<string, 'number' | 'string' | 'boolean'>();
+
+  /** Locals whose TS-inferred type is known to match their tracked
+   *  primitive type — typically `let s = tostring(...)` where TS infers
+   *  `s: string` from tostring's @rbxts/types return type. Castless arg
+   *  emit relies on this: a Local with a tracked primitive that *also*
+   *  has TS narrowing is safe to pass into a same-typed slot. */
+  readonly tsTypedPrimitiveLocal = new Set<string>();
+
+  /** Locals whose init resolved to a concrete Roblox class via the oracle
+   *  — `local x = Instance.new(...)`, `:WaitForChild(...)`,
+   *  `:FindFirstChildOfClass(...)`. Maps the local name to the resolved
+   *  className (or `Instance` when only the base class is known). Used to
+   *  (a) suppress reassignment shape-cast wraps that would conflict with
+   *  the local's TS-inferred class type, and (b) skip the Record<string,
+   *  unknown> wrap on property writes whose name is an oracle-declared
+   *  property of the resolved class. */
+  readonly tsTypedClassLocal = new Map<string, string>();
+
+  /** Class-typed locals whose initializer may be nil in @rbxts/types
+   *  (`FindFirstChild`, helper functions with nil fallthrough). Member
+   *  reads/method calls use `!` at the access site to match Luau's
+   *  runtime-error semantics without making non-null WaitForChild chains
+   *  noisy. */
+  readonly tsOptionalClassLocal = new Set<string>();
+
+  /** Locals whose initializer was emitted as `_LuauChild`, the dynamic
+   *  child-access fallback used for unknown Instance children. Downstream
+   *  casts from these locals to concrete classes need an `unknown` bridge
+   *  because `_LuauChild` is callable/indexed and does not structurally
+   *  overlap with Roblox class interfaces. */
+  readonly tsLuauChildLocal = new Set<string>();
+
+  /** Locals/params whose emitted TS declaration already has a synthesized
+   *  structural annotation. Dynamic-child fallback should not steal known
+   *  fields from these values; their declared shape is the best information
+   *  we currently have. */
+  readonly tsShapeTypedLocal = new Set<string>();
+
+  /** Class-method-body context: a map of `self.X` field name → its
+   *  synthesized field shape (TypeNode). Populated by class-shape's
+   *  method-body compile loop so `self.X = Y` writes in compileAssign
+   *  can cast RHS through the declared field type — fixes the
+   *  `Type 'unknown' is not assignable to type '{ … }'` errors that
+   *  the Record-cast skip would otherwise leave behind. */
+  selfFieldShapes: Map<string, unknown> | null = null;
+
+  /** Locals bound via user-function LuaTuple destructure
+   *  (`const [x] = userFn()`). The function's slot-0 type annotation
+   *  is often narrower than `x`'s observed access pattern, so reads on
+   *  `x.Y` need to route through Record to absorb shape mismatches. */
+  readonly destructuredLuaTupleLocal = new Set<string>();
+
+  /** File-local function return classes inferred from their return
+   *  expressions after the flow pass. This is intentionally narrow:
+   *  it only records functions whose observed return values are all the
+   *  same Roblox class (possibly with nil fallthrough). */
+  readonly userFunctionReturnClass = new Map<string, string>();
+
+  /** Injected by compile/index.ts so macros (in a sibling module) can ask
+   *  for an expression's static Luau type without re-importing the
+   *  monolithic compileExpr surface. Returns 'unknown' before injection. */
+  staticTypeOf: (expr: unknown) => StaticValueType = () => 'unknown';
+
+  /** LocalStats whose vars are never reassigned in their scope. Populated
+   *  by inferConstLocals at compile setup and consulted by compileLocal so
+   *  unreassigned bindings emit `const` instead of `let`. */
+  constLocals: WeakSet<object> = new WeakSet();
+
+  /** Per-local primitive type inferred by local-type-infer.ts (from
+   *  init + reassignments). Lets compileLocal emit `: number` annotation
+   *  on the declaration so downstream arithmetic / arg-cast sites can
+   *  trust the local without re-casting per use. */
+  localTypeMap: { perStat: WeakMap<object, 'number' | 'string' | 'boolean'>; byName: Map<string, 'number' | 'string' | 'boolean'> } = {
+    perStat: new WeakMap(),
+    byName: new Map(),
+  };
+
   constructor(public readonly compatMode: CompatMode = 'native') {}
 
-  /** Record a named import from `module`. The emitter will write
-   *  `import { ...names } from "<module>"` once per module. */
+  /** Record a named import from `module`. */
   useImport(module: string, name: string): string {
     let names = this.extraImports.get(module);
     if (!names) {
@@ -152,17 +183,12 @@ export class CompileContext {
     return name;
   }
 
-  /** Returns the recorded extra imports as `{ module, names[] }` tuples,
-   *  sorted by module path then by name for deterministic output. */
   extraImportEntries(): { module: string; names: string[] }[] {
     return [...this.extraImports.entries()]
       .sort((a, b) => a[0].localeCompare(b[0]))
       .map(([module, names]) => ({ module, names: [...names].sort() }));
   }
 
-  /** Record a name as a TS class detected by the class-shape pass. Lookup
-   *  happens at every `<Name>.new(...)` call site so we can lower it to
-   *  `new <Name>(...)` instead of leaving it as a static-method call. */
   recordDetectedClass(name: string): void {
     this.detectedClasses.add(name);
   }
@@ -171,11 +197,6 @@ export class CompileContext {
     return this.detectedClasses.has(name);
   }
 
-  /** Map class name → set of instance method names. Populated by the
-   *  class-shape pass. Used to rewrite value-position
-   *  `ClassName.method` reads to `ClassName.prototype.method`
-   *  (Luau's "method as function reference" idiom — TS doesn't
-   *  expose instance methods statically). */
   private readonly detectedClassMethods = new Map<string, Set<string>>();
 
   recordDetectedClassMethod(className: string, methodName: string): void {
@@ -191,9 +212,6 @@ export class CompileContext {
     return this.detectedClassMethods.get(className)?.has(methodName) ?? false;
   }
 
-  /** Mark a local identifier as already bound to an import of the same
-   *  name. Subsequent `local <name> = <name>` declarations are dropped to
-   *  avoid the redundant shadowing. */
   suppressLocal(name: string): void {
     this.suppressedLocals.add(name);
   }
@@ -211,9 +229,6 @@ export class CompileContext {
     return [...this.imports].sort();
   }
 
-  /** Record a host-environment global as referenced. Triggers a
-   *  `declare const X: any;` preamble at emit time so the TS type-checker
-   *  resolves the name without surfacing "Cannot find name". */
   useAmbient(name: string): void {
     this.ambientGlobalsUsed.add(name);
   }
