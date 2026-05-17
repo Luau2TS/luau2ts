@@ -39,6 +39,7 @@ import { inferConstLocals } from './const-infer.js';
 import { hoistInnerLuaTupleCalls } from './luatuple-hoist.js';
 import { inferLocalTypes, type LocalTypeMap } from './local-type-infer.js';
 import { runFlowPass, type FlowFact } from './flow.js';
+import { inferInstanceLocals } from './backprop-class.js';
 import { compileType, compileTypePack, setAliasArities, setTypeCompatMode } from './type.js';
 import {
   buildSourceMap,
@@ -812,6 +813,34 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
             typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
           }
         }
+      }
+      // Backprop pass marked this local as Instance-typed. Force the
+      // emitted TS type by widening the init through `as unknown as Instance`
+      // (the init's existing class cast — `as _LuauChild`, `as IntValue`,
+      // raw `unknown` from a Call result — wouldn't otherwise satisfy the
+      // annotation). Skip when the local already has a structural shape
+      // annotation (`tsShapeTypedLocal`) or a primitive annotation.
+      if (
+        ctx.compatMode === 'rbxts'
+        && ctx.backpropInstanceLocals.has(v.name)
+        && !ctx.tsShapeTypedLocal.has(v.name)
+        && !ctx.tsTypedPrimitiveLocal.has(v.name)
+        && initExpr
+        && typeNode === undefined
+      ) {
+        const inner = (
+          ts.isBinaryExpression(initExpr)
+          || ts.isConditionalExpression(initExpr)
+        )
+          ? factory.createParenthesizedExpression(initExpr)
+          : initExpr;
+        initExpr = factory.createAsExpression(
+          factory.createAsExpression(
+            inner,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createTypeReferenceNode('Instance', undefined),
+        );
       }
       // rbxts: shape-typed local without init needs `!` (definite assignment) to avoid TS2454.
       const needsDefiniteAssertion =
@@ -6151,6 +6180,11 @@ export async function compile(
     ctx.flowFactByExpr = flow.facts;
     ctx.flowFinalLocalFacts = flow.localFinalFacts;
     scanUserFunctionReturnClasses(rootBlock, ctx);
+    // Backprop: locals whose downstream usage only consists of Instance
+    // members get marked `tsTypedClassLocal = Instance` so receiver gates
+    // skip the Record routing and the init is widened via `as unknown as
+    // Instance` so the TS type matches the inferred class.
+    inferInstanceLocals(rootBlock, ctx);
   }
   if (rootBlock) {
     // Pre-pass: infer which user-defined functions yield. Codegen below

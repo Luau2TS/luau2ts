@@ -125,6 +125,12 @@ export class CompileContext {
    *  overlap with Roblox class interfaces. */
   readonly tsLuauChildLocal = new Set<string>();
 
+  /** Set by the backprop pass: locals whose downstream usage proves they are
+   *  Instance-shaped. compileLocalStat wraps the init through
+   *  `as unknown as Instance` so the local's TS type matches the inferred
+   *  class, letting downstream receiver gates skip the Record routing. */
+  readonly backpropInstanceLocals = new Set<string>();
+
   /** Locals/params whose emitted TS declaration already has a synthesized
    *  structural annotation. Dynamic-child fallback should not steal known
    *  fields from these values; their declared shape is the best information
