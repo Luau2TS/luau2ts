@@ -1,0 +1,724 @@
+{
+  "entries": [
+    {
+      "class": "AdPortal",
+      "kind": "Property",
+      "member": "PortalInvalidReason",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "HumanoidDescription",
+      "kind": "Property",
+      "member": "AccessoryBlob",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "InputAction",
+      "kind": "Property",
+      "member": "BoolState",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "InputAction",
+      "kind": "Property",
+      "member": "Direction1DState",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "InputAction",
+      "kind": "Property",
+      "member": "Direction2DState",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "InputAction",
+      "kind": "Property",
+      "member": "Direction3DState",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "InputAction",
+      "kind": "Property",
+      "member": "ViewportPositionState",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "InsertService",
+      "kind": "Property",
+      "member": "AllowClientInsertModels",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Instance",
+      "kind": "Property",
+      "member": "PredictionMode",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Lighting",
+      "kind": "Property",
+      "member": "ExtendLightRangeTo120",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "AsphaltName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "BasaltName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "BrickName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "CardboardName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "CarpetName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "CeramicTilesName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "ClayRoofTilesName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "CobblestoneName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "ConcreteName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "CorrodedMetalName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "CrackedLavaName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "DiamondPlateName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "FabricName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "FoilName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "GlacierName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "GraniteName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "GrassName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "GroundName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "IceName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "LeafyGrassName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "LeatherName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "LimestoneName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "MarbleName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "MetalName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "MudName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "PavementName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "PebbleName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "PlasterName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "PlasticName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "RockName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "RoofShinglesName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "RubberName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "SaltName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "SandName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "SandstoneName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "SlateName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "SmoothPlasticName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "SnowName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "WoodName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "MaterialService",
+      "kind": "Property",
+      "member": "WoodPlanksName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Model",
+      "kind": "Property",
+      "member": "Scale",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Motor6D",
+      "kind": "Property",
+      "member": "ChildName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Motor6D",
+      "kind": "Property",
+      "member": "ParentName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "PackageLink",
+      "kind": "Property",
+      "member": "Creator",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "PackageLink",
+      "kind": "Property",
+      "member": "PackageAssetName",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "PackageLink",
+      "kind": "Property",
+      "member": "PermissionLevel",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Players",
+      "kind": "Property",
+      "member": "BanningEnabled",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Players",
+      "kind": "Property",
+      "member": "UseStrafingAnimations",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "PVInstance",
+      "kind": "Property",
+      "member": "Origin",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "PVInstance",
+      "kind": "Property",
+      "member": "Pivot Offset",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "ServerScriptService",
+      "kind": "Property",
+      "member": "LoadStringEnabled",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "SoundService",
+      "kind": "Property",
+      "member": "VolumetricAudio",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StarterGui",
+      "kind": "Property",
+      "member": "RtlTextSupport",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StarterGui",
+      "kind": "Property",
+      "member": "VirtualCursorMode",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StarterPlayer",
+      "kind": "Property",
+      "member": "CreateDefaultPlayerModule",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StarterPlayer",
+      "kind": "Property",
+      "member": "EnableDynamicHeads",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StarterPlayer",
+      "kind": "Property",
+      "member": "LoadCharacterLayeredClothing ",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StyleQuery",
+      "kind": "Property",
+      "member": "AspectRatioRange",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StyleQuery",
+      "kind": "Property",
+      "member": "MaxSize",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StyleQuery",
+      "kind": "Property",
+      "member": "MinSize",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StyleQuery",
+      "kind": "Property",
+      "member": "PreferredInput",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StyleQuery",
+      "kind": "Property",
+      "member": "PreferredTextSize",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StyleQuery",
+      "kind": "Property",
+      "member": "ReducedMotionEnabled",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "StyleQuery",
+      "kind": "Property",
+      "member": "ViewportDisplaySize",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Terrain",
+      "kind": "Property",
+      "member": "Decoration",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Terrain",
+      "kind": "Property",
+      "member": "GrassLength",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Terrain",
+      "kind": "Property",
+      "member": "MaterialColors",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "UserGameSettings",
+      "kind": "Property",
+      "member": "StartMaximized",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "UserGameSettings",
+      "kind": "Property",
+      "member": "StartScreenPosition",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "UserGameSettings",
+      "kind": "Property",
+      "member": "StartScreenSize",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "VideoPlayer",
+      "kind": "Property",
+      "member": "AutoLoadInStudio",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "VideoPlayer",
+      "kind": "Property",
+      "member": "AutoPlayInStudio",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "AvatarUnificationMode",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "EnableSLIMAvatars",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "FluidForces",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "IKControlConstraintSupport",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "LayeredClothingCacheOptimizations",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "MeshPartHeadsAndAccessories",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "MeshStreamingAndImprovedLods",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "ModelStreamingBehavior",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "NextGenerationReplication",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "NextGenerationReplicationAlias",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "PathfindingUseImprovedSearch",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "PhysicsImprovedSleep",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "PhysicsSteppingMethod",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "PlayerCharacterDestroyBehavior",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "PlayerScriptsUseInputActionSystem",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "PlayerScriptsUseInputActionSystemAlias",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "PrimalPhysicsSolver",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "RejectCharacterDeletions",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "RenderingCacheOptimizations",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "ReplicateInstanceDestroySetting",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "SandboxedInstanceMode",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "SignalBehavior",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "SignalBehaviorAlias",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "StreamingEnabledAlias",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "StreamingIntegrityMode",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "StreamingMinRadius",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "StreamingTargetRadius",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "StreamOutBehavior",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "TouchesUseCollisionGroups",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "TouchEventsUseCollisionGroups",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "UseFixedSimulation",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "UseFixedSimulationAlias",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "UseNewLuauTypeSolver",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "Workspace",
+      "kind": "Property",
+      "member": "ValidateEnabledProximityPrompt",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "WrapLayer",
+      "kind": "Property",
+      "member": "Color",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "WrapLayer",
+      "kind": "Property",
+      "member": "DebugMode",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "WrapTarget",
+      "kind": "Property",
+      "member": "Color",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    },
+    {
+      "class": "WrapTarget",
+      "kind": "Property",
+      "member": "DebugMode",
+      "reason": "NotScriptable tag — Roblox prohibits script access"
+    }
+  ]
+}

@@ -41,6 +41,13 @@ import { inferLocalTypes, type LocalTypeMap } from './local-type-infer.js';
 import { runFlowPass, type FlowFact } from './flow.js';
 import { inferInstanceLocals } from './backprop-class.js';
 import { rewriteGameServices } from './service-rewrite.js';
+import {
+  lookupClassMethod as apiLookupClassMethod,
+  lookupClassProperty as apiLookupClassProperty,
+  lookupClassEvent as apiLookupClassEvent,
+} from './macros/generated/dispatch.js';
+import { STDLIB_SLOTS } from './macros/generated/stdlib-slots.js';
+import { DATATYPE_SLOTS } from './macros/generated/datatype-slots.js';
 import { compileType, compileTypePack, setAliasArities, setTypeCompatMode } from './type.js';
 import {
   buildSourceMap,
@@ -117,8 +124,22 @@ const COMMON_INSTANCE_METHODS = new Set([
 
 function oracleHasMember(ctx: CompileContext, className: string, memberName: string): boolean {
   if (ctx.oracle.isA(className, 'Instance') && COMMON_INSTANCE_METHODS.has(memberName)) return true;
-  return !!ctx.oracle.propertyType(className, memberName)
-    || !!ctx.oracle.methodReturnType(className, memberName, 0);
+  if (
+    !!ctx.oracle.propertyType(className, memberName)
+    || !!ctx.oracle.methodReturnType(className, memberName, 0)
+  ) {
+    return true;
+  }
+  // Fall back to API-Dump.json: it covers a wider surface than @rbxts/types
+  // (undocumented APIs, recently-added classes that haven't been reflected
+  // into the .d.ts yet). Walk the extends chain through api-data.
+  return apiClassHasMember(className, memberName);
+}
+
+function apiClassHasMember(className: string, memberName: string): boolean {
+  return !!apiLookupClassProperty(className, memberName)
+    || !!apiLookupClassMethod(className, memberName)
+    || apiLookupClassEvent(className, memberName);
 }
 
 function isLuauChildTypeText(text: string): boolean {
@@ -4826,6 +4847,12 @@ function castArgsForCall(
   if (ctx.compatMode !== 'rbxts') return args;
   if (!isSimpleCalleeRef(callee)) return args;
   const expectedSlot = expectedSlotTypes(callee);
+  // (api-data class-method dispatch via expectedSlotTypesForClassMethod is
+  //  intentionally disabled here: the hand-coded `expectedSlotTypes` is
+  //  the safer signal — its slots match what the Lua-side tracking maps
+  //  to. Falling back to api-data widens the skip-cast set and surfaces
+  //  TS2345 when a reassigned Local's tracked type diverges from its TS
+  //  declared type. Class-method dispatch happens elsewhere.)
   return args.map((arg, i) => {
     if (ts.isSpreadElement(arg)) {
       if (
@@ -4930,6 +4957,7 @@ function calleeAsEntityName(expr: ts.Expression): ts.EntityName {
  *  a cast. */
 type SlotKind = 'string' | 'number' | 'boolean' | 'number|string' | 'instance' | 'any';
 type ExpectedSlots = { [i: number]: SlotKind } & { rest?: SlotKind };
+
 function expectedSlotTypes(callee: ts.Expression): ExpectedSlots | undefined {
   // Peel off NonNullExpression / Parenthesized wrappers — the method name
   // is what matters for slot lookup. `folder!.FindFirstChild` and
@@ -5048,9 +5076,17 @@ function expectedSlotTypes(callee: ts.Expression): ExpectedSlots | undefined {
     case 'math.clamp':
     case 'math.atan2':
       return { 0: 'number', 1: 'number', 2: 'number' };
-    default:
-      return undefined;
   }
+  // Fall back to generated stdlib / datatype slot tables. These mirror
+  // every signature in @rbxts/types and are reproducible from
+  // node_modules/@rbxts/types via scripts/build-api-macros.mjs.
+  const generated = STDLIB_SLOTS[path] ?? DATATYPE_SLOTS[path];
+  if (generated) {
+    const out: ExpectedSlots = { ...generated.slots };
+    if (generated.rest) (out as { rest: SlotKind }).rest = generated.rest as SlotKind;
+    return out;
+  }
+  return undefined;
 }
 
 /** True for Luau exprs that compile to a TS expression TS already types
@@ -5437,7 +5473,11 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       calleeAccess = unknownCallableCastExpression(calleeAccess);
       methodCallReceiverWasRecordRouted = true;
     }
-    call = factory.createCallExpression(calleeAccess, undefined, castArgsForCall(calleeAccess, args, ctx, expr.args));
+    call = factory.createCallExpression(
+      calleeAccess,
+      undefined,
+      castArgsForCall(calleeAccess, args, ctx, expr.args),
+    );
   } else if (ctx.compatMode === 'rbxts' && expr.func.type === 'IndexExpr') {
     // rbxts: `obj[k](...)` — recast through a call signature so the
     // unknown-typed indexed slot is callable.

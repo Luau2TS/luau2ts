@@ -33,7 +33,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "prebuild": "node scripts/build-oracle.mjs",
+    "prebuild": "node scripts/build-oracle.mjs && node scripts/build-api-macros.mjs",
     "build": "tsc -b && node scripts/copy-wasm.mjs",
     "clean": "tsc -b --clean",
     "test": "vitest run",
