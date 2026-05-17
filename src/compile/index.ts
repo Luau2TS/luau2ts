@@ -134,7 +134,16 @@ function assertExpression(expr: ts.Expression, type: ts.TypeNode): ts.AsExpressi
   )
     ? factory.createParenthesizedExpression(expr)
     : expr;
-  return factory.createAsExpression(inner, type);
+  // Bridge through `unknown` so casts between unrelated types don't trip
+  // TS2352. The duplicate `as unknown` is harmless and keeps every call
+  // site safe without the caller having to reason about overlap.
+  return factory.createAsExpression(
+    factory.createAsExpression(
+      inner,
+      factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+    ),
+    type,
+  );
 }
 
 
@@ -184,8 +193,11 @@ function nodeReferencesSelf(node: ts.Node): boolean {
 
 function recordCastExpression(expr: ts.Expression): ts.Expression {
   return factory.createParenthesizedExpression(
-    assertExpression(
-      expr,
+    factory.createAsExpression(
+      factory.createAsExpression(
+        expr,
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
       factory.createTypeReferenceNode('Record', [
         factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
         factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
@@ -197,8 +209,11 @@ function recordCastExpression(expr: ts.Expression): ts.Expression {
 function luauChildCastExpression(expr: ts.Expression, ctx: CompileContext): ts.Expression {
   ctx.useLuauChildType();
   return factory.createParenthesizedExpression(
-    assertExpression(
-      expr,
+    factory.createAsExpression(
+      factory.createAsExpression(
+        expr,
+        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      ),
       factory.createTypeReferenceNode('_LuauChild', undefined),
     ),
   );
@@ -798,7 +813,13 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
               )
                 ? factory.createParenthesizedExpression(initExpr)
                 : initExpr;
-              initExpr = assertExpression(inner, fromShape);
+              initExpr = factory.createAsExpression(
+                factory.createAsExpression(
+                  inner,
+                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+                ),
+                fromShape,
+              );
             }
             // No init → `let X!: <shape>`; user's Luau assigns X in a branch TS can't prove.
           } else if (!initExpr || initIsNil) {
@@ -2520,7 +2541,18 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
           ? factory.createParenthesizedExpression(valueExpr)
           : valueExpr;
         // unknown overlaps with anything → single `as <shape>` ok.
-        valueExpr = assertExpression(innerVE, fieldTypeNode);
+        // Concrete-mismatched types need the unknown bridge to satisfy TS2352.
+        if ((valStatic as StaticValueType) === 'unknown') {
+          valueExpr = factory.createAsExpression(innerVE, fieldTypeNode);
+        } else {
+          valueExpr = factory.createAsExpression(
+            factory.createAsExpression(
+              innerVE,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            fieldTypeNode,
+          );
+        }
       }
     }
     // rbxts Phase 3e: when target is `localClass.prop` (a known class
@@ -2601,7 +2633,13 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
         ? factory.createParenthesizedExpression(valueExpr)
         : valueExpr;
       if (fromShape) {
-        valueExpr = assertExpression(inner, fromShape);
+        valueExpr = factory.createAsExpression(
+          factory.createAsExpression(
+            inner,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          fromShape,
+        );
       } else {
         // Primitive keywords (not `typeof <local>`) — TS's typeof resolves to
         // the literal `false`/`"foo"` for `let x = false`, breaking TS2367.
