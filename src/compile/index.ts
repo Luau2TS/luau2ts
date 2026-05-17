@@ -437,6 +437,36 @@ function containsFreeRef(node: ts.Expression, name: string): boolean {
  *  (service global, property of a typed class, oracle method-return). Used
  *  by compileLocal to skip the shape-infer wrap — the oracle resolution is
  *  more honest than a synthesized structural literal. */
+const ROBLOX_DATATYPES = new Set([
+  'Vector3', 'Vector2', 'Vector3int16', 'Vector2int16',
+  'CFrame', 'Color3', 'BrickColor',
+  'UDim', 'UDim2',
+  'NumberRange', 'NumberSequence', 'NumberSequenceKeypoint',
+  'ColorSequence', 'ColorSequenceKeypoint',
+  'Region3', 'Region3int16', 'Rect', 'Ray',
+  'RaycastParams', 'OverlapParams',
+  'TweenInfo', 'Random', 'DateTime',
+  'Faces', 'Axes', 'PhysicalProperties',
+  'Path2DControlPoint', 'FloatCurveKey', 'RotationCurveKey',
+  'CatalogSearchParams', 'Font',
+]);
+
+const DATATYPE_STATIC_FACTORIES = new Set([
+  'fromRGB', 'fromHSV', 'fromHex',
+  'fromScale', 'fromOffset',
+  'Angles', 'fromAxisAngle', 'fromEulerAnglesXYZ', 'fromEulerAnglesYXZ',
+  'fromOrientation', 'fromMatrix', 'fromRotationBetweenVectors',
+  'lookAt', 'lookAlong', 'identity',
+  'fromName', 'fromEnum', 'fromId',
+  'fromIsoDate', 'fromUnixTimestamp', 'fromUnixTimestampMillis',
+  'fromUniversalTime', 'fromLocalTime', 'now',
+  'fromCFrame', 'fromPosition',
+  'zero', 'one', 'xAxis', 'yAxis', 'zAxis',
+  'FromAxis', 'FromNormalId',
+  'Random', 'palette',
+  'White', 'Gray', 'DarkGray', 'Black', 'Red', 'Yellow', 'Green', 'Blue',
+]);
+
 /** Resolve the oracle className that an expression evaluates to, when
  *  possible. Used to populate tsTypedClassLocal so write sites can skip
  *  the Record<string, unknown> wrap on properties that exist on the
@@ -485,6 +515,27 @@ function resolveOracleClassOfExpr(expr: Expr, ctx: CompileContext): string | und
     ) {
       const cls = (expr.args[0] as { value: string }).value;
       if (ctx.oracle.isClass(cls)) return cls;
+    }
+    // Datatype constructor `<Type>.new(...)` → <Type> (Vector3, Color3,
+    // UDim2, BrickColor, etc.). The macro emits `new <Type>(...)` already
+    // typed as the class; the call result IS that class.
+    if (
+      fn.type === 'IndexName'
+      && fn.expr.type === 'Global'
+      && fn.index === 'new'
+      && ROBLOX_DATATYPES.has((fn.expr as { name: string }).name)
+    ) {
+      return (fn.expr as { name: string }).name;
+    }
+    // Datatype static factory `<Type>.fromX(...)` → <Type>. The macros
+    // for these return the typed value.
+    if (
+      fn.type === 'IndexName'
+      && fn.expr.type === 'Global'
+      && ROBLOX_DATATYPES.has((fn.expr as { name: string }).name)
+      && DATATYPE_STATIC_FACTORIES.has(fn.index)
+    ) {
+      return (fn.expr as { name: string }).name;
     }
     // <inst>:WaitForChild/FindFirstChild("Name") → name-table class or Instance
     if (
@@ -2595,10 +2646,23 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
       // shape annotations and other ambiguous sources, route through
       // unknown so TS2352 doesn't fire on non-overlapping types.
       if (propType && propType.kind === 'class') {
-        const valIsBareUnknown = isBareUnknownTyped(value, ctx);
         const propTypeNode = factory.createTypeReferenceNode(propType.name, undefined);
-        void valIsBareUnknown;
-        valueExpr = assertExpression(valueExpr, propTypeNode);
+        // Skip the cast when RHS's resolved class matches the prop's
+        // declared class — `lbl.Size = new UDim2(...)` doesn't need
+        // `... as unknown as UDim2` because `new UDim2(...)` already
+        // returns UDim2. The constructor / static-factory macros emit
+        // the value already typed as the class.
+        const rhsClass = resolveOracleClassOfExpr(value, ctx);
+        if (rhsClass && rhsClass === propType.name) {
+          // valueExpr stays as the constructor result — TS sees it as
+          // the declared class.
+        } else if (isBareUnknownTyped(value, ctx)) {
+          // RHS is `unknown`-typed (param, GetAttribute, etc.); single
+          // narrowing cast suffices, no bridge needed.
+          valueExpr = factory.createAsExpression(valueExpr, propTypeNode);
+        } else {
+          valueExpr = assertExpression(valueExpr, propTypeNode);
+        }
       } else if (propType?.kind === 'primitive' && propType.name !== 'unknown') {
         const valStatic = staticTypeOfExpr(value, ctx);
         if (valStatic !== propType.name) {
@@ -4917,6 +4981,19 @@ function castArgsForCall(
     )
       ? factory.createParenthesizedExpression(arg)
       : arg;
+    // When the slot kind is one we can name directly (primitive or Instance),
+    // emit `as unknown as <kind>` — shorter and faster to type-check than the
+    // generic `Parameters<typeof callee>[i]` indexed access.
+    const directType = slotKindToTypeNode(expected);
+    if (directType) {
+      return factory.createAsExpression(
+        factory.createAsExpression(
+          inner,
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        directType,
+      );
+    }
     return factory.createAsExpression(
       factory.createAsExpression(
         inner,
@@ -4930,6 +5007,20 @@ function castArgsForCall(
       ),
     );
   });
+}
+
+function slotKindToTypeNode(kind: SlotKind | undefined): ts.TypeNode | undefined {
+  switch (kind) {
+    case 'string': return factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword);
+    case 'number': return factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword);
+    case 'boolean': return factory.createKeywordTypeNode(ts.SyntaxKind.BooleanKeyword);
+    case 'number|string': return factory.createUnionTypeNode([
+      factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+      factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+    ]);
+    case 'instance': return factory.createTypeReferenceNode('Instance', undefined);
+    default: return undefined;
+  }
 }
 
 /** Build a TS `EntityName` for `typeof <callee>` queries. NonNullExpression
