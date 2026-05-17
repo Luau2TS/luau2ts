@@ -2804,7 +2804,7 @@ function compileCompoundAssign(stat: CompoundAssignStat, ctx: CompileContext): t
             undefined,
             [target, value],
           )
-        : compileBinary(stat.op, target, value, ctx);
+        : compileBinary(stat.op, target, value, ctx, stat.var, stat.value);
   if (
     stat.var.type === 'IndexExpr'
     && stat.var.index.type !== 'ConstantNumber'
