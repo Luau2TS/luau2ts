@@ -8,6 +8,19 @@ import type { ClassEntry, MethodEntry, PropertyEntry, ParamEntry, StdlibFn } fro
 
 const classes: Record<string, ClassEntry> = apiData.classes;
 
+/** True when `name` is `Instance` or a class that transitively extends
+ *  Instance (per api-data's extends chain). */
+export function isInstanceClass(name: string): boolean {
+  let cur: string | null = name;
+  const seen = new Set<string>();
+  while (cur && !seen.has(cur)) {
+    if (cur === 'Instance') return true;
+    seen.add(cur);
+    cur = classes[cur]?.extends ?? null;
+  }
+  return false;
+}
+
 /** Walk the extends chain (most specific → least) and return the first
  *  class entry that declares `methodName`. */
 export function lookupClassMethod(className: string, methodName: string): MethodEntry | undefined {

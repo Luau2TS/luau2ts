@@ -45,6 +45,7 @@ import {
   lookupClassMethod as apiLookupClassMethod,
   lookupClassProperty as apiLookupClassProperty,
   lookupClassEvent as apiLookupClassEvent,
+  isInstanceClass as apiIsInstanceClass,
 } from './macros/generated/dispatch.js';
 import { STDLIB_SLOTS } from './macros/generated/stdlib-slots.js';
 import { DATATYPE_SLOTS } from './macros/generated/datatype-slots.js';
@@ -144,6 +145,17 @@ function apiClassHasMember(className: string, memberName: string): boolean {
 
 function isLuauChildTypeText(text: string): boolean {
   return text === '_LuauChild' || text.includes('_LuauChild');
+}
+
+/** True when the type text names an Instance-rooted class (or
+ *  `<Class> | undefined` variant). Used to elide the `as unknown` bridge
+ *  between an Instance-returning call and a SubClass narrowing — TS
+ *  accepts the downcast directly. */
+function isInstanceSubclassText(text: string): boolean {
+  if (!text) return false;
+  const base = text.replace(/\s*\|\s*undefined\s*$/, '');
+  if (!/^[A-Z][\w]*$/.test(base)) return false;
+  return apiIsInstanceClass(base);
 }
 
 function assertExpression(expr: ts.Expression, type: ts.TypeNode): ts.AsExpression {
@@ -5758,10 +5770,16 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       const resolved = resolveLooseMethodCastType(expr, ctx);
       if (resolved.kind === 'class') {
         const targetType = factory.createTypeReferenceNode(resolved.text, undefined);
+        // When the call returns Instance (or `Instance | undefined`) and
+        // the target is an Instance subclass, the cast `Instance as SubClass`
+        // is a valid downcast in TS — no `as unknown` bridge needed.
+        // Bridge only when target is `_LuauChild` (forbidden alias) or
+        // when the receiver itself returns _LuauChild.
+        const targetIsInstanceSubclass = isInstanceSubclassText(resolved.text);
         const sourceNeedsBridge =
           isLuauChildTypeText(resolved.text)
           || exprEmitsLuauChild(expr.func.expr, ctx)
-          || (expr.func.expr.type !== 'Local' && expr.func.expr.type !== 'Global');
+          || !targetIsInstanceSubclass;
         call = factory.createAsExpression(
           sourceNeedsBridge
             ? factory.createAsExpression(
