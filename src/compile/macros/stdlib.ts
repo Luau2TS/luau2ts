@@ -98,7 +98,7 @@ registerMacro(
 // rbxts Array uses `remove`, not `splice` (which doesn't exist on the type).
 registerMacro(
   'table.remove',
-  ({ compiledArgs }: MacroArgs) => {
+  ({ call, ctx, compiledArgs }: MacroArgs) => {
     const [target, idx] = compiledArgs;
     if (!target) return undefined;
     const asArrayTarget = factory.createParenthesizedExpression(
@@ -119,13 +119,16 @@ registerMacro(
         [],
       );
     }
-    const idxNum = factory.createAsExpression(
-      factory.createAsExpression(
-        idx,
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-      ),
-      factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
-    );
+    const luauIdx = call.args[1];
+    const idxNum = luauIdx && argIsTrustedNumber(luauIdx, ctx)
+      ? idx
+      : factory.createAsExpression(
+          factory.createAsExpression(
+            idx,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+        );
     const indexExpr = factory.createBinaryExpression(
       idxNum,
       factory.createToken(ts.SyntaxKind.MinusToken),
@@ -386,13 +389,16 @@ for (const m of [
 // `math.clamp(x, lo, hi)` → rbxts: real `math.clamp`; native: nested min/max.
 registerMacro(
   'math.clamp',
-  ({ ctx, compiledArgs }: MacroArgs) => {
+  ({ call, ctx, compiledArgs }: MacroArgs) => {
     const [x, lo, hi] = compiledArgs;
     if (!x || !lo || !hi) return undefined;
     if (ctx.compatMode === 'rbxts') {
       ctx.useAmbient('math');
-      const num = (a: ts.Expression) =>
-        factory.createAsExpression(
+      const num = (a: ts.Expression, idx: number) => {
+        const luauArg = call.args[idx];
+        // Skip when the Luau-side arg is already statically a number.
+        if (luauArg && argIsTrustedNumber(luauArg, ctx)) return a;
+        return factory.createAsExpression(
           factory.createAsExpression(
             ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
               ? factory.createParenthesizedExpression(a)
@@ -401,13 +407,14 @@ registerMacro(
           ),
           factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
         );
+      };
       return factory.createCallExpression(
         factory.createPropertyAccessExpression(
           factory.createIdentifier('math'),
           factory.createIdentifier('clamp'),
         ),
         undefined,
-        [num(x), num(lo), num(hi)],
+        [num(x, 0), num(lo, 1), num(hi, 2)],
       );
     }
     return factory.createCallExpression(
