@@ -7356,9 +7356,7 @@ function compileInterpString(
 import pkgJson from '../../package.json' with { type: 'json' };
 const COMPILER_VERSION = (pkgJson as { version: string }).version;
 const COMPILER_NAME = (pkgJson as { name: string }).name;
-// One-line header. The "DO NOT EDIT" warning was redundant — every dev
-// looking at the file already knows what `// Compiled by …` means.
-const COMPILER_HEADER = `// Compiled by ${COMPILER_NAME} v${COMPILER_VERSION} (do not edit).\n`;
+const COMPILER_HEADER = `// Compiled by ${COMPILER_NAME} v${COMPILER_VERSION}.\n`;
 
 export interface CompileOptions {
   /** Path of the source file. Used in the source map's `sources` field. */

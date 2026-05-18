@@ -756,7 +756,7 @@ describe('compile — runtime semantics', () => {
 describe('compile — header / sourcemap / comments', () => {
   it('always prepends a single-line "Compiled by" header', async () => {
     const r = await compile('local x = 1');
-    expect(r.source).toMatch(/^\/\/ Compiled by luau2ts v[\d.]+ \(do not edit\)\./);
+    expect(r.source).toMatch(/^\/\/ Compiled by luau2ts v[\d.]+\./);
   });
 
   it('pretty-prints output via Prettier by default', async () => {
