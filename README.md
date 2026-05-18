@@ -19,6 +19,8 @@
 
 `luau2ts` is the mirror: it compiles **Luau to TypeScript**. Use it to migrate an existing Luau codebase to TypeScript, to keep two parallel runtimes in sync, or to run authored Luau through TS-native tooling. Output is idiomatic, readable TS, with optional 1:1 line-mapped source maps and a roblox-ts-compatible emit mode.
 
+Directory and Rojo-project modes also emit `.d.ts` declaration files alongside each compiled `.ts`, capturing the inferred shape of each module's exports.
+
 ## Install
 
 ```bash
