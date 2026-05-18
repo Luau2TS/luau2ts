@@ -965,15 +965,21 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
     const v = stat.vars[i]!;
     const init = stat.values[i];
     let initExpr = init ? compileExpr(init, ctx) : undefined;
-    // Empty `{}` compiles to `[]` by default; swap to `{}` when annotation isn't array-shaped.
+    // Empty `{}` is ambiguous (array seed vs. object seed). compileTableExpr
+    // emits the conservative `{} as Record<string, unknown>` cast that
+    // accepts either growth direction. When the local carries an explicit
+    // annotation, narrow to the right empty literal so downstream method
+    // dispatch (Array push/pop on array-typed locals; property writes on
+    // object-typed locals) typechecks naturally.
     if (
       initExpr
       && init?.type === 'Table'
       && (init as { items?: unknown[] }).items?.length === 0
       && v.annotation
-      && !isArrayShapedType(v.annotation)
     ) {
-      initExpr = factory.createObjectLiteralExpression([], false);
+      initExpr = isArrayShapedType(v.annotation)
+        ? factory.createArrayLiteralExpression([], false)
+        : factory.createObjectLiteralExpression([], false);
     }
     // Pass 4: wrap init with narrowed-class cast so the local's TS type
     // matches Pass-4's tsTypedClassLocal narrowing. Only applies when
@@ -3321,8 +3327,24 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
               && (value.func.type === 'Local' || value.func.type === 'Global')
               && ctx.userFunctionMayReturnNil.has((value.func as { name: string }).name)
             );
+          // Skip when RHS class IS the local's class, OR RHS is a
+          // subclass of the local's tracked class (Folder ⊂ Instance,
+          // Player ⊂ Instance, BasePart ⊂ Instance, …). Without this,
+          // a `let f: Instance | undefined; if (!f) f = Instance.new("Folder") end`
+          // pattern emits `f = ... as typeof f`, widening the
+          // narrower-subclass RHS back to `Instance | undefined` and
+          // defeating TS's exit-narrowing on the if-branch — so the
+          // function's return type stays `Instance | undefined` even
+          // though the runtime guarantees non-undefined.
+          const rhsIsSubclass = !!localCls
+            && !!rhsCls
+            && rhsCls !== localCls
+            && ctx.oracle.isClass(rhsCls)
+            && ctx.oracle.isClass(localCls)
+            && ctx.oracle.isA(rhsCls, localCls);
           if (
-            localCls && rhsCls && rhsCls === localCls
+            localCls && rhsCls
+            && (rhsCls === localCls || rhsIsSubclass)
             && (localIsOptional || !rhsNullable)
           ) {
             valueExpr = inner;
@@ -5743,7 +5765,6 @@ function castArgsForCall(
   luauCallee?: Expr,
 ): readonly ts.Expression[] {
   if (ctx.compatMode !== 'rbxts') return args;
-  if (!isSimpleCalleeRef(callee)) return args;
   // Pass 3: when the callee is a known-method on a require-bound local,
   // the cached return-shape declares its signature as `(...args:
   // unknown[]) => defined`. Every arg fits the `unknown` rest slot
@@ -5757,6 +5778,13 @@ function castArgsForCall(
     return args;
   }
   const expectedSlot = expectedSlotTypes(callee);
+  // The Parameters<typeof callee>[i] fallback needs `typeof callee` to
+  // resolve — that requires a simple identifier / shallow property
+  // access chain. When the callee is a call-result receiver (e.g.
+  // `toolsFolder().FindFirstChild`), `typeof` would fail. Bail unless
+  // we have an explicit slot kind (string / number / etc.) we can
+  // emit directly without consulting `typeof callee`.
+  if (!isSimpleCalleeRef(callee) && !expectedSlot) return args;
   // (api-data class-method dispatch via expectedSlotTypesForClassMethod is
   //  intentionally disabled here: the hand-coded `expectedSlotTypes` is
   //  the safer signal — its slots match what the Lua-side tracking maps
@@ -5844,6 +5872,11 @@ function castArgsForCall(
     }
     if (ts.isParenthesizedExpression(arg) && ts.isAsExpression(arg.expression) && !expected && !ts.isIdentifier(callee)) return arg;
     if (ts.isAsExpression(arg) && !expected && !ts.isIdentifier(callee)) return arg;
+    // No expected slot kind + complex callee: the Parameters<typeof
+    // callee>[i] fallback needs `typeof callee` to resolve. For
+    // call-result / element-access callees that emit a typeof for it
+    // would be syntactically broken; leave the arg untouched.
+    if (!expected && !isSimpleCalleeRef(callee)) return arg;
     const inner = (
       ts.isArrowFunction(arg)
       || ts.isFunctionExpression(arg)
