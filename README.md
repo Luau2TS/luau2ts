@@ -81,13 +81,6 @@ console.log(result.source);
 | `rbxts` (default) | TS that mirrors what [roblox-ts](https://roblox-ts.com) accepts as input: `new Vector3(...)`, `import { Workspace } from '@rbxts/services'`, 0-indexed arrays for statically-typed arrays. | [`@rbxts/types`](https://www.npmjs.com/package/@rbxts/types), [`@rbxts/services`](https://www.npmjs.com/package/@rbxts/services), [`@rbxts/promise`](https://www.npmjs.com/package/@rbxts/promise), the `roblox-ts` build pipeline. |
 | `native` | TS that imports stdlib helpers from `luau2ts/runtime` (`luaIndex`, `lualen`, `pairKeys`, `multiret`, ...) and uses Roblox's native API surface (`Vector3.new(...)`, `game:GetService(...)`, 1-indexed arrays). | A host runtime that mirrors Roblox's Luau API surface. |
 
-## Status
-
-| | |
-|---|---|
-| Luau conformance | **53 / 53** upstream conformance tests pass (100%) |
-| Tests | **255 passing** across **9 test files** |
-| Roblox API coverage (rbxts mode) | **4798 / 4798** members across **682 classes** (100%) |
 
 ## Docs
 
