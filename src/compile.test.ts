@@ -880,3 +880,47 @@ describe('compile — type checking', () => {
     expect(lintBlocking).toEqual([]);
   });
 });
+
+describe('compile — class-shape (setmetatable OOP)', () => {
+  it('Luau `:constructor` method does not leak as a colliding class field (rbxts)', async () => {
+    // Regression: the playground's Animal-class example was emitting
+    //   class Animal {
+    //     constructor!: unknown;        // ← bad: TS reserved as the ctor
+    //     constructor(name?: unknown) { ... }
+    //   }
+    // The aggregated-self-shape pass observed `self:constructor(name)`
+    // inside the `.new` factory, recorded `constructor` as a self-prop,
+    // and emitted a field declaration that collided with the actual
+    // JS constructor method.
+    const r = await _compile(
+      `
+        local Animal = setmetatable({}, {})
+        Animal.__index = Animal
+
+        function Animal.new(name)
+          local self = setmetatable({}, Animal)
+          self:constructor(name)
+          return self
+        end
+
+        function Animal:constructor(name)
+          self.name = name
+          self.health = 100
+        end
+
+        function Animal:greet()
+          return "Hello, " .. self.name
+        end
+      `,
+      { pretty: false, postEmitCheck: false, compatMode: 'rbxts' },
+    );
+    // The class must compile and must not declare `constructor` as a field.
+    expect(r.source).toContain('class Animal');
+    expect(r.source).not.toMatch(/constructor!\s*:/);
+    // The actual JS constructor must still be there.
+    expect(r.source).toMatch(/constructor\s*\(/);
+    // And the user's other observed self-props are still declared.
+    expect(r.source).toMatch(/name!\s*:/);
+    expect(r.source).toMatch(/health!\s*:/);
+  });
+});

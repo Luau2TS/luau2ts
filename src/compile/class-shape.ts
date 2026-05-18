@@ -273,6 +273,15 @@ export function compileClassPattern(
       for (const [name, childShape] of (aggregatedSelfShape as import('./shape-infer.js').Shape).props) {
         if (fieldNames.has(name)) continue;
         if (methodNames.has(name)) continue;
+        // `constructor` is reserved on TS class bodies — it always
+        // denotes the constructor method, never a field. The Luau OO
+        // pattern uses `self:constructor(name)` as a method call inside
+        // the `.new` factory; the method itself is parked in
+        // `pattern.constructor` and emitted as the JS class ctor below.
+        // Without this skip, the synthesized-self-field loop sees
+        // `constructor` as an observed prop and emits a colliding
+        // `constructor!: unknown` field declaration.
+        if (name === 'constructor') continue;
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
         fieldNames.add(name);
         const fieldType = shapeToTypeNode(childShape)
