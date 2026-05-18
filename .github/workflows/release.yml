@@ -4,7 +4,8 @@ run-name: Publish ${{ inputs.version }} (@${{ github.actor }})
 # Triggered manually from the Actions tab. Enter the next version
 # (e.g. 0.2.0). The workflow bumps package.json, publishes to npm,
 # pushes the tag back, then creates a styled GitHub release whose
-# body is sourced from CHANGELOG.md.
+# body is sourced from Release Drafter (which accumulates entries
+# from PR titles + labels via .github/release-drafter.yml).
 
 on:
   workflow_dispatch:
@@ -61,22 +62,25 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Extract changelog section for this version
-        run: |
-          node -e "
-            const fs = require('fs');
-            const v = process.env.VERSION;
-            const md = fs.readFileSync('CHANGELOG.md', 'utf8');
-            // Match the section between '## [vVERSION]' and the next '## '.
-            const re = new RegExp(\`## \\\\[\${v.replace(/\\\\./g, '\\\\\\\\.')}\\\\][^\\\\n]*\\\\n([\\\\s\\\\S]*?)(?=\\\\n## |\\$)\`);
-            const m = md.match(re);
-            const section = m ? m[1].trim() : '_No CHANGELOG entry found for this version._';
-            fs.writeFileSync('/tmp/release-body.md', section);
-          "
+      # Pull the release body from Release Drafter. The drafter
+      # accumulates entries from merged PRs (categorized by label per
+      # .github/release-drafter.yml) and exposes the rendered body as
+      # a step output. `publish: false` keeps this step from creating
+      # its own GitHub release; we want to compose header + body +
+      # footer ourselves below.
+      - name: Get release body from Release Drafter
+        id: drafter
+        uses: release-drafter/release-drafter@v7
+        with:
+          publish: false
+          tag: v${{ inputs.version }}
+          name: v${{ inputs.version }}
         env:
-          VERSION: ${{ inputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compose release notes
+        env:
+          DRAFTER_BODY: ${{ steps.drafter.outputs.body }}
         run: |
           cat > /tmp/release-notes.md << 'HEADER'
           <div align="center">
@@ -92,7 +96,15 @@ jobs:
           ---
 
           HEADER
-          cat /tmp/release-body.md >> /tmp/release-notes.md
+          # Use printf (not echo) so backslash escapes pass through
+          # unchanged. Fall back to a minimal placeholder when the
+          # drafter has no PRs to summarize (e.g., releases that
+          # contain only direct-to-main commits with no PR history).
+          if [ -n "$DRAFTER_BODY" ]; then
+            printf '%s\n' "$DRAFTER_BODY" >> /tmp/release-notes.md
+          else
+            echo '_No PR-labeled changes since the previous release. See the commit log for raw history._' >> /tmp/release-notes.md
+          fi
           cat >> /tmp/release-notes.md << 'FOOTER'
 
           ## Install
