@@ -12,7 +12,7 @@ function isValidIdentifier(name: string): boolean {
 // produces the proper subclass type (Frame, Part, …).
 registerMacro(
   'Instance.new',
-  ({ call, compiledArgs }) => {
+  ({ ctx, call, compiledArgs }) => {
     if (compiledArgs.length === 0) return undefined;
     const firstArg = call.args[0];
     const literalClassName = firstArg && firstArg.type === 'ConstantString';
@@ -30,13 +30,26 @@ registerMacro(
           ...compiledArgs.slice(1),
         ];
     if (args[1] && !ts.isSpreadElement(args[1])) {
-      args[1] = factory.createAsExpression(
-        factory.createAsExpression(
-          args[1],
-          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-        ),
-        factory.createTypeReferenceNode('Instance', undefined),
-      );
+      // Skip the redundant cast when the Luau-side arg is already an
+      // Instance subclass (service, typed-class local, etc.).
+      const parentLuau = call.args[1];
+      const skipParentCast =
+        parentLuau
+        && (
+          (parentLuau.type === 'Global' && ctx.oracle.isService(parentLuau.name))
+          || (parentLuau.type === 'Local'
+              && !!ctx.tsTypedClassLocal.get(parentLuau.name)
+              && ctx.oracle.isA(ctx.tsTypedClassLocal.get(parentLuau.name)!, 'Instance'))
+        );
+      if (!skipParentCast) {
+        args[1] = factory.createAsExpression(
+          factory.createAsExpression(
+            args[1],
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createTypeReferenceNode('Instance', undefined),
+        );
+      }
     }
     return factory.createNewExpression(
       factory.createIdentifier('Instance'),

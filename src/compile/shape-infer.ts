@@ -320,16 +320,23 @@ export function collectLocalNames(body: Stat): Set<string> {
 }
 
 /** Instance-interface members that identify a value as a Roblox Instance.
- *  Triggers `& Instance` intersection on the synthesized type. */
+ *  Triggers `& Instance` intersection on the synthesized type. Includes
+ *  universal Instance properties (Name, Parent, ClassName, Archivable)
+ *  so shape-typed locals whose only observed access is `.Name`/`.Parent`
+ *  still get the `& Instance` intersection — without it, shapeToTypeNode
+ *  produces a bare `{Name: unknown; Parent: unknown}` literal that loses
+ *  navigation methods (FindFirstChild, etc.) and triggers TS2339 on
+ *  every chain access through the local. */
 const INSTANCE_DISCRIMINATORS = new Set([
-  'GetAttribute', 'SetAttribute', 'GetAttributes',
+  'GetAttribute', 'SetAttribute', 'GetAttributes', 'SetAttributes',
   'IsA', 'IsDescendantOf', 'IsAncestorOf',
   'WaitForChild', 'FindFirstChild', 'FindFirstChildOfClass',
   'FindFirstChildWhichIsA', 'FindFirstAncestor', 'FindFirstAncestorOfClass',
+  'FindFirstAncestorWhichIsA',
   'GetChildren', 'GetDescendants', 'GetFullName',
   'GetPropertyChangedSignal', 'GetAttributeChangedSignal',
   'Destroy', 'Clone',
-  'ClassName',
+  'ClassName', 'Name', 'Parent', 'Archivable',
 ]);
 
 /** Player-only members — pick `& Player` over `& Instance` for typed signatures. */
@@ -367,6 +374,8 @@ function looksLikeArray(shape: Shape): boolean {
  *  so our loose `(...args: unknown[]): unknown` doesn't shadow the @rbxts/types one. */
 function intersectionTargetDeclaresName(target: string, name: string): boolean {
   if (target === 'Instance') return INSTANCE_DISCRIMINATORS.has(name);
+  // Player extends Instance — every Instance member is also a Player
+  // member.
   if (target === 'Player') return INSTANCE_DISCRIMINATORS.has(name)
     || PLAYER_DISCRIMINATORS.has(name);
   if (target === 'Vector3') return name === 'X' || name === 'Y' || name === 'Z'

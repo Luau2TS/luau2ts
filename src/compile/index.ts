@@ -33,6 +33,11 @@ import './macros/stdlib.js';
 import './rbxts-runtime.js';
 import { detectClasses, compileClassPattern, type ClassPattern } from './class-shape.js';
 import { collectLocalNames, collectShapes, shapeToTypeNode } from './shape-infer.js';
+import { inferScriptParentShapes } from './script-parent-infer.js';
+import { inferLoopVarShapes } from './loop-var-infer.js';
+import { resolveRequirePath } from './require-infer.js';
+import { inferParamBackprop } from './param-backprop.js';
+import { inferInstanceNarrowings } from './instance-narrow.js';
 import { inferParamPrimitives, inferReturnPrimitive } from './param-infer.js';
 import { splitInstanceChains } from './chain-split.js';
 import { inferConstLocals } from './const-infer.js';
@@ -145,6 +150,167 @@ function apiClassHasMember(className: string, memberName: string): boolean {
 
 function isLuauChildTypeText(text: string): boolean {
   return text === '_LuauChild' || text.includes('_LuauChild');
+}
+
+/** True when `expr` is an IndexName chain whose deepest receiver is a
+ *  dynamic root (`script`/`workspace`) we synthesized a Pass-1 shape for.
+ *  Used to suppress extra `as _LuauChild` casts inside the chain — the
+ *  synth-type cast at the root already types the whole chain. */
+function chainRootedInSynthesizedDynamic(expr: Expr, ctx: CompileContext): boolean {
+  let cur: Expr = expr;
+  while (cur.type === 'IndexName') cur = cur.expr;
+  if (cur.type !== 'Global') return false;
+  return ctx.scriptParentRootTypes.has(cur.name);
+}
+
+/** Pass 3: return the param name at the given positional index for a
+ *  user function whose params were cataloged by `inferParamBackprop`. */
+function paramNameFromCallee(name: string, index: number, ctx: CompileContext): string | undefined {
+  const names = ctx.paramBackpropParamNames.get(name);
+  return names ? names[index] : undefined;
+}
+
+/** Pass 3: true when `expr`'s static type matches a backprop-bound
+ *  type. Used to skip the redundant `as Parameters<typeof callee>[i]`
+ *  cast — TS accepts the assignment directly when the arg's TS-visible
+ *  type is compatible with the param's declared class/datatype. */
+function argIsCompatibleWithBoundType(expr: Expr, boundType: string, ctx: CompileContext): boolean {
+  // Match arg's static class against the bound type. Handles
+  // Instance-subclass downcast: bound `Instance` accepts any
+  // Instance-rooted class.
+  const isInstanceBound = boundType === 'Instance';
+  switch (expr.type) {
+    case 'Group':
+    case 'TypeAssertion':
+      return argIsCompatibleWithBoundType(expr.expr, boundType, ctx);
+    case 'Global': {
+      if (ctx.oracle.isService(expr.name)) {
+        return boundType === expr.name
+          || (isInstanceBound && ctx.oracle.isA(expr.name, 'Instance'));
+      }
+      return false;
+    }
+    case 'Local': {
+      const cls = ctx.tsTypedClassLocal.get(expr.name);
+      if (!cls) return false;
+      return boundType === cls
+        || (isInstanceBound && ctx.oracle.isA(cls, 'Instance'));
+    }
+    case 'Call':
+    case 'IndexName': {
+      const cls = resolveOracleClassOfExpr(expr, ctx);
+      if (!cls) {
+        // Pass 1 chains: `script.Parent[.X...]` evaluates to a synth
+        // type that intersects with Instance. So Instance-bound params
+        // accept these directly.
+        if (isInstanceBound && chainRootedInSynthesizedDynamic(expr, ctx)) {
+          return true;
+        }
+        return false;
+      }
+      return boundType === cls
+        || (isInstanceBound && ctx.oracle.isA(cls, 'Instance'));
+    }
+    default:
+      return false;
+  }
+}
+
+/** True when a shape's discriminators trigger the intersection with a
+ *  real class (Player, Instance, Vector3). Mirrors shape-infer's
+ *  intersection-table without re-importing it. */
+const SHAPE_INTERSECTION_DISCRIMINATORS = new Set([
+  // Instance navigation methods
+  'FindFirstChild', 'WaitForChild', 'Parent', 'GetChildren', 'GetDescendants',
+  'IsA', 'Destroy', 'Clone', 'GetFullName', 'AddTag', 'HasTag',
+  // Player discriminators
+  'UserId', 'AccountAge', 'Character', 'Team',
+  // Vector3 discriminators
+  'X', 'Y', 'Z',
+]);
+function shapeHasClassIntersection(shape: { props?: Map<string, unknown>; methods?: Map<string, unknown> } | undefined): boolean {
+  if (!shape) return false;
+  if (shape.props) {
+    for (const k of shape.props.keys()) {
+      if (SHAPE_INTERSECTION_DISCRIMINATORS.has(k)) return true;
+    }
+  }
+  if (shape.methods) {
+    for (const k of shape.methods.keys()) {
+      if (SHAPE_INTERSECTION_DISCRIMINATORS.has(k)) return true;
+    }
+  }
+  return false;
+}
+
+/** Walk an IndexName chain to its root Local (if any). Used by
+ *  shape-typed skip checks. */
+function chainRootLocal(expr: Expr): string | null {
+  let cur: Expr = expr;
+  while (cur.type === 'IndexName' && cur.op === '.') cur = cur.expr;
+  return cur.type === 'Local' ? (cur as { name: string }).name : null;
+}
+
+/** Pass 2: try to resolve a `require(X)` argument to a corpus module
+ *  path and look up its inferred return-type text. */
+function resolveRequireReturnType(arg: Expr | undefined, ctx: CompileContext): string | null {
+  if (!arg || ctx.compatMode !== 'rbxts') return null;
+  if (ctx.moduleReturnTypes.size === 0 || !ctx.currentScriptPath) return null;
+  const path = resolveRequirePath(arg, ctx.currentScriptPath);
+  if (!path) return null;
+  return ctx.moduleReturnTypes.get(path) ?? null;
+}
+
+/** Parse a TS type-text string into a TypeNode. Used for Pass 2's
+ *  cached require return types — the cache stores stringified types so
+ *  it can cross compile() invocations cleanly. */
+function parseTypeText(text: string): ts.TypeNode {
+  // Wrap in a `type _T = ...` so the TS parser sees a type position.
+  const sf = ts.createSourceFile('_t.ts', `type _T = ${text};`, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
+  const alias = sf.statements[0];
+  if (alias && ts.isTypeAliasDeclaration(alias)) return alias.type;
+  return factory.createTypeReferenceNode('defined', undefined);
+}
+
+/** True when a signal-method receiver is a typed Event property on a
+ *  known class — e.g. `clickDetector.MouseClick` where ClickDetector
+ *  declares MouseClick as a Roblox Event. In that case Connect/Fire/Wait
+ *  resolve via the @rbxts/types signal type and the Record-routing
+ *  receiver cast is pure noise. */
+function signalReceiverIsTypedEvent(recv: Expr, ctx: CompileContext): boolean {
+  if (recv.type !== 'IndexName') return false;
+  // Prefer the emit-consistent class (tsTypedClassLocal) over the more
+  // optimistic flow-class. flowClassOf for `local hum = WaitForChild("Humanoid", 5)`
+  // returns 'Humanoid' but the emitted type is `Instance | undefined`, so
+  // trusting flow misclassifies `hum.Died` as a typed event. Same caveat
+  // for Gap 1's IsA-narrowed flowClass: the compiler internalizes the
+  // narrowing but the emitted TS type is still the unnarrowed _LuauChild
+  // — skip the flow source unless the receiver wouldn't emit as
+  // _LuauChild.
+  // Only consult flowClassOf when the receiver's emit-time type is also
+  // a class — Gap 1's IsA narrowing puts an Instance subclass in
+  // flowFactByExpr but the emitted TS type is whatever the local was
+  // originally declared as (often `_LuauChild`). Skipping the cast based
+  // on flow alone would leave TS rejecting `.Connect` on `unknown`.
+  // `resolveOracleClassOfExpr` internally consults flowClassOf too, so
+  // gate the result against the same emit-class check.
+  const ownerClass = (() => {
+    if (recv.expr.type === 'Local') {
+      const tracked = ctx.tsTypedClassLocal.get(recv.expr.name);
+      if (tracked) return tracked;
+      return undefined;
+    }
+    return resolveOracleClassOfExpr(recv.expr, ctx);
+  })();
+  if (!ownerClass) return false;
+  if (!apiLookupClassEvent(ownerClass, recv.index)) return false;
+  // api-data says it's an event, but @rbxts/types may not expose it as a
+  // typed RBXScriptSignal (e.g. `Instance.Changed` is `unknown` in
+  // @rbxts/types). Without an RBXScriptSignal-typed slot, dropping the
+  // Record routing leaves a TS2571 (`.Connect` on `unknown`). Require the
+  // oracle to confirm the property type before skipping the cast.
+  const prop = ctx.oracle.propertyType(ownerClass, recv.index);
+  return prop?.kind === 'raw' && prop.text.startsWith('RBXScriptSignal');
 }
 
 /** True when the type text names an Instance-rooted class (or
@@ -487,6 +653,11 @@ function resolveOracleClassOfExpr(expr: Expr, ctx: CompileContext): string | und
   const flowed = flowClassOf(expr, ctx);
   if (flowed) return flowed;
   if (expr.type === 'Global' && ctx.oracle.isService(expr.name)) return expr.name;
+  if (expr.type === 'Local') {
+    const tracked = ctx.tsTypedClassLocal.get(expr.name);
+    if (tracked) return tracked;
+    if (ctx.oracle.isService(expr.name)) return expr.name;
+  }
   if (expr.type === 'IndexName') {
     if (
       (expr.expr.type === 'Global' || expr.expr.type === 'Local')
@@ -569,6 +740,19 @@ function resolveOracleClassOfExpr(expr: Expr, ctx: CompileContext): string | und
     ) {
       const cls = (expr.args[0] as { value: string }).value;
       if (ctx.oracle.isClass(cls)) return cls;
+    }
+    // <Service>.Method(...) / <Service>:Method(...) → return type from oracle
+    // when it's a class. Picks up TweenService.Create → Tween, etc.
+    if (fn.type === 'IndexName') {
+      const recv = fn.expr;
+      const recvClass =
+        (recv.type === 'Global' || recv.type === 'Local')
+          ? (ctx.oracle.isService(recv.name) ? recv.name : ctx.tsTypedClassLocal.get(recv.name))
+          : undefined;
+      if (recvClass) {
+        const ret = ctx.oracle.methodReturnType(recvClass, fn.index, expr.args.length);
+        if (ret?.kind === 'class') return ret.name;
+      }
     }
   }
   return undefined;
@@ -791,6 +975,51 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
     ) {
       initExpr = factory.createObjectLiteralExpression([], false);
     }
+    // Pass 4: wrap init with narrowed-class cast so the local's TS type
+    // matches Pass-4's tsTypedClassLocal narrowing. Only applies when
+    // the existing init type is `Instance` or a supertype of the
+    // narrowing — never widen a more-specific oracle resolution
+    // (`Instance.new("Part", ...)` already returns Part — don't widen
+    // to BasePart).
+    if (
+      ctx.compatMode === 'rbxts'
+      && initExpr
+      && init
+      && initIsOracleTyped(init, ctx)
+      && !v.annotation
+    ) {
+      const narrowed = ctx.instanceNarrowings.get(v.name);
+      if (narrowed) {
+        // Look at the existing resolved class. Skip the wrap when the
+        // init already resolves to a class that's more-specific-or-equal
+        // to the narrowing target.
+        let existingClass: string | undefined;
+        if (
+          init.type === 'Call'
+          && init.func.type === 'IndexName'
+          && INSTANCE_LOOSE_METHODS.has(init.func.index)
+        ) {
+          const loose = resolveLooseMethodCastType(init, ctx);
+          if (loose.kind === 'class') {
+            existingClass = loose.text.replace(/\s*\|\s*undefined\s*$/, '');
+          }
+        }
+        if (!existingClass) existingClass = resolveOracleClassOfExpr(init, ctx);
+        const shouldWrap =
+          !existingClass
+          || existingClass === 'Instance'
+          || (existingClass !== narrowed && ctx.oracle.isA(narrowed, existingClass));
+        if (shouldWrap) {
+          initExpr = factory.createAsExpression(
+            factory.createAsExpression(
+              initExpr,
+              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            ),
+            factory.createTypeReferenceNode(narrowed, undefined),
+          );
+        }
+      }
+    }
     const safeName = safeIdentifier(v.name);
     // Pick JS name: Luau's `local X = …X…` binds to the OUTER X.
     // Rename the new local to a fresh JS name when init captures the same name.
@@ -871,14 +1100,41 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
           !!init && initIsOracleTyped(init, ctx);
         // Only override TS inference for inits TS would type as `unknown`
         // (identifier reads, index access, nil). Typed inits (Instance.new, ctors) stay inferred.
+        // Calls without oracle resolution also produce `unknown` TS-side —
+        // a synthesized shape annotation surfaces the local's downstream
+        // member access for free.
+        // Pass 3: don't shape-narrow when the init is a require with a
+        // cached return type. The require's own `as unknown as <cached>`
+        // already provides the full module shape (including cross-script
+        // promotions); narrowing to observed members only adds a second
+        // `as unknown as <subset>` cast for no benefit, and the subset
+        // misses any methods the consumer hasn't called yet.
+        const initIsCachedRequire =
+          !!init
+          && init.type === 'Call'
+          && init.func.type === 'Global'
+          && init.func.name === 'require'
+          && !!resolveRequireReturnType(init.args[0], ctx);
+        // Empty-or-dict table inits (`local t = {}`, `local t = {k=v}`)
+        // qualify too: the observed-shape collector has full visibility
+        // into how the table is used after init, and synthesizing a
+        // declared type means downstream bracket / property access
+        // skips the Record bridge.
+        const initIsEmptyOrDictTable =
+          !!init
+          && init.type === 'Table'
+          && (init as { items: { key: Expr | null }[] }).items
+            .every((it) => !it.key || it.key.type === 'ConstantString');
         const initIsShapelyCandidate =
-          !initHasOracleType && (
+          !initHasOracleType && !initIsCachedRequire && (
             !init
             || init.type === 'ConstantNil'
             || init.type === 'Local'
             || init.type === 'Global'
             || init.type === 'IndexName'
             || init.type === 'IndexExpr'
+            || (init.type === 'Call' && !resolveOracleClassOfExpr(init, ctx))
+            || initIsEmptyOrDictTable
           );
         if (initIsShapelyCandidate) {
           const inferred = ctx.getShape(v.name) as
@@ -970,7 +1226,36 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       // class survives — suppress the reassign shape-cast so the
       // synthesized literal doesn't clash with the declared class.
       if (ctx.compatMode === 'rbxts' && init && initIsOracleTyped(init, ctx)) {
-        const className = resolveOracleClassOfExpr(init, ctx) ?? 'Instance';
+        // For loose-Instance method Calls, the EMITTED type is what
+        // resolveLooseMethodCastType returns (e.g. `Instance | undefined`
+        // for 2-arg WaitForChild) — not the optimistic name-resolved class.
+        // Use the emit's class so downstream signal-event checks don't see
+        // `Humanoid.Died` when TS sees `hum: Instance`.
+        let className: string | undefined;
+        if (
+          init.type === 'Call'
+          && init.func.type === 'IndexName'
+          && INSTANCE_LOOSE_METHODS.has(init.func.index)
+        ) {
+          const loose = resolveLooseMethodCastType(init, ctx);
+          if (loose.kind === 'class' && !isLuauChildTypeText(loose.text)) {
+            className = loose.text.replace(/\s*\|\s*undefined\s*$/, '');
+          }
+        }
+        if (!className) {
+          className = resolveOracleClassOfExpr(init, ctx) ?? 'Instance';
+        }
+        // Pass 4: prefer the narrowed subclass when observed member
+        // accesses fit a single Instance subclass.
+        const narrowed = ctx.instanceNarrowings.get(v.name);
+        if (narrowed) {
+          // Only narrow if the original is Instance or a supertype of
+          // the narrowed class — avoid widening from FindFirstChildOfClass-
+          // resolved specific classes.
+          if (className === 'Instance' || ctx.oracle.isA(narrowed, className)) {
+            className = narrowed;
+          }
+        }
         ctx.tsTypedClassLocal.set(v.name, className);
         if (
           init.type === 'Call'
@@ -992,7 +1277,42 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
           }
         }
       }
-      if (ctx.compatMode === 'rbxts' && init && exprEmitsLuauChild(init, ctx)) {
+      // Pass 2: require() with cached return shape — track as shape-typed
+      // so downstream `.X` access skips Record routing (the synth
+      // structural type covers each field).
+      if (
+        ctx.compatMode === 'rbxts'
+        && init
+        && init.type === 'Call'
+        && init.func.type === 'Global'
+        && init.func.name === 'require'
+        && resolveRequireReturnType(init.args[0], ctx)
+      ) {
+        ctx.tsShapeTypedLocal.add(v.name);
+        // Register recordMap fields for this local so bracket access on
+        // `<localName>.<recordMapField>` skips the Record bridge.
+        const path = resolveRequirePath(init.args[0]!, ctx.currentScriptPath);
+        if (path) {
+          ctx.requireBoundLocals.set(v.name, path);
+          const fields = ctx.moduleRecordMapFields.get(path);
+          if (fields && fields.length > 0) {
+            ctx.recordMapFields.set(v.name, new Set(fields));
+          }
+        }
+      }
+      if (
+        ctx.compatMode === 'rbxts'
+        && init
+        && exprEmitsLuauChild(init, ctx)
+        && !initIsOracleTyped(init, ctx)
+        // Track only locals whose init expression *itself* gets emitted as
+        // `_LuauChild` — require() calls and dynamic-root chains. Binary
+        // expressions like `hit && hit.Parent` propagate through
+        // `exprEmitsLuauChild` but the actual emit is `hit && X` with no
+        // `as _LuauChild` cast, so the local's TS type isn't `_LuauChild`
+        // and downstream method-call gates can't trust the tracker.
+        && initEmitsLuauChildDirectly(init, ctx)
+      ) {
         ctx.tsLuauChildLocal.add(v.name);
       }
     }
@@ -1162,7 +1482,11 @@ function compileLocalFunction(stat: LocalFunctionStat, ctx: CompileContext): ts.
   // `local function foo() end` → `async function foo() {}` (when needed)
   // with hoisting parity. Use a function declaration so `foo` is callable
   // before its line in TS.
-  const { params, typeParams, returnType, body } = compileFunctionShape(stat.func, ctx);
+  const { params, typeParams, returnType, body } = compileFunctionShape(
+    stat.func,
+    ctx,
+    { enclosingName: stat.name.name },
+  );
   // If the name was already declared as a `let` in this scope (e.g. an
   // earlier `local foo = …`), a function declaration would conflict. Emit
   // assignment to the existing binding instead.
@@ -1235,7 +1559,7 @@ function compileFunctionStat(stat: FunctionStat, ctx: CompileContext): ts.Statem
       undefined,
       factory.createIdentifier(safeIdentifier(stat.name.name)),
       undefined,
-      paramsFromLocals(stat.func.args, ctx, declShapes),
+      paramsFromLocals(stat.func.args, ctx, declShapes, undefined, stat.name.name),
       stat.func.returnAnnotation ? compileTypePack(stat.func.returnAnnotation) : undefined,
       fn.body,
     );
@@ -1525,11 +1849,21 @@ function loopValueCanUseClass(stat: ForInStat, className: string, ctx: CompileCo
         visitExpr(statNode.var);
         visitExpr(statNode.value);
         return;
-      case 'If':
-        visitExpr(statNode.condition);
-        visitStat(statNode.thenBody);
+      case 'If': {
+        // Gap 1: `if x:IsA("Class") then …` narrows x to Class inside
+        // the body via TS's predicate. Skip the unsafe-member check on
+        // the then-body AND on the post-AND condition tail when the
+        // guard names a known class.
+        const narrowed = isaGuardClassFor(statNode.condition, valueLocal, ctx);
+        if (narrowed) {
+          // Skip both condition AND then-body — TS narrows x throughout.
+        } else {
+          visitExpr(statNode.condition);
+          visitStat(statNode.thenBody);
+        }
         visitStat(statNode.elseBody);
         return;
+      }
       case 'While':
       case 'Repeat':
         visitExpr(statNode.condition);
@@ -1555,6 +1889,29 @@ function loopValueCanUseClass(stat: ForInStat, className: string, ctx: CompileCo
   };
   visitStat(stat.body);
   return safe;
+}
+
+/** Return the class name `x:IsA("Y")` narrows `x` to, or null if the
+ *  condition isn't an IsA guard on the named local. Recurses into
+ *  `and`-chains so `x:IsA("Y") and other_check` still narrows. */
+function isaGuardClassFor(cond: Expr, localName: string, ctx: CompileContext): string | null {
+  if (cond.type === 'Group') return isaGuardClassFor(cond.expr, localName, ctx);
+  if (cond.type === 'Binary' && cond.op === 'and') {
+    return isaGuardClassFor(cond.left, localName, ctx)
+      ?? isaGuardClassFor(cond.right, localName, ctx);
+  }
+  if (cond.type === 'Call'
+      && cond.self
+      && cond.func.type === 'IndexName'
+      && cond.func.index === 'IsA'
+      && cond.func.expr.type === 'Local'
+      && cond.func.expr.name === localName
+      && cond.args.length === 1
+      && cond.args[0]?.type === 'ConstantString') {
+    const className = (cond.args[0] as { value: string }).value;
+    if (ctx.oracle.isClass(className)) return className;
+  }
+  return null;
 }
 
 function loopValueUsesMemberAccess(stat: ForInStat): boolean {
@@ -1725,9 +2082,38 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
       seenForIn.add(name);
       return name;
     });
+    // Pass 5: per-var synthesized shape annotations. Apply only when
+    // the iterable wasn't already class-narrowed (`canUseClassElement`)
+    // — the oracle-class beats our synthesized shape every time.
+    const loopVarTypeMap = !canUseClassElement
+      ? (ctx.loopVarTypes.get(stat as unknown) as Map<string, ts.TypeNode> | undefined)
+      : undefined;
     const bodyStatements = ctx.withScope(() => {
       for (const v of stat.vars) ctx.defineLocal(v.name, 'unknown');
-      return compileBlockBody(stat.body, ctx);
+      // When the iterable's element resolves to a class, the value-binding
+      // (second var for two-binding `for k, v in ipairs(arr)`, first var
+      // for single-binding) emits as that class in TS. Mirror that into
+      // tsTypedClassLocal so method-call gates (`receiverClassForMethod`,
+      // `signalReceiverIsTypedEvent`) see the same class TS sees — without
+      // this, `c:IsA("BasePart")` Record-routes despite `c: Instance`.
+      if (canUseClassElement && elementFact?.kind === 'class') {
+        const valueVar = stat.vars.length === 1 ? stat.vars[0]! : stat.vars[1];
+        if (valueVar) ctx.tsTypedClassLocal.set(valueVar.name, elementFact.name);
+      }
+      // Mark Pass-5 typed vars as shape-typed so downstream member-access
+      // gates skip the Record routing path.
+      const trackedShapeVars: string[] = [];
+      if (loopVarTypeMap) {
+        for (const v of stat.vars) {
+          if (loopVarTypeMap.has(v.name)) {
+            ctx.tsShapeTypedLocal.add(v.name);
+            trackedShapeVars.push(v.name);
+          }
+        }
+      }
+      const compiled = compileBlockBody(stat.body, ctx);
+      for (const n of trackedShapeVars) ctx.tsShapeTypedLocal.delete(n);
+      return compiled;
     });
     // Cast to `Array<any>` so the destructured element is `any` (not
     // `unknown`, which trips TS18046 on every body access). Route through
@@ -1745,13 +2131,21 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     const castedIterable = assertExpression(iterableExpr, factory.createArrayTypeNode(elementType));
     if (stat.vars.length === 1) {
       // `for v in arr do` — single binding, value-only iteration.
+      // Pass 5: when we have a synthesized type for this var, annotate
+      // the destructure variable directly. TS narrows the binding to
+      // the named type and downstream `.X.Y` access skips Record
+      // routing without changing the iterable's element type.
+      const singleVarName = stat.vars[0]!.name;
+      const singleVarType = loopVarTypeMap?.get(singleVarName);
       return [
         factory.createForOfStatement(
           undefined,
           factory.createVariableDeclarationList(
             [factory.createVariableDeclaration(
               factory.createIdentifier(forInNames[0]!),
-              undefined, undefined, undefined,
+              undefined,
+              singleVarType,
+              undefined,
             )],
             ts.NodeFlags.Const,
           ),
@@ -1787,14 +2181,34 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
           : castedIterable,
       ],
     );
+    // Pass 5: replace the matching tuple slots with the loop-var's
+    // synthesized type so the destructure binding picks them up
+    // directly. For ipairs the first slot is the numeric index; for
+    // pairs the first slot is the key (string or arbitrary), so it
+    // stays `unknown` unless Pass 5 synthesized a type for it.
+    const tupleSlot = (i: number): ts.TypeNode => {
+      const v = stat.vars[i];
+      const text = v ? loopVarTypeMap?.get(v.name) : undefined;
+      if (text) return text;
+      if (i === 0 && !userWantsPairs) {
+        return factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword);
+      }
+      return factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+    };
     // Keep the iterable typed as tuple entries. A bare `any` iterable
-    // makes roblox-ts assert when lowering the binding pattern.
-    const iterableForFor: ts.Expression = userWantsPairs
+    // makes roblox-ts assert when lowering the binding pattern. On the
+    // ipairs path, we need the tuple cast too when Pass 5 contributes a
+    // var type — otherwise the destructure pulls the element type from
+    // the upstream `Array<_LuauChild>` and `tsShapeTypedLocal` would
+    // mislead downstream gates into skipping Record routing without an
+    // actual narrowed type.
+    const needsTupleCast = userWantsPairs || (loopVarTypeMap && loopVarTypeMap.size > 0);
+    const iterableForFor: ts.Expression = needsTupleCast
       ? assertExpression(
           iterCall,
           factory.createArrayTypeNode(factory.createTupleTypeNode([
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+            tupleSlot(0),
+            tupleSlot(1),
           ])),
         )
       : iterCall;
@@ -2319,15 +2733,24 @@ function buildAssignmentStatement(
       // Cast receiver → Record<string, unknown> so the assignment accepts
       // any RHS; cast key through `unknown as string` so Instance/Player
       // keys flow without TS2538.
-      const recv = factory.createParenthesizedExpression(
-        assertExpression(
-          compileExpr(target.expr, ctx),
-          factory.createTypeReferenceNode('Record', [
-            factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
-            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-          ]),
-        ),
-      );
+      // The recordMap-field skip is not applied in the write path because
+      // Pass 2's `Record<string, defined | undefined>` value type can't
+      // accept an `unknown`-typed RHS (e.g. pcall destructured profile).
+      // Pass 6: when target is a Local whose synthesized shape already
+      // carries `[k: string]: unknown` (observed bracket access), the
+      // declared type accepts the bracket assignment directly.
+      const targetAlreadyIndexed = localShapeHasStringIndexSig(target.expr, ctx);
+      const recv = targetAlreadyIndexed
+        ? compileExpr(target.expr, ctx)
+        : factory.createParenthesizedExpression(
+            assertExpression(
+              compileExpr(target.expr, ctx),
+              factory.createTypeReferenceNode('Record', [
+                factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+              ]),
+            ),
+          );
       const key = assertExpression(compileExpr(indexExpr, ctx), factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword));
       return factory.createExpressionStatement(
         factory.createAssignment(
@@ -2371,6 +2794,36 @@ function compileLValueReceiver(expr: Expr, ctx: CompileContext): ts.Expression {
   // `_LuauChild`.
   const inner = expr.expr;
   if (inner.type === 'Local' || inner.type === 'Global') {
+    // Pass 1: synthesized dynamic-root cast wins over `_LuauChild`.
+    if (inner.type === 'Global' && ctx.scriptParentRootTypes.has(inner.name)) {
+      const synthType = ctx.scriptParentRootTypes.get(inner.name) as ts.TypeNode;
+      const wrapped = factory.createParenthesizedExpression(
+        factory.createAsExpression(compileExpr(inner, ctx), synthType),
+      );
+      return factory.createPropertyAccessExpression(
+        wrapped,
+        factory.createIdentifier(propertyName(expr.index)),
+      );
+    }
+    // Shape-typed local: the local's declared annotation already exposes
+    // the accessed member, so skip the `_LuauChild` bridge.
+    if (inner.type === 'Local' && ctx.tsShapeTypedLocal.has(inner.name)) {
+      return factory.createPropertyAccessExpression(
+        compileExpr(inner, ctx),
+        factory.createIdentifier(propertyName(expr.index)),
+      );
+    }
+    // Gap 3: `self` (→ `this`) in class methods is typed as the class.
+    // Class fields are resolved via the class declaration; skip the
+    // `_LuauChild` bridge. Gating on ctx.selfFieldShapes (set by
+    // class-shape's method compile loop) ensures we only fire inside
+    // recognized class method bodies.
+    if (inner.type === 'Local' && inner.name === 'self' && ctx.selfFieldShapes) {
+      return factory.createPropertyAccessExpression(
+        compileExpr(inner, ctx),
+        factory.createIdentifier(propertyName(expr.index)),
+      );
+    }
     ctx.useLuauChildType();
     const wrapped = factory.createParenthesizedExpression(
       assertExpression(
@@ -2427,9 +2880,13 @@ function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
       ) {
         const cls = ctx.tsTypedClassLocal.get(target.expr.name)!;
         const propType = ctx.oracle.propertyType(cls, target.index);
+        const isSimpleRaw =
+          propType?.kind === 'raw'
+          && /^[A-Z][\w.]*(?:<[^()=]+>)?$/.test(propType.text);
         if (
           propType
           && (propType.kind === 'class'
+              || isSimpleRaw
               || (propType.kind === 'primitive' && propType.name !== 'unknown'))
         ) {
           return factory.createPropertyAccessExpression(
@@ -2441,6 +2898,66 @@ function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
       // Chain receivers (`a.b.c.Size = X`) route the leaf Local through
       // `_LuauChild` so each intermediate `.X` resolves dynamically.
       const receiverExpr = compileLValueReceiver(target.expr, ctx);
+      // Pass 1: when the chain is rooted in a synthesized dynamic root,
+      // the structural typing covers the assignment slot (assigned leaves
+      // are typed `defined` so any RHS satisfies the slot).
+      if (chainRootedInSynthesizedDynamic(target.expr, ctx)) {
+        return factory.createPropertyAccessExpression(
+          receiverExpr,
+          factory.createIdentifier(propertyName(target.index)),
+        );
+      }
+      // Shape-typed Local target whose field shape is leaf (empty) —
+      // shapeToTypeNode emits the field as `unknown` which accepts any
+      // RHS. Plain `.X = Y` typechecks without the Record bridge.
+      // Skip when the field has a nested shape (Disconnect/Connect etc.)
+      // since those narrower types may reject undefined/unknown writes.
+      // Also skip when the local's shape intersects with a real class
+      // (e.g. `{ Team: unknown } & Player`) — the intersection narrows
+      // the field to the class's declared type, which may reject the
+      // RHS. Handles both `local.X = Y` and `local.A.B...X = Y` by
+      // walking the IndexName chain to its Local root.
+      {
+        let rootLocal: { name: string } | null = null;
+        const path: string[] = [target.index];
+        let cur: Expr = target.expr;
+        while (cur.type === 'IndexName' && cur.op === '.') {
+          path.unshift(cur.index);
+          cur = cur.expr;
+        }
+        if (cur.type === 'Local') rootLocal = cur as { name: string };
+        if (
+          rootLocal
+          && ctx.tsShapeTypedLocal.has(rootLocal.name)
+          && !ctx.tsTypedClassLocal.has(rootLocal.name)
+        ) {
+          let curShape = ctx.getShape(rootLocal.name) as
+            | { props?: Map<string, { empty?: boolean; props?: Map<string, unknown>; methods?: Map<string, unknown> }> }
+            | undefined;
+          const rootIntersects = shapeHasClassIntersection(curShape);
+          let leafEmpty = false;
+          let intermediateOk = true;
+          for (let i = 0; i < path.length && curShape; i++) {
+            const fname = path[i]!;
+            const next = curShape.props?.get(fname);
+            if (!next) { intermediateOk = false; break; }
+            if (i === path.length - 1) {
+              leafEmpty = !!next.empty;
+            } else {
+              if (shapeHasClassIntersection(next as { props?: Map<string, unknown>; methods?: Map<string, unknown> })) {
+                intermediateOk = false; break;
+              }
+            }
+            curShape = next as typeof curShape;
+          }
+          if (leafEmpty && intermediateOk && !rootIntersects) {
+            return factory.createPropertyAccessExpression(
+              receiverExpr,
+              factory.createIdentifier(propertyName(target.index)),
+            );
+          }
+        }
+      }
       return factory.createPropertyAccessExpression(
         factory.createParenthesizedExpression(
           factory.createAsExpression(
@@ -2663,9 +3180,20 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
         // declared class — `lbl.Size = new UDim2(...)` doesn't need
         // `... as unknown as UDim2` because `new UDim2(...)` already
         // returns UDim2. The constructor / static-factory macros emit
-        // the value already typed as the class.
+        // the value already typed as the class. Also skip when RHS's
+        // class is a subtype of the prop class (TS handles the downcast):
+        // `panel.Parent = script` is fine without `script as Instance`.
         const rhsClass = resolveOracleClassOfExpr(value, ctx);
-        if (rhsClass && rhsClass === propType.name) {
+        // Static type can be a `datatype:Vector3` etc — match against
+        // the prop's class name to avoid double-casting when compileExpr
+        // already emitted the same type cast on the chain.
+        const rhsStatic = staticTypeOfExpr(value, ctx);
+        const rhsDatatypeMatch = typeof rhsStatic === 'string'
+          && rhsStatic === `datatype:${propType.name}`;
+        if (
+          rhsDatatypeMatch
+          || (rhsClass && (rhsClass === propType.name || ctx.oracle.isA(rhsClass, propType.name)))
+        ) {
           // valueExpr stays as the constructor result — TS sees it as
           // the declared class.
         } else if (isBareUnknownTyped(value, ctx)) {
@@ -2688,10 +3216,27 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
             : valueExpr;
           valueExpr = assertExpression(inner, primNode);
         }
+      } else if (
+        propType?.kind === 'raw'
+        && /^[A-Z][\w.]*(?:<[^()=]+>)?$/.test(propType.text)
+      ) {
+        // Raw types that look like a simple TypeReference (Enum.Material,
+        // AttributeValue, etc) — bridge through `unknown` to satisfy TS.
+        // Skip the cast when RHS already names the same enum (e.g. RHS is
+        // `Enum.Material.Neon`, prop is `Enum.Material` — TS accepts the
+        // assignment directly).
+        const rawRoot = propType.text.split('.')[0];
+        const rhsIsSameEnum =
+          value.type === 'IndexName'
+          && rawRoot === 'Enum'
+          && extractEnumRoot(value) === propType.text;
+        if (!rhsIsSameEnum) {
+          const inner = ts.isBinaryExpression(valueExpr) || ts.isConditionalExpression(valueExpr)
+            ? factory.createParenthesizedExpression(valueExpr)
+            : valueExpr;
+          valueExpr = assertExpression(inner, factory.createTypeReferenceNode(propType.text, undefined));
+        }
       }
-      // For non-class non-primitive property types (Enum unions, raw
-      // textual types), the cast isn't safely expressible without a
-      // bridge — fall back to the receiver-Record cast path.
     }
     // Capture pre-assignment tracked type — the reassign-cast fallback uses
     // it to widen the RHS for primitive-typed locals.
@@ -3033,7 +3578,7 @@ function buildTypeParams(
 function compileFunctionShape(
   fn: FunctionExpr,
   ctx: CompileContext,
-  options: { allowImplicitSelf?: boolean } = {},
+  options: { allowImplicitSelf?: boolean; enclosingName?: string } = {},
 ): CompiledFunction {
   const params: ts.ParameterDeclaration[] = [];
   // `self` first-arg → `this` only for member-position functions; bare
@@ -3088,7 +3633,24 @@ function compileFunctionShape(
   const prevTsOptionalClass = new Set(ctx.tsOptionalClassLocal);
   const prevTsLuauChild = new Set(ctx.tsLuauChildLocal);
   const prevTsShapeTyped = new Set(ctx.tsShapeTypedLocal);
-  for (const p of paramsFromLocals(realArgs, ctx, paramShapes, paramPrimitives)) {
+  // Pass 3: register backprop-typed params in `tsTypedClassLocal` so
+  // downstream macros / receiver gates (Instance.new parent skip etc.)
+  // see them as Instance/etc.
+  const backpropMap = options.enclosingName
+    ? ctx.paramBackpropTypes.get(options.enclosingName)
+    : undefined;
+  if (backpropMap) {
+    for (const arg of realArgs) {
+      const bound = backpropMap.get(arg.name);
+      if (!bound) continue;
+      // Only register known oracle classes (Instance, Player, etc.) —
+      // datatype names like Vector3 aren't tsTypedClassLocal-shaped.
+      if (ctx.oracle.isClass(bound) || bound === 'Instance') {
+        ctx.tsTypedClassLocal.set(arg.name, bound);
+      }
+    }
+  }
+  for (const p of paramsFromLocals(realArgs, ctx, paramShapes, paramPrimitives, options.enclosingName)) {
     params.push(p);
   }
   if (fn.vararg) {
@@ -3224,6 +3786,11 @@ function paramsFromLocals(
    *  than `shapes`: if a param shows up only as `math.floor(p)`, the
    *  shape collector sees nothing, but we still know `p: number`. */
   primitives?: Map<string, 'number' | 'string' | 'boolean'>,
+  /** Pass 3 (param backprop): the enclosing function's name, used to
+   *  consult `ctx.paramBackpropTypes` for call-site-derived param types.
+   *  Wins over `shapes` when present — the call-site observation is
+   *  stronger evidence than the body's shape inference. */
+  enclosingFunctionName?: string,
 ): ts.ParameterDeclaration[] {
   const seen = new Set<string>();
   const out: ts.ParameterDeclaration[] = [];
@@ -3266,24 +3833,36 @@ function paramsFromLocals(
     if (local.annotation) {
       ty = compileType(local.annotation);
     } else if (ctx.compatMode === 'rbxts') {
-      // Primitive inference (math/string usage) wins — it's an honest
-      // constraint, the shape literal is a synthesized guess.
-      const prim = primitives?.get(local.name);
-      if (prim) {
-        ty = factory.createKeywordTypeNode(
-          prim === 'number' ? ts.SyntaxKind.NumberKeyword
-            : prim === 'string' ? ts.SyntaxKind.StringKeyword
-            : ts.SyntaxKind.BooleanKeyword,
-        );
-        hasInferredShape = true;
+      // Pass 3 (call-site backprop): if every call site passes a
+      // consistent class/datatype for this param position, bind that
+      // class directly. Strongest evidence — wins over primitive/shape.
+      const backpropMap = enclosingFunctionName
+        ? ctx.paramBackpropTypes.get(enclosingFunctionName)
+        : undefined;
+      const backpropClass = backpropMap?.get(local.name);
+      if (backpropClass) {
+        ty = factory.createTypeReferenceNode(backpropClass, undefined);
+        if (i < rbxtsOptionalFrom) hasInferredShape = true;
       } else {
-        const shape = shapes?.get(local.name);
-        const fromShape = shape ? shapeToTypeNode(shape) : null;
-        if (fromShape) {
-          ty = fromShape;
+        // Primitive inference (math/string usage) wins next — it's an
+        // honest constraint, the shape literal is a synthesized guess.
+        const prim = primitives?.get(local.name);
+        if (prim) {
+          ty = factory.createKeywordTypeNode(
+            prim === 'number' ? ts.SyntaxKind.NumberKeyword
+              : prim === 'string' ? ts.SyntaxKind.StringKeyword
+              : ts.SyntaxKind.BooleanKeyword,
+          );
           hasInferredShape = true;
         } else {
-          ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+          const shape = shapes?.get(local.name);
+          const fromShape = shape ? shapeToTypeNode(shape) : null;
+          if (fromShape) {
+            ty = fromShape;
+            hasInferredShape = true;
+          } else {
+            ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+          }
         }
       }
     }
@@ -3431,6 +4010,41 @@ function typeFromAnnotation(
  *  Used by cast-skip predicates so we don't drop a needed cast when the
  *  tracked type happens to match the expected slot but the TS-side
  *  declared type does not. */
+/** True when `expr`'s TS-visible type is a class that extends `Instance`.
+ *  Used by the arg-cast skip logic so `new Instance("Part", Workspace)`
+ *  doesn't emit a redundant `as unknown as Instance` on the Workspace arg. */
+function argIsInstanceTyped(expr: Expr, ctx: CompileContext): boolean {
+  if (ctx.compatMode !== 'rbxts') return false;
+  switch (expr.type) {
+    case 'Group':
+    case 'TypeAssertion':
+      return argIsInstanceTyped(expr.expr, ctx);
+    case 'Global':
+      return ctx.oracle.isService(expr.name);
+    case 'Local': {
+      const cls = ctx.tsTypedClassLocal.get(expr.name);
+      return !!cls && ctx.oracle.isA(cls, 'Instance');
+    }
+    case 'Call':
+    case 'IndexName': {
+      const cls = resolveOracleClassOfExpr(expr, ctx);
+      return !!cls && ctx.oracle.isA(cls, 'Instance');
+    }
+    default:
+      return false;
+  }
+}
+
+/** Extracts the enum type from a chain like `Enum.Material.Neon` →
+ *  `Enum.Material`. Returns undefined when the chain isn't enum-shaped. */
+function extractEnumRoot(expr: Expr): string | undefined {
+  if (expr.type !== 'IndexName') return undefined;
+  if (expr.expr.type === 'IndexName' && expr.expr.expr.type === 'Global' && expr.expr.expr.name === 'Enum') {
+    return `Enum.${expr.expr.index}`;
+  }
+  return undefined;
+}
+
 function tsVisibleType(expr: Expr, ctx: CompileContext): StaticValueType {
   switch (expr.type) {
     case 'ConstantInteger':
@@ -3794,6 +4408,17 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
               factory.createIdentifier(propertyName(expr.index)),
             );
           }
+          // Pass 1: when the synthesizer produced a structural type for
+          // this root, cast through it instead of `_LuauChild`.
+          const synthType = ctx.scriptParentRootTypes.get(luauReceiverName) as ts.TypeNode | undefined;
+          if (synthType) {
+            return factory.createPropertyAccessExpression(
+              factory.createParenthesizedExpression(
+                factory.createAsExpression(compiledRoot, synthType),
+              ),
+              factory.createIdentifier(propertyName(expr.index)),
+            );
+          }
           ctx.useLuauChildType();
           return factory.createPropertyAccessExpression(
             factory.createParenthesizedExpression(
@@ -3822,6 +4447,17 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           if (ctx.oracle.propertyType(serviceName, expr.index)) {
             return factory.createPropertyAccessExpression(
               compiledReceiver,
+              factory.createIdentifier(propertyName(expr.index)),
+            );
+          }
+          // Pass 1: synthesized service shape — cast through it instead of
+          // `_LuauChild`. The structural type covers chain accesses.
+          const serviceSynthType = ctx.scriptParentRootTypes.get(serviceName) as ts.TypeNode | undefined;
+          if (serviceSynthType) {
+            return factory.createPropertyAccessExpression(
+              factory.createParenthesizedExpression(
+                factory.createAsExpression(compiledReceiver, serviceSynthType),
+              ),
               factory.createIdentifier(propertyName(expr.index)),
             );
           }
@@ -3971,6 +4607,12 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
             factory.createIdentifier('Parent'),
           );
         }
+        // Pass 1: when the chain is rooted in a dynamic root we synthesized
+        // a shape for, the structural type already provides typing for the
+        // `.Parent` access — no `as _LuauChild` cast needed.
+        if (chainRootedInSynthesizedDynamic(expr, ctx)) {
+          return access;
+        }
         ctx.useLuauChildType();
         return assertExpression(access, factory.createTypeReferenceNode('_LuauChild', undefined));
       }
@@ -4008,15 +4650,42 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
             !!receiverClass
             && ctx.oracle.isA(receiverClass, 'Instance')
             && oracleHasMember(ctx, receiverClass, expr.index);
-          const valueForCast = receiverHasProperty
+          // Pass 1: chains rooted in a synthesized dynamic root carry the
+          // datatype directly (e.g. `script.Parent.CFrame` resolves to
+          // `CFrame` per ROBLOX_PROPERTY_TYPES). Use direct access only
+          // when the datatype actually declares the accessed property —
+          // some scripts use deprecated lowercase aliases (lookVector)
+          // that aren't in @rbxts/types and still need the Record bridge.
+          const receiverIsSynthDynamicRoot =
+            expr.expr.type === 'IndexName'
+            && chainRootedInSynthesizedDynamic(expr.expr, ctx)
+            && !!ctx.oracle.propertyType(dtName, expr.index);
+          // LuauChild-emitting receivers already accept any prop access
+          // (the alias's index sig returns `_LuauChild`). Skip the
+          // Record bridge and go straight to `as unknown as <Datatype>`.
+          const receiverIsLuauChild = exprEmitsLuauChild(expr.expr, ctx);
+          // Pass 6: a shape-typed Local whose synthesized annotation
+          // declares this property (typically as `unknown`) lets TS read
+          // `.X` directly — the `as unknown` bridge isn't needed because
+          // the source is already `unknown`-shaped at the slot.
+          const receiverIsShapeTypedWithProp =
+            expr.expr.type === 'Local'
+            && ctx.tsShapeTypedLocal.has(expr.expr.name)
+            && localObservedShapeHasMember(expr.expr, expr.index, ctx);
+          const valueForCast = receiverHasProperty || receiverIsSynthDynamicRoot
             ? access
-            : factory.createAsExpression(
-                factory.createPropertyAccessExpression(
-                  recordCastExpression(accessReceiver),
-                  factory.createIdentifier(propertyName(expr.index)),
-                ),
-                factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-              );
+            : receiverIsLuauChild || receiverIsShapeTypedWithProp
+              ? factory.createAsExpression(
+                  access,
+                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+                )
+              : factory.createAsExpression(
+                  factory.createPropertyAccessExpression(
+                    recordCastExpression(accessReceiver),
+                    factory.createIdentifier(propertyName(expr.index)),
+                  ),
+                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+                );
           return factory.createAsExpression(
             valueForCast,
             factory.createTypeReferenceNode(dtName, undefined),
@@ -4027,9 +4696,21 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         ctx.compatMode === 'rbxts'
         && shouldRouteDynamicChildRead(expr, ctx)
       ) {
+        // Pass 1: chains rooted in a synthesized dynamic root already
+        // have full structural typing — emit direct access.
+        if (chainRootedInSynthesizedDynamic(expr, ctx)) {
+          return access;
+        }
         if (
           expr.expr.type === 'Local'
           && !ctx.tsTypedClassLocal.has(expr.expr.name)
+          // LuauChild-tracked locals keep the LuauChild route — Record
+          // gives `unknown` from the index sig, breaking downstream method
+          // calls (TS2571). _LuauChild's call/index signatures handle this.
+          && !ctx.tsLuauChildLocal.has(expr.expr.name)
+          // Gap 3: `self.X` inside a class method resolves via the class
+          // declaration — no Record bridge.
+          && !(expr.expr.name === 'self' && ctx.selfFieldShapes)
           && localObservedShapeHasMember(expr.expr, expr.index, ctx)
         ) {
           return factory.createPropertyAccessExpression(
@@ -4050,6 +4731,17 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         && !resolveOracleClassOfExpr(expr.expr, ctx)
         && rootGlobalName(expr.expr) !== 'Enum'
       ) {
+        // Skip when the chain root is a shape-typed Local — the shape
+        // annotation covers each chain link's type, no Record bridge
+        // needed. Pass 6: previously required `!tsTypedClassLocal.has`
+        // to avoid clobbering oracle-class typing, but the Pass-6
+        // shapely-candidate path now produces an `& Instance`
+        // intersection that *is* the oracle class plus the observed
+        // shape — trust it.
+        const rootLocal = chainRootLocal(expr.expr);
+        if (rootLocal && ctx.tsShapeTypedLocal.has(rootLocal)) {
+          return access;
+        }
         return factory.createPropertyAccessExpression(
           recordCastExpression(accessReceiver),
           factory.createIdentifier(propertyName(expr.index)),
@@ -4114,15 +4806,31 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         // Receiver → Record<string, unknown> (not any, no-any rule).
         // Route through `unknown` so typed arrays / records don't TS2352.
         // Index → string so Player/Instance keys don't TS2538.
-        const dynamicTarget = factory.createParenthesizedExpression(
-          assertExpression(
-            target,
-            factory.createTypeReferenceNode('Record', [
-              factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
-              factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-            ]),
-          ),
-        );
+        // Skip the Record wrap when the target already emits as
+        // `_LuauChild` — that alias's `[k: string]: _LuauChild` signature
+        // accepts the bracket access directly, and the cast would replace
+        // the `_LuauChild` result with `unknown`, breaking downstream
+        // method calls.
+        // Also skip when the target chain is `<local>.<recordMapField>` —
+        // Pass 2 typed that field as `Record<string, defined>` directly,
+        // so bracket access typechecks without the bridge.
+        const targetEmitsLuauChild = exprEmitsLuauChild(expr.expr, ctx);
+        const targetIsRecordMapField =
+          expr.expr.type === 'IndexName'
+          && expr.expr.expr.type === 'Local'
+          && ctx.recordMapFields.get(expr.expr.expr.name)?.has(expr.expr.index);
+        const targetHasStringIndex = localShapeHasStringIndexSig(expr.expr, ctx);
+        const dynamicTarget = (targetEmitsLuauChild || targetIsRecordMapField || targetHasStringIndex)
+          ? factory.createParenthesizedExpression(target)
+          : factory.createParenthesizedExpression(
+              assertExpression(
+                target,
+                factory.createTypeReferenceNode('Record', [
+                  factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+                  factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+                ]),
+              ),
+            );
         // Paren-wrap binary/conditional indices first — `as` binds
         // tighter than `??`/`||`/`&&`, so a bare `dir ?? "down" as
         // unknown as string` would only cast the "down" branch and
@@ -4542,6 +5250,15 @@ function compileBinary(
         // suppressed by an outer `as` cast.
         const widenAccess = (e: ts.Expression): ts.Expression => {
           if (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.name)) {
+            // Gap 3: `self.X` inside a class method resolves via the
+            // class declaration — no Record bridge.
+            if (
+              ctx.selfFieldShapes
+              && ts.isIdentifier(e.expression)
+              && e.expression.text === 'self'
+            ) {
+              return e;
+            }
             return factory.createPropertyAccessExpression(
               factory.createParenthesizedExpression(
                 factory.createAsExpression(
@@ -4790,6 +5507,27 @@ function walkLuauNodes(node: unknown, visit: (n: { type: string }) => void): voi
 /** Pre-pass: populate `ctx.yieldingFunctions` with every named function whose
  *  body transitively yields. Fixed-point iteration so a caller picks up its
  *  callee's status across forward references. */
+/** Collect local-variable initializers that are chains rooted in a
+ *  dynamic root (`script`/`workspace`). Used by `inferScriptParentShapes`
+ *  to fold alias accesses into the root's synthesized shape. */
+function collectDynamicAliasInits(root: BlockStat, out: Map<string, Expr>): void {
+  const isDynamicRootChain = (e: Expr): boolean => {
+    let cur: Expr = e;
+    while (cur.type === 'IndexName' && cur.op === '.') cur = cur.expr;
+    return cur.type === 'Global' && (cur.name === 'script' || cur.name === 'workspace');
+  };
+  walkLuauNodes(root, (n) => {
+    if (n.type === 'Local' && 'vars' in n && 'values' in n) {
+      const s = n as unknown as LocalStat;
+      for (let i = 0; i < s.vars.length; i += 1) {
+        const v = s.vars[i]!;
+        const init = s.values[i];
+        if (init && isDynamicRootChain(init)) out.set(v.name, init);
+      }
+    }
+  });
+}
+
 function scanYieldingFunctions(root: BlockStat, ctx: CompileContext): void {
   // 1. Catalog every named function definition reachable from the root.
   const funcBodies = new Map<string, BlockStat>();
@@ -5002,9 +5740,22 @@ function castArgsForCall(
   args: readonly ts.Expression[],
   ctx: CompileContext,
   luauArgs?: readonly Expr[],
+  luauCallee?: Expr,
 ): readonly ts.Expression[] {
   if (ctx.compatMode !== 'rbxts') return args;
   if (!isSimpleCalleeRef(callee)) return args;
+  // Pass 3: when the callee is a known-method on a require-bound local,
+  // the cached return-shape declares its signature as `(...args:
+  // unknown[]) => defined`. Every arg fits the `unknown` rest slot
+  // without a cast — wrapping with `Parameters<typeof mod.fn>[i]` is
+  // pure text noise. Skip the cast entirely for this call.
+  if (
+    luauCallee
+    && luauCallee.type === 'IndexName'
+    && isRequireBoundKnownMethod(luauCallee.expr, luauCallee.index, ctx)
+  ) {
+    return args;
+  }
   const expectedSlot = expectedSlotTypes(callee);
   // (api-data class-method dispatch via expectedSlotTypesForClassMethod is
   //  intentionally disabled here: the hand-coded `expectedSlotTypes` is
@@ -5048,6 +5799,10 @@ function castArgsForCall(
         const tsT = tsVisibleType(luau, ctx);
         if (tsT === expected) return arg;
         if (expected === 'number|string' && (tsT === 'number' || tsT === 'string')) return arg;
+        // Instance-slot acceptance for class-typed expressions. TS will
+        // already see these as Instance subclasses, so the redundant
+        // `as unknown as Instance` cast just adds noise.
+        if (expected === 'instance' && argIsInstanceTyped(luau, ctx)) return arg;
       }
     } else if (
       luauArgs?.[i]
@@ -5068,6 +5823,24 @@ function castArgsForCall(
       // (including untyped locals) is a type-safe no-op — `X as unknown
       // as unknown` is equivalent to `X`. Skip the wrap entirely.
       return arg;
+    }
+    // Pass 3: callee has a backprop-typed param at this position and the
+    // arg's source type is compatible. The function emits the typed
+    // annotation, so the arg goes through TS structural assignment without
+    // the `Parameters<typeof callee>[i]` indirection.
+    if (
+      ts.isIdentifier(callee)
+      && luauArgs?.[i]
+      && ctx.paramBackpropTypes.has(callee.text)
+    ) {
+      const map = ctx.paramBackpropTypes.get(callee.text)!;
+      // paramsFromLocals walks `realArgs` (which mirrors `luauArgs`),
+      // so positional index alignment holds.
+      const paramName = paramNameFromCallee(callee.text, i, ctx);
+      const boundType = paramName ? map.get(paramName) : undefined;
+      if (boundType && argIsCompatibleWithBoundType(luauArgs[i]!, boundType, ctx)) {
+        return arg;
+      }
     }
     if (ts.isParenthesizedExpression(arg) && ts.isAsExpression(arg.expression) && !expected && !ts.isIdentifier(callee)) return arg;
     if (ts.isAsExpression(arg) && !expected && !ts.isIdentifier(callee)) return arg;
@@ -5212,6 +5985,22 @@ function expectedSlotTypes(callee: ts.Expression): ExpectedSlots | undefined {
     // `wait(seconds)` global (deprecated but still common).
     case 'wait':
       return { 0: 'number' };
+    // task.spawn/defer/delay/pcall/xpcall: passing an unknown-typed callback
+    // (a bare local whose value happens to be a function) makes TS unable
+    // to pick between the (callback, ...args) and (thread, ...args)
+    // overloads. The Parameters<> cast disambiguates. Don't blanket-skip.
+    // Leave these as fall-through.
+    // Debris.AddItem(Instance, number) — common helper, both args
+    // typed.
+    case 'Debris.AddItem':
+      return { 0: 'instance', 1: 'number' };
+    // TweenService.Create(Instance, TweenInfo, dict). Arg 0 benefits
+    // from the Instance-slot skip when receiver is typed. Arg 2 (dict)
+    // must keep its `Parameters<>` wrap — TS validates the dict against
+    // `Partial<ExtractMembers<T0, Tweenable>>` and rejects `Size` etc.
+    // when T0 isn't narrowed to BasePart (Instance has no such member).
+    case 'TweenService.Create':
+      return { 0: 'instance' };
     // Roblox datatype static factories — all numeric args.
     case 'Color3.fromRGB':
     case 'Color3.fromHSV':
@@ -5566,10 +6355,23 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     // where the receiver is a union of incompatible RBXScriptSignal<T>.
     const receiverIsIndexExpr =
       ctx.compatMode === 'rbxts' && expr.func.expr.type === 'IndexExpr';
+    // Signal-method receiver cast fires for `.Connect`/`.Fire`/`.Wait` on
+    // chained receivers (`obj.Signal:Connect(...)`). But when the chain
+    // root resolves to a class whose member `<index>` is declared as an
+    // Event in api-data, the receiver IS a typed RBXScriptSignal — no
+    // cast needed.
+    const recvEmitsLuauChildForGate =
+      ctx.compatMode === 'rbxts'
+      && exprEmitsLuauChild(expr.func.expr, ctx);
     const isSignalMethod =
       ctx.compatMode === 'rbxts'
       && SIGNAL_METHODS.has(expr.func.index)
-      && (expr.func.expr.type === 'IndexName' || expr.func.expr.type === 'Call');
+      && (expr.func.expr.type === 'IndexName' || expr.func.expr.type === 'Call')
+      && !signalReceiverIsTypedEvent(expr.func.expr, ctx)
+      // `_LuauChild`'s call signature (`(...args: unknown[]): _LuauChild`)
+      // accepts any signal-method call directly — the Record cast is
+      // redundant when the receiver already emits as `_LuauChild`.
+      && !recvEmitsLuauChildForGate;
     const receiverClassForMethod =
       ctx.compatMode === 'rbxts'
         ? flowClassOf(expr.func.expr, ctx)
@@ -5591,12 +6393,29 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       && expr.func.expr.type === 'Local'
       && !ctx.tsTypedClassLocal.has(expr.func.expr.name)
       && !ctx.tsShapeTypedLocal.has(expr.func.expr.name)
+      // tsLuauChildLocal locals are now tracked only when the init's
+      // emission directly types the local as `_LuauChild` — those accept
+      // any method via the call signature.
+      && !ctx.tsLuauChildLocal.has(expr.func.expr.name)
       && !ctx.preInferredParamType.has(expr.func.expr.name)
       && localObservedShapeHasMember(expr.func.expr, expr.func.index, ctx);
+    // LuauChild bypasses Record routing only for methods whose call result
+    // is consumed directly (no `as <SpecificType>` post-cast that would
+    // reject `_LuauChild`). GetAttribute applies a post-cast to
+    // AttributeValue — keep its routing so the call result is `unknown`,
+    // bridgeable to AttributeValue.
+    const luauChildBypassesUnknownChain =
+      recvEmitsLuauChildForGate
+      && expr.func.index !== 'GetAttribute';
     const receiverIsUnknownChain =
       ctx.compatMode === 'rbxts'
       && expr.func.expr.type === 'IndexName'
       && !receiverClassForMethod
+      && !signalReceiverIsTypedEvent(expr.func.expr, ctx)
+      && !luauChildBypassesUnknownChain
+      // Pass 1: chains rooted in a synthesized dynamic root carry full
+      // structural typing — every leg already resolves cleanly.
+      && !chainRootedInSynthesizedDynamic(expr.func.expr, ctx)
       && rootGlobalName(expr.func.expr) !== 'Enum';
     const dynamicInstanceMethod =
       ctx.compatMode === 'rbxts'
@@ -5607,16 +6426,19 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     // post-cast result types (`Instance | undefined`, etc.) that the
     // direct path on `_LuauChild` doesn't surface correctly. Skip the
     // routing in the LuauChild-receiver case.
+    // _LuauChild's `(...args: unknown[]): _LuauChild` call signature
+    // accepts any method invocation directly — the Record detour is only
+    // necessary for methods whose call result feeds a downstream
+    // type-specific post-cast that `_LuauChild` can't satisfy.
+    // GetAttribute → AttributeValue, GetPivot → CFrame need explicit
+    // bridges. INSTANCE_LOOSE_METHODS already bridge through `unknown`
+    // in their post-cast code (sourceNeedsBridge fires when receiver
+    // emits LuauChild), so they can also skip routing.
+    const luauChildPostCastNeedsBridge =
+      expr.func.index === 'GetPivot';
     const skipLuauChildRouting =
       receiverEmitsLuauChild
-      && (
-        INSTANCE_LOOSE_METHODS.has(expr.func.index)
-        || expr.func.index === 'Clone'
-        || expr.func.index === 'Destroy'
-        || expr.func.index === 'IsA'
-        || expr.func.index === 'GetChildren'
-        || expr.func.index === 'GetDescendants'
-      );
+      && !luauChildPostCastNeedsBridge;
     const needsReceiverCast =
       receiverIsIndexExpr
       || isSignalMethod
@@ -5685,7 +6507,7 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     call = factory.createCallExpression(
       calleeAccess,
       undefined,
-      castArgsForCall(calleeAccess, args, ctx, expr.args),
+      castArgsForCall(calleeAccess, args, ctx, expr.args, expr.func),
     );
   } else if (ctx.compatMode === 'rbxts' && expr.func.type === 'IndexExpr') {
     // rbxts: `obj[k](...)` — recast through a call signature so the
@@ -5739,11 +6561,18 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       if (
         ctx.compatMode === 'rbxts'
         && expr.func.type === 'IndexName'
+        && !isRequireBoundKnownMethod(expr.func.expr, expr.func.index, ctx)
         && (
           exprEmitsLuauChild(expr.func.expr, ctx)
           || (
             expr.func.expr.type === 'Local'
             && !ctx.tsTypedClassLocal.has(expr.func.expr.name)
+            // Pass 6: shape-typed locals already declare the called
+            // member via the synthesized annotation (whether as a method
+            // signature in the shape or via the `& Instance` intersection
+            // when the member is an Instance API like GetAttribute). The
+            // structural callable cast adds pure text noise on these.
+            && !ctx.tsShapeTypedLocal.has(expr.func.expr.name)
             && localObservedShapeHasMember(expr.func.expr, expr.func.index, ctx)
           )
         )
@@ -5755,7 +6584,7 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       ) {
         calleeExpr = unknownCallableCastExpression(calleeExpr);
       }
-      call = factory.createCallExpression(calleeExpr, undefined, castArgsForCall(calleeExpr, args, ctx, expr.args));
+      call = factory.createCallExpression(calleeExpr, undefined, castArgsForCall(calleeExpr, args, ctx, expr.args, expr.func));
     }
   }
   // rbxts: cast loose-Instance method results (`Instance | undefined`
@@ -5782,8 +6611,13 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       // union of every possible attribute primitive. Emitting `as unknown`
       // wasted information and forced every downstream use through a
       // second cast; route the call result to the oracle-declared type.
+      // LuauChild-typed receiver call results are _LuauChild — bridge
+      // through unknown so the AttributeValue cast doesn't trip TS2352.
+      const receiverIsLuauChildForCast = exprEmitsLuauChild(expr.func.expr, ctx);
       call = factory.createAsExpression(
-        call,
+        receiverIsLuauChildForCast
+          ? factory.createAsExpression(call, factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword))
+          : call,
         factory.createTypeReferenceNode('AttributeValue', undefined),
       );
     } else {
@@ -5821,14 +6655,31 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     && expr.func.type === 'Global'
     && expr.func.name === 'require'
   ) {
-    ctx.useLuauChildType();
-    call = factory.createAsExpression(
-      factory.createAsExpression(
-        call,
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-      ),
-      factory.createTypeReferenceNode('_LuauChild', undefined),
-    );
+    // Pass 2: try the corpus require-type cache first. If the require
+    // argument resolves to a known module path, use its inferred return
+    // shape instead of the `_LuauChild` fallback.
+    const cachedTypeText = resolveRequireReturnType(expr.args[0], ctx);
+    if (cachedTypeText) {
+      call = factory.createAsExpression(
+        factory.createAsExpression(
+          call,
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        // Parse the cached type text into a TS type node via a parsed
+        // source file. The strings come from our own analyzer so they
+        // always parse.
+        parseTypeText(cachedTypeText),
+      );
+    } else {
+      ctx.useLuauChildType();
+      call = factory.createAsExpression(
+        factory.createAsExpression(
+          call,
+          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        ),
+        factory.createTypeReferenceNode('_LuauChild', undefined),
+      );
+    }
   }
   if (
     ctx.compatMode === 'rbxts'
@@ -5924,6 +6775,52 @@ function localObservedShapeHasMember(expr: Expr, member: string, ctx: CompileCon
   return !!shape && (!!shape.props?.has(member) || !!shape.methods?.has(member));
 }
 
+/** Pass 6: true when `expr` is a shape-typed Local whose synthesized
+ *  shape carries a string-keyed index signature (from observed bracket
+ *  access in the script). The local's declared TS type already accepts
+ *  `t[k]` directly, so the runtime-key bracket-access Record bridges
+ *  in compileExpr's IndexExpr path AND in buildAssignmentStatement's
+ *  rbxts write path are pure noise — both can skip.
+ *
+ *  Excludes array-shaped locals (`{push, pop, ...}` observed methods)
+ *  because shapeToTypeNode renders those as `Array<defined>` with a
+ *  numeric index signature; a string-key bracket access on `Array<T>`
+ *  trips TS7015 under noImplicitAny. */
+const ARRAY_SHAPE_METHODS = new Set([
+  'push', 'pop', 'shift', 'unshift', 'insert', 'remove',
+  'indexOf', 'lastIndexOf', 'join', 'concat', 'find',
+  'forEach', 'map', 'filter', 'reduce',
+]);
+function localShapeHasStringIndexSig(expr: Expr, ctx: CompileContext): boolean {
+  if (expr.type !== 'Local') return false;
+  if (!ctx.tsShapeTypedLocal.has(expr.name)) return false;
+  const shape = ctx.getShape(expr.name) as
+    | { indexed?: boolean; methods?: Map<string, unknown> }
+    | undefined;
+  if (!shape?.indexed) return false;
+  if (shape.methods) {
+    for (const m of shape.methods.keys()) {
+      if (ARRAY_SHAPE_METHODS.has(m)) return false;
+    }
+  }
+  return true;
+}
+
+/** Pass 3: true when `expr` is a Local bound to `require(...)` AND
+ *  `member` is recorded as a 'method' in the corpus index's exported
+ *  members for that module. The require result is cast to a structural
+ *  type that already declares `member(...args): defined`, so TS sees
+ *  `mod.member(...)` as callable — emitting the structural
+ *  `unknownCallableCastExpression` or the per-arg
+ *  `Parameters<typeof mod.member>[i]` wraps adds pure text noise. */
+function isRequireBoundKnownMethod(expr: Expr, member: string, ctx: CompileContext): boolean {
+  if (expr.type !== 'Local') return false;
+  const path = ctx.requireBoundLocals.get(expr.name);
+  if (!path) return false;
+  const members = ctx.moduleExportedMembers.get(path);
+  return members?.get(member) === 'method';
+}
+
 function rootGlobalName(expr: Expr): string | null {
   let cur: Expr = expr;
   while (cur.type === 'IndexName' || cur.type === 'IndexExpr' || cur.type === 'Call') {
@@ -5997,12 +6894,54 @@ function exprMayCompileAsLuauChild(expr: Expr, ctx: CompileContext): boolean {
     case 'IndexExpr':
       return exprMayCompileAsLuauChild(expr.expr, ctx);
     case 'Call':
+      // A Call that resolves to a known class (services, Instance.new,
+      // datatype factories, oracle method returns) emits as a typed value,
+      // not _LuauChild. Bail before the chain-root heuristic mislabels it.
+      if (ctx.compatMode === 'rbxts' && resolveOracleClassOfExpr(expr, ctx)) return false;
       return exprMayCompileAsLuauChild(expr.func, ctx);
     case 'Group':
     case 'TypeAssertion':
       return exprMayCompileAsLuauChild(expr.expr, ctx);
     default:
       return false;
+  }
+}
+
+/** True when the init expression's emission directly produces a value
+ *  typed `_LuauChild` (require() call, dynamic-root chain, navigation
+ *  method whose oracle result is `_LuauChild`). Excludes Binary
+ *  expressions and other forms that propagate `exprEmitsLuauChild`
+ *  internally but emit as a union without the explicit `as _LuauChild`
+ *  cast. Used to keep `tsLuauChildLocal` consistent with TS-side types. */
+function initEmitsLuauChildDirectly(expr: Expr, ctx: CompileContext): boolean {
+  switch (expr.type) {
+    case 'Group':
+    case 'TypeAssertion':
+      return initEmitsLuauChildDirectly(expr.expr, ctx);
+    case 'Local':
+      return ctx.tsLuauChildLocal.has(expr.name);
+    case 'IndexName':
+      // `.Parent`/etc. emit with explicit `as _LuauChild`.
+      if (expr.index === 'Parent') return true;
+      return initEmitsLuauChildDirectly(expr.expr, ctx);
+    case 'Call':
+      if (expr.func.type === 'Global' && expr.func.name === 'require') {
+        // Pass 2: when the require resolves via the corpus cache, the
+        // post-cast is the structural return type (not `_LuauChild`).
+        if (resolveRequireReturnType(expr.args[0], ctx)) return false;
+        return true;
+      }
+      if (
+        expr.self
+        && expr.func.type === 'IndexName'
+        && INSTANCE_LOOSE_METHODS.has(expr.func.index)
+      ) {
+        const resolved = resolveLooseMethodCastType(expr, ctx);
+        return resolved.kind === 'class' && isLuauChildTypeText(resolved.text);
+      }
+      return exprMayCompileAsLuauChild(expr, ctx);
+    default:
+      return exprMayCompileAsLuauChild(expr, ctx);
   }
 }
 
@@ -6018,7 +6957,12 @@ function exprEmitsLuauChild(expr: Expr, ctx: CompileContext): boolean {
       if (expr.index === 'Parent') return true;
       return exprEmitsLuauChild(expr.expr, ctx);
     case 'Call':
-      if (expr.func.type === 'Global' && expr.func.name === 'require') return true;
+      if (expr.func.type === 'Global' && expr.func.name === 'require') {
+        // Pass 2: require resolved through the corpus cache — structural
+        // type, not _LuauChild.
+        if (resolveRequireReturnType(expr.args[0], ctx)) return false;
+        return true;
+      }
       if (
         expr.self
         && expr.func.type === 'IndexName'
@@ -6421,6 +7365,31 @@ export interface CompileOptions {
   /** Explicitly enable both layers, even if `postEmitCheck` /
    *  `preEmitCheck` were set to false individually. */
   typeCheck?: boolean;
+  /** Pass 2 (Architectural Phase 3 finish): cross-script require()
+   *  inference. Map of corpus module path → inferred return-type text.
+   *  At `require(X)` emit time, the path argument is resolved against
+   *  the current script's path; if a cached return type exists, it
+   *  replaces the `_LuauChild` fallback. Built by the CLI/stress driver
+   *  via a pre-pass over the corpus. */
+  moduleReturnTypes?: Map<string, string>;
+  /** Pass 2 extension: module path → field names typed as
+   *  `Record<string, defined>` (empty-table init pattern). Consumer
+   *  scripts skip the bracket-access Record bridge when chaining into
+   *  one of these fields. */
+  moduleRecordMapFields?: Map<string, string[]>;
+  /** Pass 3: per-module exported-member kind map. Keyed by corpus
+   *  path; value is `memberName → 'method' | 'property' | 'recordMap'`.
+   *  Same data analyzeModuleReturn produced as a TypeNode, kept in
+   *  structured form so per-script compile() can skip the structural
+   *  callable cast on calls to known-method members of require-bound
+   *  locals. */
+  moduleExportedMembers?: Map<string, Map<string, 'method' | 'property' | 'recordMap'>>;
+  /** Corpus path for this script (Roblox instance path or filesystem
+   *  path-sans-extension), used as the lookup key for cross-script
+   *  `require()` resolution. Distinct from `sourceFile`, which feeds the
+   *  source map's `sources` field — they're conflated only when this
+   *  option is absent, in which case `sourceFile` is used for both. */
+  corpusPath?: string;
 }
 
 export interface CompileResult {
@@ -6449,6 +7418,10 @@ export async function compile(
   const parsed = await parse(source);
   const ctx = new CompileContext(options.compatMode ?? 'native');
   ctx.staticTypeOf = (expr) => staticTypeOfExpr(expr as Expr, ctx);
+  if (options.moduleReturnTypes) ctx.moduleReturnTypes = options.moduleReturnTypes;
+  if (options.moduleRecordMapFields) ctx.moduleRecordMapFields = options.moduleRecordMapFields;
+  if (options.moduleExportedMembers) ctx.moduleExportedMembers = options.moduleExportedMembers;
+  ctx.currentScriptPath = options.corpusPath ?? options.sourceFile ?? '';
   // rbxts mode: split inline `:WaitForChild():WaitForChild()` instance-nav
   // chains into named locals so each link's oracle-resolved class flows
   // cleanly (instead of getting absorbed by a single `as X` at the end).
@@ -6591,6 +7564,55 @@ export async function compile(
     const rootNames = collectLocalNames(rootBlock);
     rootShapes = collectShapes(rootBlock, rootNames);
     ctx.pushShapeScope(rootShapes as Map<string, unknown>);
+  }
+  // Pass 1 (Architectural Phase 3 finish): per-script class-shape
+  // inference for dynamic roots (`script`, `workspace`). Synthesizes a
+  // structural type from observed accesses and stashes the result so
+  // compileExpr / compileLocal can cast through the synthesized shape
+  // instead of routing chains through `_LuauChild`.
+  let scriptParentDecls: ts.Statement[] = [];
+  if (ctx.compatMode === 'rbxts' && rootBlock) {
+    const aliasInits = new Map<string, Expr>();
+    collectDynamicAliasInits(rootBlock, aliasInits);
+    const inf = inferScriptParentShapes(rootBlock, ctx.oracle, aliasInits);
+    ctx.scriptParentRootTypes = inf.rootTypes as Map<string, unknown>;
+    ctx.scriptParentAliasTypes = inf.aliasTypes as Map<string, unknown>;
+    scriptParentDecls = inf.declarations;
+  }
+  // Pass 3: same-script function param backprop. Bind concrete TS types
+  // for params whose call sites all pass arguments of a consistent
+  // class/datatype. `paramsFromLocals` consults the result.
+  if (ctx.compatMode === 'rbxts' && rootBlock) {
+    const bp = inferParamBackprop(rootBlock, ctx.oracle);
+    ctx.paramBackpropTypes = bp.types;
+    ctx.paramBackpropParamNames = bp.paramNames;
+  }
+  // Pass 4: narrow Instance-typed locals to specific subclasses (BasePart,
+  // GuiButton, etc.) when observed member access fits a single class.
+  if (ctx.compatMode === 'rbxts' && rootBlock) {
+    const allLocals = new Set<string>();
+    walkLuauNodes(rootBlock, (n) => {
+      if (n.type === 'Local' && 'vars' in n) {
+        for (const v of (n as unknown as LocalStat).vars) allLocals.add(v.name);
+      } else if (n.type === 'ForIn' && 'vars' in n) {
+        // Include for-loop bindings (`for k, v of iterable do … end`).
+        for (const v of (n as unknown as { vars: { name: string }[] }).vars) {
+          allLocals.add(v.name);
+        }
+      }
+    });
+    ctx.instanceNarrowings = inferInstanceNarrowings(rootBlock, allLocals, ctx.oracle);
+  }
+  // Pass 5: loop-var shape inference. For each `for ... in ...` stat,
+  // walk its body to collect each loop variable's observed access
+  // pattern, synthesize a TS type so downstream member access bypasses
+  // the Record routing path. Same `defined`/`Instance` fallback rules
+  // as Pass 1.
+  let loopVarDecls: ts.Statement[] = [];
+  if (ctx.compatMode === 'rbxts' && rootBlock) {
+    const lv = inferLoopVarShapes(rootBlock, ctx.oracle);
+    ctx.loopVarTypes = lv.byStat as Map<unknown, Map<string, unknown>>;
+    loopVarDecls = lv.declarations;
   }
   const stmts: ts.Statement[] = rootBlock ? compileBlockBody(rootBlock, ctx) : [];
   if (rootShapes) ctx.popShapeScope();
@@ -6868,6 +7890,9 @@ export async function compile(
     );
   }
   allStatements.push(...implicitGlobalDecls);
+  // Pass 1: type aliases for synthesized script/workspace shapes.
+  allStatements.push(...scriptParentDecls);
+  allStatements.push(...loopVarDecls);
   allStatements.push(...stmts);
 
   // Force module shape so top-level `await` is legal. Append `export {};`

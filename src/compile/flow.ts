@@ -58,6 +58,63 @@ function oracleTypeToFact(type: ReturnType<CompileContext['oracle']['propertyTyp
   return { kind: 'unknown' };
 }
 
+/** Gap 1: collect local-name → narrowed class FlowFact from a type-guard
+ *  conditional. Supported forms:
+ *    - `x:IsA("ClassName")`
+ *    - `typeof(x) == "Instance"` (narrows to Instance)
+ *    - logical-AND chains of the above.
+ *  Returns an empty map when the condition isn't a recognized guard. */
+function collectTypeGuardNarrowings(expr: P.Expr, ctx: CompileContext): Map<string, FlowFact> {
+  const out = new Map<string, FlowFact>();
+  const visit = (e: P.Expr): void => {
+    switch (e.type) {
+      case 'Group':
+        visit(e.expr);
+        return;
+      case 'Binary': {
+        // `A and B` → both narrowings apply in the truthy branch.
+        if (e.op === 'and') {
+          visit(e.left);
+          visit(e.right);
+        }
+        // `typeof(x) == "Class"` form.
+        if (e.op === '==') {
+          const leftCall = e.left.type === 'Call' ? e.left : null;
+          const rightStr = stringLit(e.right);
+          if (leftCall && rightStr && leftCall.func.type === 'Global' && leftCall.func.name === 'typeof' && leftCall.args.length === 1) {
+            const arg = leftCall.args[0]!;
+            if (arg.type === 'Local' && ctx.oracle.isClass(rightStr)) {
+              out.set(arg.name, { kind: 'class', name: rightStr });
+            }
+          }
+        }
+        return;
+      }
+      case 'Call': {
+        // `x:IsA("ClassName")` pattern: self-call, func is IndexName(x, 'IsA'),
+        // arg[0] is a constant string naming a known class.
+        if (
+          e.self
+          && e.func.type === 'IndexName'
+          && (e.func.index === 'IsA' || e.func.index === 'IsDescendantOf')
+          && e.func.expr.type === 'Local'
+          && e.args.length === 1
+        ) {
+          const className = stringLit(e.args[0]);
+          if (e.func.index === 'IsA' && className && ctx.oracle.isClass(className)) {
+            out.set(e.func.expr.name, { kind: 'class', name: className });
+          }
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  };
+  visit(expr);
+  return out;
+}
+
 function expressionFact(
   expr: P.Expr,
   env: Env,
@@ -333,8 +390,13 @@ function visitStat(
       return;
     case 'If': {
       observeExpression(stat.condition, env, ctx, facts);
+      // Gap 1: flow-narrow on type guards like `x:IsA("Player")`. The
+      // truthy branch knows x is the named class; mirror that as a
+      // FlowFact for the inner scope.
+      const guardNarrowings = collectTypeGuardNarrowings(stat.condition, ctx);
       if (stat.thenBody.type === 'Block') {
         const inner: Env = { scope: new Map(), parent: env };
+        for (const [name, fact] of guardNarrowings) inner.scope.set(name, fact);
         visitBlock(stat.thenBody, inner, ctx, facts, localFinalFacts);
       } else {
         visitStat(stat.thenBody, env, ctx, facts, localFinalFacts);

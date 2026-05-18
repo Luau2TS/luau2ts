@@ -125,6 +125,71 @@ export class CompileContext {
    *  overlap with Roblox class interfaces. */
   readonly tsLuauChildLocal = new Set<string>();
 
+  /** Phase 1 (Architectural Phase 3 finish): per-script synthesized type
+   *  for the bare `script` / `workspace` global. compileExpr's dynamic-
+   *  root path consults this so the chain casts through the synthesized
+   *  shape instead of `_LuauChild`. */
+  scriptParentRootTypes: Map<string, unknown> = new Map();
+
+  /** Per-alias-local synthesized type, for `local model = script.Parent`
+   *  style alias bindings. compileLocal reads this and casts the init. */
+  scriptParentAliasTypes: Map<string, unknown> = new Map();
+
+  /** Pass 2: cross-script require() inference cache. Module path →
+   *  inferred return-type text. */
+  moduleReturnTypes: Map<string, string> = new Map();
+
+  /** Pass 2 extension: module path → recordMap field names. */
+  moduleRecordMapFields: Map<string, string[]> = new Map();
+
+  /** Pass 3: module path → exported-member kind map ('method' for fns
+   *  declared as `function M.foo()` or `M.foo = function`, 'property'
+   *  for plain assignments, 'recordMap' for `M.foo = {}`). Used to
+   *  decide whether a `mod.foo(...)` call needs the structural callable
+   *  cast — for 'method' members, the cached return-type already
+   *  declares `foo(...args): defined`, so TS sees the call as typed and
+   *  the cast is pure noise. */
+  moduleExportedMembers: Map<string, Map<string, 'method' | 'property' | 'recordMap'>> = new Map();
+
+  /** Pass 3: per-script set of locals bound to `require(...)` whose
+   *  cached return-shape is known. Keyed by local name; value is the
+   *  corpus path of the required module so call-site lookups can index
+   *  `moduleExportedMembers` directly without re-resolving the require
+   *  argument every time. */
+  readonly requireBoundLocals = new Map<string, string>();
+
+  /** Pass 5: per-ForInStat → per-var → synthesized TS type node, set
+   *  by inferLoopVarShapes. compileForIn consults this to annotate the
+   *  destructured loop variable so downstream `.X.Y` access bypasses
+   *  the Record routing path. */
+  loopVarTypes: Map<unknown, Map<string, unknown>> = new Map();
+
+  /** Pass 2: the script's own corpus path, used as the anchor for
+   *  resolving `require(script.Parent.X)` patterns. */
+  currentScriptPath = '';
+
+  /** Pass 3: function-name → param-name → inferred TS-type-text. Set
+   *  by `inferParamBackprop`; consulted by `paramsFromLocals` so a
+   *  consistently-typed argument binds a real param annotation. */
+  paramBackpropTypes: Map<string, Map<string, string>> = new Map();
+
+  /** Pass 3: function-name → ordered param names. Used by
+   *  `castArgsForCall` to map a positional arg to its declared param
+   *  name, then look up the backprop type. */
+  paramBackpropParamNames: Map<string, string[]> = new Map();
+
+  /** Pass 4: local-name → narrowed Instance subclass. Inferred from
+   *  observed member accesses (`light.Color` + `light.Material` ⇒
+   *  BasePart). `compileLocal` reads this and casts the init into the
+   *  narrowed class so downstream property access skips Record routing. */
+  instanceNarrowings: Map<string, string> = new Map();
+
+  /** Pass 2 extension: per-local set of fields that Pass-2 synthesis
+   *  typed as `Record<string, defined>` (empty-table-literal init pattern
+   *  e.g. `module.Profiles = {}`). Used by bracket-access code to skip
+   *  the Record bridge when the chain hits such a field. */
+  recordMapFields: Map<string, Set<string>> = new Map();
+
   /** Set by the backprop pass: locals whose downstream usage proves they are
    *  Instance-shaped. compileLocalStat wraps the init through
    *  `as unknown as Instance` so the local's TS type matches the inferred

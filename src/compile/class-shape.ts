@@ -455,10 +455,26 @@ export function compileClassPattern(
     if (aggregatedSelfShape) {
       ctx.selfFieldShapes = (aggregatedSelfShape as import('./shape-infer.js').Shape).props as unknown as Map<string, unknown>;
     }
+    // Pass 6: mark shape-typed params as `tsShapeTypedLocal` for the
+    // duration of the body compile so downstream Record-routing /
+    // callable-cast gates see them as having declared structural types
+    // (mirrors compileFunctionShape's same-named logic — class methods
+    // were the gap). Scope-restored after the body.
+    const trackedShapeParams: string[] = [];
+    if (methodShapes && ctx.compatMode === 'rbxts') {
+      for (const a of fnArgs) {
+        const sh = methodShapes.get(a.name);
+        if (sh && !sh.empty && !ctx.tsShapeTypedLocal.has(a.name)) {
+          ctx.tsShapeTypedLocal.add(a.name);
+          trackedShapeParams.push(a.name);
+        }
+      }
+    }
     const rawBody = ctx.withScope(() => {
       for (const a of fnExpr.args ?? []) ctx.defineLocal(a.name, 'unknown');
       return compileBlockBody(fnExpr.body as Stat, ctx);
     });
+    for (const n of trackedShapeParams) ctx.tsShapeTypedLocal.delete(n);
     ctx.selfFieldShapes = prevSelfFieldShapes;
     if (methodShapes) ctx.popShapeScope();
     // Restore preInferredParamType snapshot.

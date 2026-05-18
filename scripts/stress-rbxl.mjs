@@ -73,11 +73,29 @@ const stats = {
   byScript: [],
 };
 
+// Pass 2 pre-pass: parse each module, infer its return-shape, build a
+// corpus-wide cache compile() can consult at require() emit time. The
+// same helper drives the CLI's directory and project modes, so harness
+// and CLI stay in lockstep on cross-script behavior.
+let moduleReturnTypes = new Map();
+let moduleRecordMapFields = new Map();
+let moduleExportedMembers = new Map();
+if (compatMode === 'rbxts') {
+  const { buildCorpusIndex, deriveCompileMaps } = await import('../dist/compile/cross-script/index.js');
+  const corpusScripts = targets.map((s) => ({
+    corpusPath: s.path,
+    source: s.source,
+    scriptKind: s.className === 'ModuleScript' ? 'ModuleScript' : undefined,
+  }));
+  const index = await buildCorpusIndex(corpusScripts);
+  ({ moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers } = deriveCompileMaps(index));
+}
+
 const t0 = Date.now();
 for (const s of targets) {
   let result;
   try {
-    result = await compile(s.source, { sourceFile: s.path, pretty: false, compatMode });
+    result = await compile(s.source, { sourceFile: s.path, corpusPath: s.path, pretty: false, compatMode, moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers });
     if (dumpDir && result.source) {
       // Mirror the script's instance path under dumpDir/. Trim the
       // leading slash so the resolve doesn't escape dumpDir on Windows.
