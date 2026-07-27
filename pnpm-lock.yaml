@@ -17,7 +17,7 @@ importers:
     devDependencies:
       '@rbxts/types':
         specifier: ^1.0.920
-        version: 1.0.939
+        version: 1.0.940
       '@types/node':
         specifier: ^22.10.0
         version: 22.20.1
@@ -233,8 +233,8 @@ packages:
     resolution: {integrity: sha512-+1VkjdD0QBLPodGrJUeqarH8VAIvQODIbwh9XpP5Syisf7YoQgsJKPNFoqqLQlu+VQ/tVSshMR6loPMn8U+dPg==}
     engines: {node: '>=14'}
 
-  '@rbxts/types@1.0.939':
-    resolution: {integrity: sha512-8EUgqGpGLV6I98/Lc5Su8Lw6RGhairmXGuCHdX1JiS00WNNR/n0GiEol+SjERZhFR9/u1ZZOMpOUFtY4IyL1GQ==}
+  '@rbxts/types@1.0.940':
+    resolution: {integrity: sha512-F5kSGN/V005xtTSI7+JYJB4NAGU7GJnYEm3I8XquB42ldIrphiFhQypuWOPU5ke0xqNKVK8y1EI9gAxylzbuew==}
 
   '@rollup/rollup-android-arm-eabi@4.60.4':
     resolution: {integrity: sha512-F5QXMSiFebS9hKZj02XhWLLnRpJ3B3AROP0tWbFBSj+6kCbg5m9j5JoHKd4mmSVy5mS/IMQloYgYxCuJC0fxEQ==}
@@ -898,7 +898,7 @@ snapshots:
   '@pkgjs/parseargs@0.11.0':
     optional: true
 
-  '@rbxts/types@1.0.939': {}
+  '@rbxts/types@1.0.940': {}
 
   '@rollup/rollup-android-arm-eabi@4.60.4':
     optional: true
