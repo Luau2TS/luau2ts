@@ -20,11 +20,12 @@ import {
   type Stat,
   type TableItem,
   type TypeAliasStat,
+  type TypePack,
   type TypeNode,
 } from '../parser/index.js';
 import ts from 'typescript';
 import { format as prettierFormat } from 'prettier';
-import { ARITH_DATATYPES, CompileContext, RUNTIME_MODULE, type CompatMode, type StaticValueType } from './context.js';
+import { ARITH_DATATYPES, CompileContext, RUNTIME_MODULE, VECTOR_LIB_TYPE, isDatatypeStatic, type CompatMode, type StaticValueType } from './context.js';
 import { lookupMacro } from './macros/index.js';
 // Side-effect imports — populate the macro registry consulted by lookupMacro.
 import './macros/datatypes.js';
@@ -54,7 +55,7 @@ import {
 } from './macros/generated/dispatch.js';
 import { STDLIB_SLOTS } from './macros/generated/stdlib-slots.js';
 import { DATATYPE_SLOTS } from './macros/generated/datatype-slots.js';
-import { compileType, compileTypePack, setAliasArities, setTypeCompatMode } from './type.js';
+import { compileType, compileTypePack, setAliasArities, setAliasBodies, setTypeCompatMode, setTypePrefixResolver } from './type.js';
 import {
   buildSourceMap,
   inlineSourceMapURL,
@@ -80,6 +81,12 @@ function flowFactToStatic(fact: FlowFact | undefined): StaticValueType | undefin
   if (!fact) return undefined;
   if (fact.kind === 'primitive') return fact.name;
   if (fact.kind === 'datatype') return `datatype:${fact.name}` as StaticValueType;
+  // The oracle models Roblox datatypes as classes (`CFrame.LookVector`
+  // → class Vector3); surface those as datatypes so arithmetic can
+  // dispatch to `.add()` instead of bridging through number.
+  if (fact.kind === 'class' && !fact.nullable && ARITH_DATATYPES.has(fact.name)) {
+    return `datatype:${fact.name}` as StaticValueType;
+  }
   return undefined;
 }
 
@@ -390,6 +397,30 @@ function nodeReferencesSelf(node: ts.Node): boolean {
   return ts.forEachChild(node, nodeReferencesSelf) ?? false;
 }
 
+/** `i` → `i - 1`, folding `i + 1` / `i - 1` literals so `t[i + 1]` emits
+ *  `t[i]` rather than `t[i + 1 - 1]`. */
+function zeroBasedIndex(index: ts.Expression): ts.Expression {
+  if (
+    ts.isBinaryExpression(index)
+    && ts.isNumericLiteral(index.right)
+    && (index.operatorToken.kind === ts.SyntaxKind.PlusToken
+      || index.operatorToken.kind === ts.SyntaxKind.MinusToken)
+  ) {
+    const k = Number(index.right.text) * (index.operatorToken.kind === ts.SyntaxKind.PlusToken ? 1 : -1);
+    const shifted = k - 1;
+    if (shifted === 0) return index.left;
+    return factory.createBinaryExpression(
+      index.left,
+      shifted > 0 ? ts.SyntaxKind.PlusToken : ts.SyntaxKind.MinusToken,
+      factory.createNumericLiteral(Math.abs(shifted)),
+    );
+  }
+  const inner = ts.isBinaryExpression(index) || ts.isConditionalExpression(index)
+    ? factory.createParenthesizedExpression(index)
+    : index;
+  return factory.createBinaryExpression(inner, ts.SyntaxKind.MinusToken, factory.createNumericLiteral(1));
+}
+
 function recordCastExpression(expr: ts.Expression): ts.Expression {
   return factory.createParenthesizedExpression(
     factory.createAsExpression(
@@ -509,11 +540,17 @@ function statementsOf(stat: Stat, ctx: CompileContext): ts.Statement[] {
       }
       if (stat.values.length === 1) {
         const value = stat.values[0]!;
-        const compiled = ctx.compatMode === 'rbxts'
+        let compiled = ctx.compatMode === 'rbxts'
           && value.type === 'Local'
           && ctx.tsLuauChildLocal.has(value.name)
             ? factory.createNonNullExpression(compileExpr(value, ctx))
             : compileExpr(value, ctx);
+        if (ctx.compatMode === 'rbxts') {
+          const declared = declaredSingleReturnType(ctx);
+          if (declared && !returnValueFitsDeclared(value, declared, ctx)) {
+            compiled = assertExpression(compiled, compileType(declared));
+          }
+        }
         return [factory.createReturnStatement(compiled)];
       }
       // Multi-value return: native emits array; rbxts emits `$tuple(...)` macro
@@ -649,7 +686,22 @@ const DATATYPE_STATIC_FACTORIES = new Set([
  *  possible. Used to populate tsTypedClassLocal so write sites can skip
  *  the Record<string, unknown> wrap on properties that exist on the
  *  class. */
-function resolveOracleClassOfExpr(expr: Expr, ctx: CompileContext): string | undefined {
+/** Strip a `:: any` assertion in rbxts mode, where it compiles to
+ *  nothing. The value's real type is whatever the inner expression
+ *  produces, and every typing decision should see through to it. */
+function throughAnyAssertion(expr: Expr, ctx: CompileContext): Expr {
+  if (
+    ctx.compatMode === 'rbxts'
+    && expr.type === 'TypeAssertion'
+    && compileType(expr.annotation).kind === ts.SyntaxKind.UnknownKeyword
+  ) {
+    return throughAnyAssertion(expr.expr, ctx);
+  }
+  return expr;
+}
+
+function resolveOracleClassOfExpr(rawExpr: Expr, ctx: CompileContext): string | undefined {
+  const expr = throughAnyAssertion(rawExpr, ctx);
   const flowed = flowClassOf(expr, ctx);
   if (flowed) return flowed;
   if (expr.type === 'Global' && ctx.oracle.isService(expr.name)) return expr.name;
@@ -758,7 +810,8 @@ function resolveOracleClassOfExpr(expr: Expr, ctx: CompileContext): string | und
   return undefined;
 }
 
-function initIsOracleTyped(expr: Expr, ctx: CompileContext): boolean {
+function initIsOracleTyped(rawExpr: Expr, ctx: CompileContext): boolean {
+  const expr = throughAnyAssertion(rawExpr, ctx);
   if (flowClassOf(expr, ctx)) return true;
   if ((expr as unknown as { __nonnull?: boolean }).__nonnull) return true;
   if (expr.type === 'Global') return ctx.oracle.isService(expr.name);
@@ -820,6 +873,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
     ) {
       ctx.suppressLocal(v.name);
       ctx.defineLocal(v.name, typeFromAnnotation(v.annotation, init, ctx));
+      ctx.noteDeclaredType(v.name, v.annotation);
       if (ctx.compatMode === 'rbxts' && initIsOracleTyped(init, ctx)) {
         ctx.tsTypedClassLocal.set(v.name, resolveOracleClassOfExpr(init, ctx) ?? 'Instance');
       }
@@ -833,19 +887,34 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
     ctx.preferMultiReturn = true;
     const rawInit = compileExpr(stat.values[0]!, ctx);
     ctx.preferMultiReturn = savedMR;
-    // rbxts: cast RHS `as any` — `as [any, any]` fails TS2352 against LuaTuple.
+    // @rbxts/types declares the tuple for oracle methods (`GetComponents`,
+    // `WorldToViewportPoint`) and the string library; destructuring those
+    // directly keeps every slot typed. Anything else bridges through
+    // `unknown[]` — `as [unknown, unknown]` fails TS2352 against LuaTuple.
+    const tupleSlots = ctx.compatMode === 'rbxts' ? oracleTupleSlots(stat.values[0]!, ctx) : null;
     const init = ctx.compatMode === 'rbxts'
-      ? assertExpression(
-          rawInit,
-          factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
-        )
+      ? tupleSlots
+        ? rawInit
+        : assertExpression(
+            rawInit,
+            factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+          )
       : factory.createCallExpression(
           factory.createIdentifier(ctx.use('multiret')),
           undefined,
           [rawInit],
         );
     const anyShadow = stat.vars.some((v) => ctx.hasLocalInCurrentScope(v.name));
-    for (const v of stat.vars) ctx.assignLocal(v.name, typeFromAnnotation(v.annotation));
+    stat.vars.forEach((v, i) => {
+      const slot = tupleSlots?.[i];
+      ctx.assignLocal(v.name, v.annotation ? typeFromAnnotation(v.annotation) : slot?.staticType ?? 'unknown');
+      ctx.noteDeclaredType(v.name, v.annotation);
+      if (!v.annotation && slot) {
+        if (slot.staticType !== 'unknown') ctx.noteDeclaredTypeKind(v.name, slot.staticType);
+        if (slot.className) ctx.tsTypedClassLocal.set(v.name, slot.className);
+        else ctx.tsTypedClassLocal.delete(v.name);
+      }
+    });
     if (anyShadow) {
       // Same-scope shadow: emit destructuring assignment, not `let` — Luau reuses the binding.
       return [factory.createExpressionStatement(
@@ -1053,6 +1122,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
         );
       }
       ctx.assignLocal(v.name, typeFromAnnotation(v.annotation, init, ctx));
+      ctx.noteDeclaredType(v.name, v.annotation);
     } else {
       // rbxts: materialize observed structural shape as the annotation;
       // bare `let x` / `let x = nil` fall back to `unknown` so writes don't trip TS7034.
@@ -1131,8 +1201,14 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
           && init.type === 'Table'
           && (init as { items: { key: Expr | null }[] }).items
             .every((it) => !it.key || it.key.type === 'ConstantString');
+        // Inits TS already types concretely (datatype factories, `vector`
+        // library results, trusted primitives) must not be re-annotated
+        // with an observed shape — `const v: { x: unknown } = vector.create(...)`
+        // throws away the real type and forces casts on every use.
+        const initIsTsTyped =
+          !!init && isTrustedTypedExpr(init, ctx) && staticTypeOfExpr(init, ctx) !== 'unknown';
         const initIsShapelyCandidate =
-          !initHasOracleType && !initIsCachedRequire && (
+          !initHasOracleType && !initIsCachedRequire && !initIsTsTyped && (
             !init
             || init.type === 'ConstantNil'
             || init.type === 'Local'
@@ -1195,6 +1271,24 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
           : initExpr;
         initExpr = assertExpression(inner, factory.createTypeReferenceNode('Instance', undefined));
       }
+      // Annotated Instance-class local: the annotation is the TS type.
+      // Register the class for the member-access gates and bridge inits
+      // TS types wider than it (`WaitForChild` → Instance) or as unknown.
+      const annotatedClass = oracleClassOfAnnotation(v.annotation, ctx);
+      if (ctx.compatMode === 'rbxts' && annotatedClass) {
+        ctx.tsTypedClassLocal.set(v.name, annotatedClass.name);
+        if (annotatedClass.nullable) ctx.tsOptionalClassLocal.add(v.name);
+        else ctx.tsOptionalClassLocal.delete(v.name);
+        ctx.tsLuauChildLocal.delete(v.name);
+        if (initExpr && init && !initIsNil && typeNode && !initFitsAnnotatedClass(init, annotatedClass.name, ctx)) {
+          const alreadyCast =
+            ts.isAsExpression(initExpr)
+            && ts.isTypeReferenceNode(initExpr.type)
+            && ts.isIdentifier(initExpr.type.typeName)
+            && initExpr.type.typeName.text === annotatedClass.name;
+          if (!alreadyCast) initExpr = assertExpression(initExpr, typeNode);
+        }
+      }
       // rbxts: shape-typed local without init needs `!` (definite assignment) to avoid TS2454.
       const needsDefiniteAssertion =
         ctx.compatMode === 'rbxts'
@@ -1212,6 +1306,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
         ),
       );
       ctx.defineLocal(v.name, typeFromAnnotation(v.annotation, init, ctx));
+      ctx.noteDeclaredType(v.name, v.annotation);
       // Track which locals TS will know as a primitive — used by the
       // arg-cast skip logic so `let s = tostring(...); string.reverse(s)`
       // doesn't re-cast `s`. Only safe when the init is a trusted-typed
@@ -1227,6 +1322,23 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
         if (t === 'string' || t === 'number' || t === 'boolean') {
           ctx.tsTypedPrimitiveLocal.add(v.name);
         }
+      }
+      // Datatype inits (`Vector3.new`, `vector.create`, trusted member
+      // reads) keep their inferred TS type through reassignment too —
+      // TS widens `let` bindings only to the init's own type.
+      // Skipped when local-type inference already emitted a primitive
+      // annotation for this binding — that annotation is what TS sees,
+      // and claiming a datatype here would dispatch `.add()`/`.mul()`
+      // against a `number`-typed declaration.
+      if (
+        ctx.compatMode === 'rbxts'
+        && init
+        && !v.annotation
+        && !ctx.tsTypedPrimitiveLocal.has(v.name)
+        && isTrustedTypedExpr(init, ctx)
+      ) {
+        const t = staticTypeOfExpr(init, ctx);
+        if (isDatatypeStatic(t)) ctx.noteDeclaredTypeKind(v.name, t);
       }
       // Class-typed: even when the local is reassigned, the TS-inferred
       // class survives — suppress the reassign shape-cast so the
@@ -1622,13 +1734,26 @@ function compileFor(stat: ForStat, ctx: CompileContext): ts.Statement {
   // Lua: `for i = from, to, step do … end`. step defaults to 1.
   const idName = safeIdentifier(stat.var.name);
   const id = factory.createIdentifier(idName);
-  const fromExpr = compileExpr(stat.from, ctx);
-  const toExpr = compileExpr(stat.to, ctx);
-  const stepExpr = stat.step ? compileExpr(stat.step, ctx) : null;
+  // rbxts: an `unknown`-typed bound (`for i = 1, n` with untyped `n`)
+  // leaves `i` itself `unknown` and trips TS2365 on the `<=` guard.
+  // Bridge each bound to number unless TS already sees it as one.
+  const numberBound = (luau: Expr): ts.Expression => {
+    const compiled = compileExpr(luau, ctx);
+    if (ctx.compatMode !== 'rbxts' || tsSeesNumber(luau, ctx)) return compiled;
+    return factory.createParenthesizedExpression(
+      assertExpression(compiled, factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword)),
+    );
+  };
+  const fromExpr = numberBound(stat.from);
+  const toExpr = numberBound(stat.to);
+  const stepExpr = stat.step ? numberBound(stat.step) : null;
 
+  const prevBinding = ctx.snapshotBinding(stat.var.name);
   const body = ctx.withScope(() => {
     ctx.defineLocal(stat.var.name, 'number');
+    ctx.noteDeclaredTypeKind(stat.var.name, 'number');
     const inner = compileBlockBody(stat.body, ctx);
+    ctx.restoreBinding(stat.var.name, prevBinding);
     // Anti-DoS guard: bail on non-finite loop var (Infinity/NaN). Skip in
     // rbxts mode — `Number.isFinite` fires TS2693 against @rbxts/types.
     if (ctx.compatMode === 'rbxts') {
@@ -2094,8 +2219,15 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     const loopVarTypeMap = !canUseClassElement
       ? (ctx.loopVarTypes.get(stat as unknown) as Map<string, ts.TypeNode> | undefined)
       : undefined;
+    const prevBindings = stat.vars.map((v) => ctx.snapshotBinding(v.name));
     const bodyStatements = ctx.withScope(() => {
-      for (const v of stat.vars) ctx.defineLocal(v.name, 'unknown');
+      stat.vars.forEach((v, i) => {
+        // `for i, v in ipairs(t)` — @rbxts/types declares the ipairs
+        // index slot as `number`, so TS sees `i: number` directly.
+        const isIpairsIndex = !userWantsPairs && stat.vars.length >= 2 && i === 0;
+        ctx.defineLocal(v.name, isIpairsIndex ? 'number' : 'unknown');
+        ctx.noteDeclaredTypeKind(v.name, isIpairsIndex ? 'number' : undefined);
+      });
       // When the iterable's element resolves to a class, the value-binding
       // (second var for two-binding `for k, v in ipairs(arr)`, first var
       // for single-binding) emits as that class in TS. Mirror that into
@@ -2111,7 +2243,11 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
       const trackedShapeVars: string[] = [];
       if (loopVarTypeMap) {
         for (const v of stat.vars) {
-          if (loopVarTypeMap.has(v.name)) {
+          const synth = loopVarTypeMap.get(v.name);
+          // A synthesized `unknown` is no shape at all — marking the var
+          // shape-typed would let bracket access skip the Record bridge
+          // and surface TS18046 on the destructured binding.
+          if (synth && synth.kind !== ts.SyntaxKind.UnknownKeyword) {
             ctx.tsShapeTypedLocal.add(v.name);
             trackedShapeVars.push(v.name);
           }
@@ -2119,6 +2255,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
       }
       const compiled = compileBlockBody(stat.body, ctx);
       for (const n of trackedShapeVars) ctx.tsShapeTypedLocal.delete(n);
+      stat.vars.forEach((v, i) => ctx.restoreBinding(v.name, prevBindings[i]!));
       return compiled;
     });
     // Cast to `Array<any>` so the destructured element is `any` (not
@@ -2676,7 +2813,13 @@ function buildAssignmentStatement(
   target: Expr,
   valueExpr: ts.Expression,
   ctx: CompileContext,
+  /** The Luau expression `valueExpr` was compiled from, when the caller
+   *  has it. Lets the declared-slot bridges below skip a cast the
+   *  emitted value already satisfies. */
+  valueSource?: Expr,
 ): ts.Statement {
+  const valueSeenAs = (): StaticValueType =>
+    valueSource ? tsVisibleType(valueSource, ctx) : 'unknown';
   if (target.type === 'IndexExpr') {
     const indexExpr = target.index;
     // Literal numeric: `t[1] = v` → `t[0] = v`.
@@ -2692,6 +2835,18 @@ function buildAssignmentStatement(
           )
         : factory.createNumericLiteral(n);
       let recv = compileExpr(target.expr, ctx);
+      if (ctx.compatMode === 'rbxts' && target.expr.type === 'Local' && ctx.tsArrayTypedLocal.has(target.expr.name)) {
+        const element = ctx.tsArrayTypedLocal.get(target.expr.name) ?? null;
+        const elementStatic = typeFromAnnotation(ctx.resolveAlias(element));
+        const rhsMatches = elementStatic !== 'unknown'
+          && (valueSeenAs() === elementStatic || isTsExpressionOfStatic(valueExpr, elementStatic));
+        return factory.createExpressionStatement(
+          factory.createAssignment(
+            factory.createElementAccessExpression(recv, lit),
+            rhsMatches ? valueExpr : assertExpression(valueExpr, compileType(element)),
+          ),
+        );
+      }
       // rbxts: chained LHS `obj[k][N] = v` — recast inner receiver through
       // Record so the literal-index assignment slot accepts the RHS.
       if (
@@ -2745,6 +2900,24 @@ function buildAssignmentStatement(
       // Pass 6: when target is a Local whose synthesized shape already
       // carries `[k: string]: unknown` (observed bracket access), the
       // declared type accepts the bracket assignment directly.
+      if (target.expr.type === 'Local' && ctx.tsArrayTypedLocal.has(target.expr.name) && tsSeesNumber(indexExpr, ctx)) {
+        const element = ctx.tsArrayTypedLocal.get(target.expr.name) ?? null;
+        const elementStatic = typeFromAnnotation(ctx.resolveAlias(element));
+        const rhsMatches = elementStatic !== 'unknown'
+          && (valueSeenAs() === elementStatic || isTsExpressionOfStatic(valueExpr, elementStatic));
+        // `t[i] = nil` clears the slot; roblox-ts lowers `undefined` to
+        // `nil`, so the element cast only keeps TS quiet about it.
+        const rhs = rhsMatches ? valueExpr : assertExpression(valueExpr, compileType(element));
+        return factory.createExpressionStatement(
+          factory.createAssignment(
+            factory.createElementAccessExpression(
+              compileExpr(target.expr, ctx),
+              zeroBasedIndex(compileExpr(indexExpr, ctx)),
+            ),
+            rhs,
+          ),
+        );
+      }
       const targetAlreadyIndexed = localShapeHasStringIndexSig(target.expr, ctx);
       const recv = targetAlreadyIndexed
         ? compileExpr(target.expr, ctx)
@@ -2774,9 +2947,44 @@ function buildAssignmentStatement(
       ),
     );
   }
+  if (
+    ctx.compatMode === 'rbxts'
+    && target.type === 'IndexName'
+    && target.expr.type === 'Local'
+  ) {
+    const field = ctx.declaredFieldAnnotation(target.expr.name, target.index);
+    const want = field ? typeFromAnnotation(ctx.resolveAlias(field)) : 'unknown';
+    if (field && want !== 'unknown' && valueSeenAs() !== want && !isTsExpressionOfStatic(valueExpr, want)) {
+      return factory.createExpressionStatement(
+        factory.createAssignment(compileLValue(target, ctx), assertExpression(valueExpr, compileType(field))),
+      );
+    }
+  }
   return factory.createExpressionStatement(
     factory.createAssignment(compileLValue(target, ctx), valueExpr),
   );
+}
+
+/** True when the emitted expression is self-evidently of `want` — a
+ *  literal, or an `as <want>` cast we just produced. Keeps the
+ *  declared-field write path from stacking a redundant bridge. */
+function isTsExpressionOfStatic(expr: ts.Expression, want: StaticValueType): boolean {
+  let cur = expr;
+  while (ts.isParenthesizedExpression(cur)) cur = cur.expression;
+  if (ts.isAsExpression(cur)) {
+    const t = cur.type;
+    if (want === 'number' && t.kind === ts.SyntaxKind.NumberKeyword) return true;
+    if (want === 'string' && t.kind === ts.SyntaxKind.StringKeyword) return true;
+    if (want === 'boolean' && t.kind === ts.SyntaxKind.BooleanKeyword) return true;
+    if (isDatatypeStatic(want) && ts.isTypeReferenceNode(t) && ts.isIdentifier(t.typeName)) {
+      return t.typeName.text === want.slice('datatype:'.length);
+    }
+    return false;
+  }
+  if (want === 'number') return ts.isNumericLiteral(cur);
+  if (want === 'string') return ts.isStringLiteral(cur) || ts.isTemplateExpression(cur);
+  if (want === 'boolean') return cur.kind === ts.SyntaxKind.TrueKeyword || cur.kind === ts.SyntaxKind.FalseKeyword;
+  return false;
 }
 
 /** Compile a Luau expression intended as an assignment LHS. Identical
@@ -2866,6 +3074,7 @@ function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
       target.expr.type === 'Local'
       || target.expr.type === 'Global'
       || target.expr.type === 'IndexName'
+      || target.expr.type === 'IndexExpr'
       || target.expr.type === 'Call';
     if (
       ctx.compatMode === 'rbxts'
@@ -2879,6 +3088,12 @@ function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
       // Use `recv!.prop` to absorb the optional case when the local
       // was declared `ClassName | undefined` — the script's pattern
       // assumes the value is present at this point.
+      if (target.expr.type === 'Local' && ctx.declaredFieldAnnotation(target.expr.name, target.index)) {
+        return factory.createPropertyAccessExpression(
+          compileExpr(target.expr, ctx),
+          factory.createIdentifier(propertyName(target.index)),
+        );
+      }
       if (
         target.expr.type === 'Local'
         && ctx.tsTypedClassLocal.has(target.expr.name)
@@ -3383,7 +3598,7 @@ function compileAssign(stat: AssignStat, ctx: CompileContext): ts.Statement[] {
     }
     // Non-literal numeric `tbl[k] = v` routes through luaIndexSet (plain
     // `=` would emit `luaIndex(tbl, k) = v`, not a valid lvalue).
-    const writeStmt = buildAssignmentStatement(target, valueExpr, ctx);
+    const writeStmt = buildAssignmentStatement(target, valueExpr, ctx, stat.values[i]);
     stmts.push(writeStmt);
     // `_G["X"] = v` mirrors to the matching local since our _G is a plain
     // object and a later bare `X(...)` would read the predecl (undefined).
@@ -3651,6 +3866,9 @@ function compileFunctionShape(
   // `s` (typed string inside format) leak into a Connect callback's
   // unrelated `s` local elsewhere.
   const prevTsPrim = new Set(ctx.tsTypedPrimitiveLocal);
+  const prevDeclaredPrim = new Map(ctx.tsDeclaredTypeLocal);
+  const prevDeclaredAnnotation = new Map(ctx.tsDeclaredAnnotation);
+  const prevArrayTyped = new Map(ctx.tsArrayTypedLocal);
   const prevTsClass = new Set(ctx.tsTypedClassLocal.keys());
   const prevTsOptionalClass = new Set(ctx.tsOptionalClassLocal);
   const prevTsLuauChild = new Set(ctx.tsLuauChildLocal);
@@ -3715,8 +3933,15 @@ function compileFunctionShape(
     const tupleArity = maxMultiReturnArity(fn.body);
     if (tupleArity !== null) {
       ctx.useImport('@rbxts/types', 'LuaTuple');
-      const componentTypes = Array.from({ length: tupleArity }, () =>
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+      const declaredPack = fn.returnAnnotation;
+      const declaredTypes =
+        declaredPack && declaredPack.type === 'TypePackExplicit'
+          && !declaredPack.typeList.tailType
+          && declaredPack.typeList.types.length === tupleArity
+          ? declaredPack.typeList.types
+          : null;
+      const componentTypes = Array.from({ length: tupleArity }, (_, i) =>
+        declaredTypes ? compileType(declaredTypes[i]) : factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
       );
       returnType = factory.createTypeReferenceNode('LuaTuple', [
         factory.createTupleTypeNode(componentTypes),
@@ -3724,12 +3949,26 @@ function compileFunctionShape(
     }
   }
 
+  ctx.returnAnnotationStack.push(fn.returnAnnotation);
   const innerStatements = ctx.withScope(() => {
-    for (const arg of realArgs) ctx.defineLocal(arg.name, typeFromAnnotation(arg.annotation));
+    for (const arg of realArgs) {
+      ctx.defineLocal(arg.name, typeFromAnnotation(arg.annotation));
+      ctx.noteDeclaredType(arg.name, arg.annotation);
+      const annotatedClass = oracleClassOfAnnotation(arg.annotation, ctx);
+      if (ctx.compatMode === 'rbxts' && annotatedClass) {
+        ctx.tsTypedClassLocal.set(arg.name, annotatedClass.name);
+        if (annotatedClass.nullable) ctx.tsOptionalClassLocal.add(arg.name);
+        else ctx.tsOptionalClassLocal.delete(arg.name);
+      }
+    }
     if (ctx.compatMode === 'rbxts') {
       for (const arg of realArgs) {
         const shape = paramShapes?.get(arg.name);
-        if (shape && !shape.empty) ctx.tsShapeTypedLocal.add(arg.name);
+        // `p: any` compiles to `p: unknown` — no declared members to
+        // preserve, so member reads must keep the Record bridge.
+        const annotatedUnknown =
+          !!arg.annotation && compileType(arg.annotation).kind === ts.SyntaxKind.UnknownKeyword;
+        if (shape && !shape.empty && !annotatedUnknown) ctx.tsShapeTypedLocal.add(arg.name);
       }
     }
     if (fn.vararg) ctx.defineLocal('__varargs', 'unknown');
@@ -3765,6 +4004,7 @@ function compileFunctionShape(
   if (returnType && bodyContainsAwait(block)) {
     finalReturnType = factory.createTypeReferenceNode('Promise', [returnType]);
   }
+  ctx.returnAnnotationStack.pop();
   if (paramShapes) ctx.popShapeScope();
   // Restore preInferredParamType snapshot.
   for (const [k, v] of prevPreInferred) {
@@ -3775,6 +4015,12 @@ function compileFunctionShape(
   for (const name of ctx.tsTypedPrimitiveLocal) {
     if (!prevTsPrim.has(name)) ctx.tsTypedPrimitiveLocal.delete(name);
   }
+  ctx.tsDeclaredTypeLocal.clear();
+  for (const [k, v] of prevDeclaredPrim) ctx.tsDeclaredTypeLocal.set(k, v);
+  ctx.tsDeclaredAnnotation.clear();
+  for (const [k, v] of prevDeclaredAnnotation) ctx.tsDeclaredAnnotation.set(k, v);
+  ctx.tsArrayTypedLocal.clear();
+  for (const [k, v] of prevArrayTyped) ctx.tsArrayTypedLocal.set(k, v);
   for (const name of Array.from(ctx.tsTypedClassLocal.keys())) {
     if (!prevTsClass.has(name)) ctx.tsTypedClassLocal.delete(name);
   }
@@ -3996,6 +4242,82 @@ function compileFunctionExpr(
 // Expressions
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** The enclosing function's declared single return type, when it names
+ *  something the static view can compare against (primitive, datatype,
+ *  Instance class). */
+function declaredSingleReturnType(ctx: CompileContext): TypeNode | null {
+  const pack = ctx.returnAnnotationStack[ctx.returnAnnotationStack.length - 1];
+  if (!pack || pack.type !== 'TypePackExplicit') return null;
+  if (pack.typeList.types.length !== 1 || pack.typeList.tailType) return null;
+  const t = pack.typeList.types[0]!;
+  if (typeFromAnnotation(t) !== 'unknown' || oracleClassOfAnnotation(t, ctx)) return t;
+  return null;
+}
+
+/** True when TS already sees `value` as the declared return type, so no
+ *  bridge is needed on the `return`. */
+function returnValueFitsDeclared(value: Expr, declared: TypeNode, ctx: CompileContext): boolean {
+  const cls = oracleClassOfAnnotation(declared, ctx);
+  if (cls) {
+    if (value.type === 'ConstantNil') return cls.nullable;
+    return initFitsAnnotatedClass(value, cls.name, ctx);
+  }
+  const want = typeFromAnnotation(declared);
+  if (want === 'unknown') return true;
+  if (value.type === 'ConstantNil') return false;
+  return isTrustedTypedExpr(value, ctx) && staticTypeOfExpr(value, ctx) === want;
+}
+
+/** Oracle Instance class named by an annotation (`Frame`, `Frame?`,
+ *  `Frame | nil`), or null. */
+function oracleClassOfAnnotation(
+  t: TypeNode | null | undefined,
+  ctx: CompileContext,
+): { name: string; nullable: boolean } | null {
+  if (!t) return null;
+  switch (t.type) {
+    case 'TypeGroup':
+      return oracleClassOfAnnotation(t.groupType, ctx);
+    case 'TypeReference':
+      if (t.prefix || t.parameters.length > 0) return null;
+      if (ctx.oracle.isClass(t.name) && ctx.oracle.isA(t.name, 'Instance')) {
+        return { name: t.name, nullable: false };
+      }
+      return null;
+    case 'TypeUnion': {
+      const nonNil = t.types.filter((m) => !(m.type === 'TypeReference' && m.name === 'nil') && m.type !== 'TypeOptional');
+      if (nonNil.length !== 1 || nonNil.length === t.types.length) return null;
+      const inner = oracleClassOfAnnotation(nonNil[0], ctx);
+      return inner ? { name: inner.name, nullable: true } : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/** True when TS already types `init` as `className` or a subclass, so
+ *  an annotated local needs no bridge cast. Loose navigation methods
+ *  (`WaitForChild`, `FindFirstChild`) emit as `Instance` regardless of
+ *  what the name table suggests. */
+function initFitsAnnotatedClass(init: Expr, className: string, ctx: CompileContext): boolean {
+  if (init.type === 'Group') return initFitsAnnotatedClass(init.expr, className, ctx);
+  if (init.type === 'TypeAssertion') {
+    const asserted = oracleClassOfAnnotation(init.annotation, ctx);
+    return !!asserted && ctx.oracle.isA(asserted.name, className);
+  }
+  if (init.type === 'Local') {
+    const cls = ctx.tsTypedClassLocal.get(init.name);
+    return !!cls && ctx.oracle.isA(cls, className) && !ctx.tsLuauChildLocal.has(init.name);
+  }
+  if (init.type === 'Call' && init.self && init.func.type === 'IndexName' && INSTANCE_LOOSE_METHODS.has(init.func.index)) {
+    const loose = resolveLooseMethodCastType(init, ctx);
+    return loose.kind === 'class' && loose.text === className;
+  }
+  if (exprEmitsLuauChild(init, ctx)) return false;
+  const cls = resolveOracleClassOfExpr(init, ctx);
+  return !!cls && ctx.oracle.isA(cls, className);
+}
+
 function typeFromAnnotation(
   annotation: TypeNode | null | undefined,
   fallbackExpr?: Expr,
@@ -4005,10 +4327,11 @@ function typeFromAnnotation(
   switch (annotation.type) {
     case 'TypeReference':
       if (annotation.prefix === null) {
+        if (annotation.name === 'any' && fallbackExpr && ctx) return staticTypeOfExpr(fallbackExpr, ctx);
         if (annotation.name === 'number') return 'number';
         if (annotation.name === 'boolean') return 'boolean';
         if (annotation.name === 'string') return 'string';
-        if (ARITH_DATATYPES.has(annotation.name)) {
+        if (ARITH_DATATYPES.has(annotation.name) || annotation.name === VECTOR_LIB_TYPE) {
           return `datatype:${annotation.name}` as StaticValueType;
         }
       }
@@ -4083,6 +4406,8 @@ function tsVisibleType(expr: Expr, ctx: CompileContext): StaticValueType {
       // declared annotation, so TS sees the primitive.
       const preInferred = ctx.preInferredParamType.get(expr.name);
       if (preInferred) return preInferred;
+      const declared = ctx.tsDeclaredTypeLocal.get(expr.name);
+      if (declared) return declared;
       // Local-type-inferred primitive — same: annotation is emitted.
       if (ctx.tsTypedPrimitiveLocal.has(expr.name)) {
         const localPrim = ctx.localTypeMap.byName.get(expr.name);
@@ -4104,10 +4429,41 @@ function tsVisibleType(expr: Expr, ctx: CompileContext): StaticValueType {
     }
     case 'Unary':
       if (expr.op === 'not') return 'boolean';
-      if (expr.op === '#' || expr.op === '-') return 'number';
+      if (expr.op === '#') return 'number';
+      if (expr.op === '-') return staticTypeOfExpr(expr, ctx);
       return 'unknown';
+    case 'IndexName':
+    case 'IndexExpr':
+    case 'IfElse':
+      // Member reads on TS-typed receivers (oracle classes, datatypes,
+      // annotated arrays) and branch-agreeing conditionals type exactly
+      // as the static view.
+      return isTrustedTypedExpr(expr, ctx) ? staticTypeOfExpr(expr, ctx) : 'unknown';
     default:
       return 'unknown';
+  }
+}
+
+const VECTOR_LIB_NUMBER_FNS = new Set(['magnitude', 'dot', 'angle']);
+const VECTOR_LIB_VECTOR_FNS = new Set([
+  'create', 'normalize', 'cross', 'floor', 'ceil', 'abs', 'sign', 'clamp', 'max', 'min',
+]);
+const VECTOR_LIB_COMPONENTS = new Set(['x', 'y', 'z']);
+
+/** True when TS will type the emitted expression as `number` without a
+ *  cast. Locals go through the TS-visible view (declared / inferred
+ *  annotation), never the tracked reassignment type — `let x: unknown;
+ *  x = tick(); x - 1` tracks as number but TS still sees `unknown`. */
+function tsSeesNumber(expr: Expr, ctx: CompileContext): boolean {
+  switch (expr.type) {
+    case 'Local':
+      return tsVisibleType(expr, ctx) === 'number';
+    case 'Group':
+      return tsSeesNumber(expr.expr, ctx);
+    case 'TypeAssertion':
+      return typeFromAnnotation(expr.annotation) === 'number' || tsSeesNumber(expr.expr, ctx);
+    default:
+      return staticTypeOfExpr(expr, ctx) === 'number';
   }
 }
 
@@ -4126,10 +4482,18 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       if (f.type === 'IndexName' && f.expr.type === 'Global' && ARITH_DATATYPES.has(f.expr.name)) {
         return `datatype:${f.expr.name}` as StaticValueType;
       }
+      if (f.type === 'IndexName' && f.expr.type === 'Global' && f.expr.name === VECTOR_LIB_TYPE) {
+        if (VECTOR_LIB_NUMBER_FNS.has(f.index)) return 'number';
+        if (VECTOR_LIB_VECTOR_FNS.has(f.index)) return `datatype:${VECTOR_LIB_TYPE}`;
+      }
       // Stdlib coercions.
       if (f.type === 'Global') {
         if (f.name === 'tostring') return 'string';
         if (f.name === 'tonumber') return 'number';
+      }
+      if ((f.type === 'Local' || f.type === 'Global') && !expr.self) {
+        const declared = ctx.userFunctionReturnType.get(f.name);
+        if (declared) return declared;
       }
       // math.X (most) returns number.
       if (f.type === 'IndexName' && f.expr.type === 'Global' && f.expr.name === 'math') {
@@ -4219,6 +4583,12 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       return staticTypeOfExpr(expr.expr, ctx);
     case 'TypeAssertion':
       return typeFromAnnotation(expr.annotation, expr.expr, ctx);
+    case 'IndexExpr': {
+      if (expr.expr.type === 'Local' && ctx.tsArrayTypedLocal.has(expr.expr.name) && tsSeesNumber(expr.index, ctx)) {
+        return typeFromAnnotation(ctx.tsArrayTypedLocal.get(expr.expr.name));
+      }
+      return 'unknown';
+    }
     case 'Unary':
       if (expr.op === 'not') return 'boolean';
       if (expr.op === '#' || expr.op === '-') {
@@ -4237,8 +4607,49 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       // arithmetic needs the datatype hint to dispatch through `.add()` etc.
       const flowed = flowFactToStatic(flowFactOf(expr, ctx));
       if (flowed) return flowed;
+      if (expr.expr.type === 'Global' && expr.expr.name === VECTOR_LIB_TYPE) {
+        if (expr.index === 'zero' || expr.index === 'one') return `datatype:${VECTOR_LIB_TYPE}`;
+        return 'unknown';
+      }
+      const receiverStatic = staticTypeOfExpr(expr.expr, ctx);
+      if (isDatatypeStatic(receiverStatic)) {
+        const dt = receiverStatic.slice('datatype:'.length);
+        if (dt === VECTOR_LIB_TYPE) {
+          return VECTOR_LIB_COMPONENTS.has(expr.index) ? 'number' : 'unknown';
+        }
+        const prop = ctx.oracle.propertyType(dt, expr.index);
+        if (prop?.kind === 'primitive' && prop.name !== 'unknown') return prop.name;
+        if (prop?.kind === 'class' && !prop.nullable && ARITH_DATATYPES.has(prop.name)) {
+          return `datatype:${prop.name}` as StaticValueType;
+        }
+        return 'unknown';
+      }
+      // Field of a binding whose annotation (possibly via a `type`
+      // alias) declares a table shape: the declared field type is
+      // exactly what TS sees.
+      if (expr.expr.type === 'Local') {
+        const field = ctx.declaredFieldAnnotation(expr.expr.name, expr.index);
+        if (field) return typeFromAnnotation(ctx.resolveAlias(field));
+      }
+      // Receiver whose class is known: the oracle's declared property
+      // type is authoritative, and the name-based datatype heuristics
+      // below must not override it (`GuiObject.Position` is UDim2,
+      // `GuiObject.Rotation` is number).
+      const knownReceiverClass =
+        flowClassOf(expr.expr, ctx)
+        ?? (expr.expr.type === 'Local' ? ctx.tsTypedClassLocal.get(expr.expr.name) : undefined)
+        ?? resolveOracleClassOfExpr(expr.expr, ctx)
+        ?? undefined;
+      if (knownReceiverClass && ctx.oracle.isClass(knownReceiverClass)) {
+        const prop = ctx.oracle.propertyType(knownReceiverClass, expr.index);
+        if (prop?.kind === 'primitive' && prop.name !== 'unknown') return prop.name;
+        if (prop?.kind === 'class' && !prop.nullable && ARITH_DATATYPES.has(prop.name)) {
+          return `datatype:${prop.name}` as StaticValueType;
+        }
+        if (prop) return 'unknown';
+      }
       const VECTOR3_PROPS = new Set([
-        'Position', 'Size', 'Velocity', 'Rotation',
+        'Position', 'Size', 'Velocity',
         'AssemblyLinearVelocity', 'AssemblyAngularVelocity',
         'RotVelocity', 'Orientation',
       ]);
@@ -4251,18 +4662,30 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
         const lt = staticTypeOfExpr(expr.left, ctx);
         const rt = staticTypeOfExpr(expr.right, ctx);
         if (lt === 'number' && rt === 'number') return 'number';
+        // `vector` arithmetic bridges through number and casts back.
+        if (ctx.compatMode === 'rbxts' && ['+', '-', '*', '/'].includes(expr.op)
+          && (lt === `datatype:${VECTOR_LIB_TYPE}` || rt === `datatype:${VECTOR_LIB_TYPE}`)) {
+          return `datatype:${VECTOR_LIB_TYPE}`;
+        }
         // Datatype arithmetic preserves the LEFT operand's datatype.
         if (typeof lt === 'string' && lt.startsWith('datatype:')) return lt;
         // rbxts mode: compileBinary casts unknown operands to `number` at
         // emit time, so the TS-typed result of `<number> op <unknown>` is
         // `number`. Mirror that here so downstream reassign/return casts
         // can skip the outer `as unknown as number` wrap.
-        if (ctx.compatMode === 'rbxts' && (lt === 'number' || rt === 'number')) {
-          return 'number';
-        }
+        if (ctx.compatMode === 'rbxts') return 'number';
         return 'unknown';
       }
       if (['==', '~=', '<', '<=', '>', '>='].includes(expr.op)) return 'boolean';
+      if (expr.op === 'and' || expr.op === 'or') {
+        // `a == b or c == d` — both operands boolean ⇒ the result is
+        // boolean. Matters for `or` lowering: a boolean LHS must pick
+        // `||` (a `false` LHS falls through) rather than `??`.
+        const lt = staticTypeOfExpr(expr.left, ctx);
+        const rt = staticTypeOfExpr(expr.right, ctx);
+        if (lt === 'boolean' && rt === 'boolean') return 'boolean';
+        return 'unknown';
+      }
       if (expr.op === '..') {
         const lt = staticTypeOfExpr(expr.left, ctx);
         const rt = staticTypeOfExpr(expr.right, ctx);
@@ -4623,7 +5046,16 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           && !ctx.preInferredParamType.has(expr.expr.name)
           && !flowClassOf(expr.expr, ctx)
           && !resolveOracleClassOfExpr(expr.expr, ctx);
-        if (receiverIsUntypedLocal) {
+        // Same for member reads that compile to `unknown` (Record-routed
+        // `entry.model`): `.Parent` on `unknown` is TS2571.
+        const receiverIsUntypedMember =
+          (expr.expr.type === 'IndexName' || expr.expr.type === 'IndexExpr')
+          && !exprEmitsLuauChild(expr.expr, ctx)
+          && !flowClassOf(expr.expr, ctx)
+          && !resolveOracleClassOfExpr(expr.expr, ctx)
+          && !chainRootedInSynthesizedDynamic(expr.expr, ctx)
+          && !(chainRootLocal(expr.expr) !== null && ctx.tsShapeTypedLocal.has(chainRootLocal(expr.expr)!));
+        if (receiverIsUntypedLocal || receiverIsUntypedMember) {
           return factory.createPropertyAccessExpression(
             luauChildCastExpression(accessReceiver, ctx),
             factory.createIdentifier('Parent'),
@@ -4668,10 +5100,16 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
             flowClassOf(expr.expr, ctx)
             ?? (expr.expr.type === 'Local' ? ctx.tsTypedClassLocal.get(expr.expr.name) : undefined)
             ?? resolveOracleClassOfExpr(expr.expr, ctx);
+          const receiverStaticType = staticTypeOfExpr(expr.expr, ctx);
+          const receiverIsTsDatatype =
+            isDatatypeStatic(receiverStaticType)
+            && isTrustedTypedExpr(expr.expr, ctx)
+            && !!ctx.oracle.propertyType(receiverStaticType.slice('datatype:'.length), expr.index);
           const receiverHasProperty =
-            !!receiverClass
-            && ctx.oracle.isA(receiverClass, 'Instance')
-            && oracleHasMember(ctx, receiverClass, expr.index);
+            receiverIsTsDatatype
+            || (!!receiverClass
+              && ctx.oracle.isA(receiverClass, 'Instance')
+              && oracleHasMember(ctx, receiverClass, expr.index));
           // Pass 1: chains rooted in a synthesized dynamic root carry the
           // datatype directly (e.g. `script.Parent.CFrame` resolves to
           // `CFrame` per ROBLOX_PROPERTY_TYPES). Use direct access only
@@ -4825,6 +5263,11 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       // Runtime key: rbxts uses native bracket (roblox-ts preserves indices);
       // native mode uses luaIndex helper for 1-indexed handling.
       if (ctx.compatMode === 'rbxts') {
+        // Array-typed local (`t: T[]`) with a number index: roblox-ts
+        // rebases array element access by +1, so emit the 0-based form.
+        if (expr.expr.type === 'Local' && ctx.tsArrayTypedLocal.has(expr.expr.name) && tsSeesNumber(indexExpr, ctx)) {
+          return factory.createElementAccessExpression(target, zeroBasedIndex(index));
+        }
         // Receiver → Record<string, unknown> (not any, no-any rule).
         // Route through `unknown` so typed arrays / records don't TS2352.
         // Index → string so Player/Instance keys don't TS2538.
@@ -4907,6 +5350,12 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         );
       }
       const inner = compileExpr(expr.expr, ctx);
+      // `x :: any` says "trust me"; emitting `as unknown` would instead
+      // erase whatever TS already knew about `x` (a `_LuauChild` require,
+      // a typed local) and break every downstream use.
+      if (ctx.compatMode === 'rbxts' && targetTy.kind === ts.SyntaxKind.UnknownKeyword) {
+        return inner;
+      }
       if (
         ctx.compatMode === 'rbxts'
         && (
@@ -4936,8 +5385,42 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
 function compileUnary(expr: Extract<Expr, { type: 'Unary' }>, ctx: CompileContext): ts.Expression {
   const inner = compileExpr(expr.expr, ctx);
   switch (expr.op) {
-    case '-':
-      return factory.createPrefixUnaryExpression(ts.SyntaxKind.MinusToken, inner);
+    case '-': {
+      if (ctx.compatMode !== 'rbxts' || tsSeesNumber(expr.expr, ctx)) {
+        return factory.createPrefixUnaryExpression(ts.SyntaxKind.MinusToken, inner);
+      }
+      const operandType = staticTypeOfExpr(expr.expr, ctx);
+      if (operandType === `datatype:${VECTOR_LIB_TYPE}`) {
+        return assertExpression(
+          factory.createPrefixUnaryExpression(
+            ts.SyntaxKind.MinusToken,
+            factory.createParenthesizedExpression(
+              assertExpression(inner, factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword)),
+            ),
+          ),
+          factory.createTypeReferenceNode(VECTOR_LIB_TYPE, undefined),
+        );
+      }
+      if (isDatatypeStatic(operandType) && isTrustedTypedExpr(expr.expr, ctx)) {
+        // Vector3 / Vector2 / CFrame declare `.mul(number)`; `-v` is `v * -1`.
+        return factory.createCallExpression(
+          factory.createPropertyAccessExpression(
+            isRepeatableExpression(inner) ? inner : factory.createParenthesizedExpression(inner),
+            factory.createIdentifier('mul'),
+          ),
+          undefined,
+          [factory.createPrefixUnaryExpression(ts.SyntaxKind.MinusToken, factory.createNumericLiteral(1))],
+        );
+      }
+      // Unknown-typed operand: TS rejects unary minus on `unknown`
+      // (TS2571 / TS18046); bridge to number like binary arithmetic.
+      return factory.createPrefixUnaryExpression(
+        ts.SyntaxKind.MinusToken,
+        factory.createParenthesizedExpression(
+          assertExpression(inner, factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword)),
+        ),
+      );
+    }
     case '#': {
       const innerType = staticTypeOfExpr(expr.expr, ctx);
       if (innerType === 'string') {
@@ -5118,6 +5601,18 @@ function compileBinaryExpr(expr: Extract<Expr, { type: 'Binary' }>, ctx: Compile
     }
   }
 
+  // `vector` has no arithmetic methods in @rbxts/types. Bridge both
+  // operands through number (roblox-ts still emits the native operator,
+  // which Luau's vector metamethods handle) and cast the result back.
+  if (
+    ctx.compatMode === 'rbxts'
+    && ['+', '-', '*', '/'].includes(expr.op)
+    && (leftType === `datatype:${VECTOR_LIB_TYPE}` || rightType === `datatype:${VECTOR_LIB_TYPE}`)
+  ) {
+    const bridged = compileBinary(expr.op, left, right, ctx, expr.left, expr.right);
+    return assertExpression(bridged, factory.createTypeReferenceNode(VECTOR_LIB_TYPE, undefined));
+  }
+
   // Datatype fast-path: LEFT-typed Roblox datatype → `.add/.sub/.mul/.div(rhs)`
   // (the typed overload covers both same-datatype and scalar). Skipped when
   // only the RIGHT is datatype — `2 * v1` can't call `.mul()` on a JS number.
@@ -5130,10 +5625,30 @@ function compileBinaryExpr(expr: Extract<Expr, { type: 'Binary' }>, ctx: Compile
     };
     const method = methodMap[expr.op];
     if (method) {
+      // The static view may know the datatype while TS sees `unknown`
+      // (Record-routed member, untyped local); bridge the receiver so
+      // `.add()` resolves instead of surfacing TS2571.
+      const dtName = leftType.slice('datatype:'.length);
+      const receiver = ctx.compatMode !== 'rbxts' || isTrustedTypedExpr(expr.left, ctx)
+        ? left
+        : factory.createParenthesizedExpression(
+            assertExpression(left, factory.createTypeReferenceNode(dtName, undefined)),
+          );
+      // `.mul(unknown)` fails TS2345; bridge an untyped RHS to the
+      // datatype the static view names, else to number.
+      let operand = right;
+      if (ctx.compatMode === 'rbxts' && !isTrustedTypedExpr(expr.right, ctx)) {
+        operand = assertExpression(
+          right,
+          isDatatypeStatic(rightType)
+            ? factory.createTypeReferenceNode(rightType.slice('datatype:'.length), undefined)
+            : factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+        );
+      }
       return factory.createCallExpression(
-        factory.createPropertyAccessExpression(left, factory.createIdentifier(method)),
+        factory.createPropertyAccessExpression(receiver, factory.createIdentifier(method)),
         undefined,
-        [right],
+        [operand],
       );
     }
   }
@@ -5302,14 +5817,33 @@ function compileBinary(
         // Cast operands `as unknown as number` (not `as any`, which trips
         // roblox-ts no-any). Vector3 arithmetic uses the .add()/.sub() path
         // earlier; this fallback covers unknown-typed numeric operands.
+        // A member read whose receiver TS already types (declared
+        // datatype / class / shape, synthesized dynamic root, trusted
+        // static view) resolves on its own; the Record recast would only
+        // erase that type.
+        const receiverTsTyped = (src: Expr): boolean => {
+          if (src.type === 'Group' || src.type === 'TypeAssertion') return receiverTsTyped(src.expr);
+          if (src.type !== 'IndexName') return true;
+          if (isTrustedTypedExpr(src, ctx)) return true;
+          if (chainRootedInSynthesizedDynamic(src, ctx)) return true;
+          if (src.expr.type === 'Local') {
+            const n = src.expr.name;
+            return ctx.tsShapeTypedLocal.has(n)
+              || ctx.tsTypedClassLocal.has(n)
+              || ctx.tsDeclaredTypeLocal.has(n)
+              || (n === 'self' && !!ctx.selfFieldShapes);
+          }
+          return false;
+        };
         const wrap = (e: ts.Expression, srcExpr?: Expr) => {
-          if (srcExpr && staticTypeOfExpr(srcExpr, ctx) === 'number') {
-            return widenAccess(e);
+          const widened = srcExpr && receiverTsTyped(srcExpr) ? e : widenAccess(e);
+          if (srcExpr && tsSeesNumber(srcExpr, ctx)) {
+            return widened;
           }
           return factory.createParenthesizedExpression(
             factory.createAsExpression(
               factory.createAsExpression(
-                widenAccess(e),
+                widened,
                 factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
               ),
               factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
@@ -5374,7 +5908,7 @@ function compileBinary(
     // the cast when staticTypeOfExpr already knows the operand is `number`.
     if (ctx.compatMode === 'rbxts') {
       const wrap = (e: ts.Expression, srcExpr?: Expr) => {
-        if (srcExpr && staticTypeOfExpr(srcExpr, ctx) === 'number') {
+        if (srcExpr && tsSeesNumber(srcExpr, ctx)) {
           return e;
         }
         return factory.createParenthesizedExpression(
@@ -5618,6 +6152,110 @@ function scanYieldingFunctions(root: BlockStat, ctx: CompileContext): void {
   }
 }
 
+/** Collect `local function f(): T` / `function f(): T` return annotations
+ *  (single-type packs only) so call sites see the declared type. */
+function scanUserFunctionReturnTypes(root: BlockStat, ctx: CompileContext): void {
+  const note = (name: string, fn: { returnAnnotation: TypePack | null }): void => {
+    const pack = fn.returnAnnotation;
+    if (!pack || pack.type !== 'TypePackExplicit') return;
+    if (pack.typeList.types.length !== 1 || pack.typeList.tailType) return;
+    const t = typeFromAnnotation(pack.typeList.types[0]);
+    if (t !== 'unknown' && t !== 'nil') ctx.userFunctionReturnType.set(name, t);
+  };
+  walkLuauNodes(root, (n) => {
+    if (n.type === 'LocalFunction') {
+      const s = n as unknown as LocalFunctionStat;
+      note(s.name.name, s.func);
+    } else if (n.type === 'Function' && 'func' in n && 'name' in n) {
+      const s = n as unknown as { name: Expr; func: { returnAnnotation: TypePack | null } };
+      if (s.name && (s.name.type === 'Global' || s.name.type === 'Local')) {
+        note((s.name as { name: string }).name, s.func);
+      }
+    }
+  });
+}
+
+/** Per-slot types of a call whose @rbxts/types return is
+ *  `LuaTuple<[…]>`: oracle-typed methods on a receiver TS sees as that
+ *  class, and namespace-form string-library calls. Null when the tuple
+ *  isn't declared, so callers fall back to the `unknown[]` bridge. */
+function oracleTupleSlots(
+  call: Expr,
+  ctx: CompileContext,
+): { staticType: StaticValueType; className?: string }[] | null {
+  if (call.type !== 'Call' || call.func.type !== 'IndexName') return null;
+  const fn = call.func;
+  if (!call.self && fn.expr.type === 'Global' && fn.expr.name === 'string') {
+    if (fn.index === 'find') return [{ staticType: 'number' }, { staticType: 'number' }, { staticType: 'string' }];
+    if (fn.index === 'gsub') return [{ staticType: 'string' }, { staticType: 'number' }];
+    if (fn.index === 'match') return [{ staticType: 'string' }, { staticType: 'string' }, { staticType: 'string' }];
+    return null;
+  }
+  if (!call.self) return null;
+  const recvClass = tsVisibleClassOfExpr(fn.expr, ctx);
+  if (!recvClass) return null;
+  const ret = ctx.oracle.methodReturnType(recvClass, fn.index, call.args.length);
+  if (!ret || ret.kind !== 'raw') return null;
+  const m = /^LuaTuple<\[(.*)\]>$/s.exec(ret.text.trim());
+  if (!m) return null;
+  const parts: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of m[1]!) {
+    if (ch === '<' || ch === '[' || ch === '(') depth += 1;
+    if (ch === '>' || ch === ']' || ch === ')') depth -= 1;
+    if (ch === ',' && depth === 0) { parts.push(cur.trim()); cur = ''; continue; }
+    cur += ch;
+  }
+  if (cur.trim()) parts.push(cur.trim());
+  return parts.map((text) => {
+    if (text === 'number' || text === 'string' || text === 'boolean') return { staticType: text };
+    if (ARITH_DATATYPES.has(text)) return { staticType: `datatype:${text}` as StaticValueType };
+    if (ctx.oracle.isClass(text) && ctx.oracle.isA(text, 'Instance')) return { staticType: 'unknown', className: text };
+    return { staticType: 'unknown' };
+  });
+}
+
+/** Class TS itself sees for a receiver: a class-typed local, a service
+ *  global, or an oracle-resolved chain/call — never a flow-only guess. */
+function tsVisibleClassOfExpr(expr: Expr, ctx: CompileContext): string | undefined {
+  if (expr.type === 'Local') {
+    const cls = ctx.tsTypedClassLocal.get(expr.name);
+    if (cls && !ctx.tsLuauChildLocal.has(expr.name)) return cls;
+    // Datatype-annotated bindings (`pose: CFrame`) aren't Instances, so
+    // they never enter tsTypedClassLocal — but the oracle still knows
+    // their methods.
+    const declared = ctx.tsDeclaredTypeLocal.get(expr.name);
+    return isDatatypeStatic(declared ?? 'unknown') ? declared!.slice('datatype:'.length) : undefined;
+  }
+  if (expr.type === 'Global' && ctx.oracle.isService(expr.name)) return expr.name;
+  if (expr.type === 'Group' || expr.type === 'TypeAssertion') return tsVisibleClassOfExpr(expr.expr, ctx);
+  if (exprEmitsLuauChild(expr, ctx)) return undefined;
+  const cls = resolveOracleClassOfExpr(expr, ctx);
+  if (cls && ctx.oracle.isClass(cls)) return cls;
+  const st = staticTypeOfExpr(expr, ctx);
+  if (isDatatypeStatic(st) && isTrustedTypedExpr(expr, ctx)) return st.slice('datatype:'.length);
+  return undefined;
+}
+
+/** Top-level `local X = require(<path>)` → corpus path, for qualified
+ *  type references (`X.Foo`). Independent of the cached return-type
+ *  index so type imports work even when the module's value shape is
+ *  unknown. */
+function scanRequireLocalPaths(root: BlockStat, ctx: CompileContext): void {
+  for (const stat of root.body) {
+    if (stat.type !== 'Local') continue;
+    stat.vars.forEach((v, i) => {
+      const init = stat.values[i];
+      if (!init || init.type !== 'Call' || init.func.type !== 'Global' || init.func.name !== 'require') return;
+      const arg = init.args[0];
+      if (!arg) return;
+      const path = resolveRequirePath(arg, ctx.currentScriptPath);
+      if (path) ctx.requireLocalPaths.set(v.name, path);
+    });
+  }
+}
+
 function scanUserFunctionAllUnknownParams(root: BlockStat, ctx: CompileContext): void {
   const userFunctions = new Map<string, { args: { name: string; annotation: unknown }[]; body: BlockStat }>();
   walkLuauNodes(root, (n) => {
@@ -5826,6 +6464,7 @@ function castArgsForCall(
         // type stays `unknown`/`string` — the cast must still apply.
         const tsT = tsVisibleType(luau, ctx);
         if (tsT === expected) return arg;
+        if (expected === 'vector' && tsT === `datatype:${VECTOR_LIB_TYPE}`) return arg;
         if (expected === 'number|string' && (tsT === 'number' || tsT === 'string')) return arg;
         // Instance-slot acceptance for class-typed expressions. TS will
         // already see these as Instance subclasses, so the redundant
@@ -5923,6 +6562,7 @@ function slotKindToTypeNode(kind: SlotKind | undefined): ts.TypeNode | undefined
       factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
     ]);
     case 'instance': return factory.createTypeReferenceNode('Instance', undefined);
+    case 'vector': return factory.createTypeReferenceNode(VECTOR_LIB_TYPE, undefined);
     default: return undefined;
   }
 }
@@ -5950,7 +6590,7 @@ function calleeAsEntityName(expr: ts.Expression): ts.EntityName {
  *  the arg's static type already matches. The `'any'` slot means the
  *  declared param type is `unknown` — any arg is type-compatible without
  *  a cast. */
-type SlotKind = 'string' | 'number' | 'boolean' | 'number|string' | 'instance' | 'any';
+type SlotKind = 'string' | 'number' | 'boolean' | 'number|string' | 'instance' | 'vector' | 'any';
 type ExpectedSlots = { [i: number]: SlotKind } & { rest?: SlotKind };
 
 function expectedSlotTypes(callee: ts.Expression): ExpectedSlots | undefined {
@@ -6048,6 +6688,23 @@ function expectedSlotTypes(callee: ts.Expression): ExpectedSlots | undefined {
     case 'NumberRange.new':
     case 'Rect.new':
       return { 0: 'number', 1: 'number', 2: 'number', 3: 'number', rest: 'number' };
+    case 'vector.create':
+      return { 0: 'number', 1: 'number', 2: 'number' };
+    case 'vector.magnitude':
+    case 'vector.normalize':
+    case 'vector.floor':
+    case 'vector.ceil':
+    case 'vector.abs':
+    case 'vector.sign':
+      return { 0: 'vector' };
+    case 'vector.cross':
+    case 'vector.dot':
+    case 'vector.angle':
+    case 'vector.clamp':
+      return { 0: 'vector', 1: 'vector', 2: 'vector' };
+    case 'vector.max':
+    case 'vector.min':
+      return { 0: 'vector', rest: 'vector' };
     case 'string.reverse':
     case 'string.lower':
     case 'string.upper':
@@ -6115,6 +6772,20 @@ function isTrustedTypedExpr(expr: Expr, ctx: CompileContext): boolean {
     const flowed = flowFactToStatic(flowFactOf(expr, ctx));
     if (flowed && flowed !== 'unknown') return true;
   }
+  if (expr.type === 'IndexName' && expr.expr.type === 'Local') {
+    if (ctx.declaredFieldAnnotation(expr.expr.name, expr.index)) {
+      return staticTypeOfExpr(expr, ctx) !== 'unknown';
+    }
+  }
+  if (expr.type === 'IndexName') {
+    // Member of a TS-typed datatype receiver (`v.x` on `vector`,
+    // `cf.Position` on a trusted CFrame): @rbxts/types declares the
+    // property, so the read types exactly as the static view.
+    const recv = staticTypeOfExpr(expr.expr, ctx);
+    if (isDatatypeStatic(recv) && isTrustedTypedExpr(expr.expr, ctx)) {
+      return staticTypeOfExpr(expr, ctx) !== 'unknown';
+    }
+  }
   switch (expr.type) {
     case 'ConstantString':
     case 'ConstantNumber':
@@ -6123,17 +6794,38 @@ function isTrustedTypedExpr(expr: Expr, ctx: CompileContext): boolean {
       return true;
     case 'Group':
       return isTrustedTypedExpr(expr.expr, ctx);
+    case 'Unary':
+      // `#x` and `not x` always emit as number / boolean; `-x` keeps the
+      // operand's type, and its emit bridges an untyped operand itself.
+      return expr.op !== '-' || staticTypeOfExpr(expr, ctx) !== 'unknown';
     case 'TypeAssertion':
+      if (ctx.compatMode === 'rbxts' && compileType(expr.annotation).kind === ts.SyntaxKind.UnknownKeyword) {
+        return isTrustedTypedExpr(expr.expr, ctx);
+      }
       return true;
     case 'Local':
       return ctx.preInferredParamType.has(expr.name)
-        || ctx.tsTypedPrimitiveLocal.has(expr.name);
+        || ctx.tsTypedPrimitiveLocal.has(expr.name)
+        || ctx.tsDeclaredTypeLocal.has(expr.name);
+    case 'IndexExpr':
+      return expr.expr.type === 'Local'
+        && ctx.tsArrayTypedLocal.has(expr.expr.name)
+        && tsSeesNumber(expr.index, ctx)
+        && staticTypeOfExpr(expr, ctx) !== 'unknown';
     case 'Call': {
       const fn = expr.func;
       if (fn.type === 'Global' && (fn.name === 'tostring' || fn.name === 'tonumber')) return true;
+      if ((fn.type === 'Local' || fn.type === 'Global') && !expr.self && ctx.userFunctionReturnType.has(fn.name)) {
+        return true;
+      }
       if (fn.type === 'IndexName' && fn.expr.type === 'Global') {
         const ns = fn.expr.name;
         if (ns === 'math' || ns === 'string') return true;
+        // Datatype factories / `vector` library — @rbxts/types declares
+        // every one of these with a concrete return type.
+        if (ARITH_DATATYPES.has(ns) || ns === VECTOR_LIB_TYPE) {
+          return staticTypeOfExpr(expr, ctx) !== 'unknown';
+        }
       }
       // Receiver-method form for string lib (s:gsub etc): the methods
       // we route through namespace form, but for safety treat them as
@@ -6154,14 +6846,24 @@ function isTrustedTypedExpr(expr: Expr, ctx: CompileContext): boolean {
           return true;
         }
         if (ctx.compatMode === 'rbxts') {
-          const lt = staticTypeOfExpr(expr.left, ctx);
-          const rt = staticTypeOfExpr(expr.right, ctx);
-          if (lt === 'number' || rt === 'number') return true;
+          // Every non-datatype operand gets the `as unknown as number`
+          // bridge at emit time, so the TS-typed result is `number`
+          // whenever the LHS doesn't dispatch to `.add()`/`.sub()`; the
+          // `vector` bridge casts its result back explicitly.
+          const st = staticTypeOfExpr(expr, ctx);
+          if (st === 'number' || st === `datatype:${VECTOR_LIB_TYPE}`) return true;
+          return isTrustedTypedExpr(expr.left, ctx);
         }
         return false;
       }
       if (expr.op === '..') return true;
       return false;
+    case 'IfElse': {
+      const t = staticTypeOfExpr(expr, ctx);
+      return t !== 'unknown'
+        && isTrustedTypedExpr(expr.trueExpr, ctx)
+        && isTrustedTypedExpr(expr.falseExpr, ctx);
+    }
     default:
       return false;
   }
@@ -6879,6 +7581,16 @@ function shouldRouteDynamicChildRead(
       return false;
     }
   }
+  // Locals TS already types (annotated datatypes, trusted datatype
+  // inits) resolve members through @rbxts/types — no bridge.
+  if (expr.expr.type === 'Local' && isDatatypeStatic(ctx.tsDeclaredTypeLocal.get(expr.expr.name) ?? 'unknown')) {
+    return false;
+  }
+  // Declared table shape: the annotation names the field, so the read
+  // resolves against it directly.
+  if (expr.expr.type === 'Local' && ctx.declaredFieldAnnotation(expr.expr.name, expr.index)) {
+    return false;
+  }
   const observedUntypedLocal =
     expr.expr.type === 'Local'
     && !ctx.tsTypedClassLocal.has(expr.expr.name)
@@ -7234,8 +7946,17 @@ function compileTableExpr(
     );
   }
   if (allRecord) {
+    // Lua tolerates `{ a = 1, a = 2 }` (last write wins); TS rejects the
+    // duplicate (TS1117). Keep only the final occurrence of each key.
+    const lastIndexByKey = new Map<string, number>();
+    expr.items.forEach((i, idx) => {
+      if (i.key && i.key.type === 'ConstantString') lastIndexByKey.set(i.key.value, idx);
+    });
+    const deduped = expr.items.filter((i, idx) =>
+      !(i.key && i.key.type === 'ConstantString') || lastIndexByKey.get(i.key.value) === idx,
+    );
     return factory.createObjectLiteralExpression(
-      expr.items.map((i) => compileTableProp(i, ctx)),
+      deduped.map((i) => compileTableProp(i, ctx)),
       true,
     );
   }
@@ -7421,6 +8142,13 @@ export interface CompileOptions {
    *  source map's `sources` field — they're conflated only when this
    *  option is absent, in which case `sourceFile` is used for both. */
   corpusPath?: string;
+  /** Corpus path → emitted module path relative to the output root
+   *  (POSIX, no extension). With `outPath`, lets qualified type
+   *  references into required modules (`Mod.Foo`) emit as type-only
+   *  namespace imports instead of dangling namespace names. */
+  moduleOutPaths?: Map<string, string>;
+  /** This script's emitted module path, same form as `moduleOutPaths`. */
+  outPath?: string;
 }
 
 export interface CompileResult {
@@ -7449,10 +8177,13 @@ export async function compile(
   const parsed = await parse(source);
   const ctx = new CompileContext(options.compatMode ?? 'native');
   ctx.staticTypeOf = (expr) => staticTypeOfExpr(expr as Expr, ctx);
+  ctx.tsVisibleTypeOf = (expr) => tsVisibleType(expr as Expr, ctx);
   if (options.moduleReturnTypes) ctx.moduleReturnTypes = options.moduleReturnTypes;
   if (options.moduleRecordMapFields) ctx.moduleRecordMapFields = options.moduleRecordMapFields;
   if (options.moduleExportedMembers) ctx.moduleExportedMembers = options.moduleExportedMembers;
   ctx.currentScriptPath = options.corpusPath ?? options.sourceFile ?? '';
+  if (options.moduleOutPaths) ctx.moduleOutPaths = options.moduleOutPaths;
+  ctx.currentOutPath = options.outPath ?? '';
   // rbxts mode: split inline `:WaitForChild():WaitForChild()` instance-nav
   // chains into named locals so each link's oracle-resolved class flows
   // cleanly (instead of getting absorbed by a single `as X` at the end).
@@ -7496,6 +8227,7 @@ export async function compile(
     ctx.flowFinalLocalFacts = flow.localFinalFacts;
     scanUserFunctionReturnClasses(rootBlock, ctx);
     scanUserFunctionAllUnknownParams(rootBlock, ctx);
+    scanUserFunctionReturnTypes(rootBlock, ctx);
     // Backprop: locals whose downstream usage only consists of Instance
     // members get marked `tsTypedClassLocal = Instance` so receiver gates
     // skip the Record routing and the init is widened via `as unknown as
@@ -7532,9 +8264,24 @@ export async function compile(
       }
     };
     walkAliases(parsed.root);
+    walkLuauNodes(parsed.root, (n) => {
+      if (n.type === 'TypeAlias') {
+        const alias = n as unknown as TypeAliasStat;
+        if (alias.generics.length === 0 && alias.genericPacks.length === 0) {
+          ctx.typeAliases.set(alias.name, alias.aliasType);
+        }
+      }
+    });
   }
   setAliasArities(aliasArities);
+  setAliasBodies(ctx.typeAliases);
   setTypeCompatMode(ctx.compatMode);
+  if (parsed.root) scanRequireLocalPaths(parsed.root, ctx);
+  // A qualified type reference (`Mod.Foo`) would need `Mod` to export
+  // types, which a module emitting `export = value` cannot do. Leave the
+  // prefix as written rather than importing a namespace that has no
+  // types to offer.
+  setTypePrefixResolver(null);
 
   // rbxts mode pre-scan: walk every top-level function declaration and
   // remember those whose body emits multi-return (any return path with
@@ -7647,16 +8394,45 @@ export async function compile(
   }
   const stmts: ts.Statement[] = rootBlock ? compileBlockBody(rootBlock, ctx) : [];
   if (rootShapes) ctx.popShapeScope();
-  // ModuleScript trailing `return X` → `export default X`. Conservative:
-  // multi-statement scripts only (single-line `return X` test snippets stay).
-  if (stmts.length > 1) {
-    const last = stmts[stmts.length - 1]!;
-    if (ts.isReturnStatement(last) && last.expression) {
+  // ModuleScript trailing `return X` → `export = X`. roblox-ts rejects a
+  // module-scope `return` outright (TS1108), so rbxts mode always rewrites;
+  // native mode keeps single-line `return X` snippets as-is.
+  if (stmts.length > 1 || ctx.compatMode === 'rbxts') {
+    const last = stmts[stmts.length - 1];
+    if (last && ts.isReturnStatement(last) && last.expression) {
+      // rbxts: `export = X` is the ModuleScript contract — roblox-ts
+      // lowers it to `return X`, matching the Luau the module came
+      // from. `export default X` would lower to `return { default = X }`
+      // and break every consumer's `require(M).member` access.
       stmts[stmts.length - 1] = factory.createExportAssignment(
         undefined,
-        false,
+        ctx.compatMode === 'rbxts',
         last.expression,
       );
+      // TS forbids an export assignment beside any other exported
+      // element, and Luau's `export type` has no TS equivalent under
+      // `export =` (a module can export a value or a namespace of
+      // types, not both). Runtime shape wins: the aliases stay
+      // file-local. Cross-module references to them don't resolve —
+      // see the `export type` note in the README.
+      if (ctx.compatMode === 'rbxts') {
+        for (let i = 0; i < stmts.length; i++) {
+          const s = stmts[i];
+          if (
+            s
+            && ts.isTypeAliasDeclaration(s)
+            && s.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
+          ) {
+            stmts[i] = factory.updateTypeAliasDeclaration(
+              s,
+              s.modifiers.filter((m) => m.kind !== ts.SyntaxKind.ExportKeyword),
+              s.name,
+              s.typeParameters,
+              s.type,
+            );
+          }
+        }
+      }
       // roblox-ts rejects `export = let`. Flip the matching top-level `let`
       // to `const` when the export expression is an identifier match.
       if (ctx.compatMode === 'rbxts' && ts.isIdentifier(last.expression)) {
@@ -7863,6 +8639,7 @@ export async function compile(
     if (ctx.compatMode === 'rbxts' && module === '@rbxts/types') continue;
     allStatements.push(buildNamedImport(module, names));
   }
+  setTypePrefixResolver(null);
   // `declare const X: any;` for ambient globals (native mode). Skipped in
   // rbxts since @rbxts/types provides typed globals — `: any` would shadow
   // them and break roblox-ts's for-of iteration analysis.
@@ -8179,6 +8956,7 @@ const HOST_PROVIDED_GLOBALS = new Set([
   'utf8',
   'bit32',
   'buffer',
+  'vector',
   'debug',
   // Roblox datatypes (provided by import)
   'Instance',
@@ -8317,6 +9095,7 @@ const AMBIENT_GLOBALS = new Set([
   'coroutine',
   'bit32',
   'buffer',
+  'vector',
   'debug',
   'utf8',
   'io',

@@ -31,11 +31,29 @@ export function setAliasArities(map: Map<string, { generics: number; hasPack: bo
   aliasArities = map;
 }
 
+/** Bodies of the script's non-generic `type X = …` declarations, so key
+ *  types that name an alias can be resolved. Set per compile() run. */
+let aliasBodies: Map<string, TypeNode> = new Map();
+
+export function setAliasBodies(map: Map<string, TypeNode>): void {
+  aliasBodies = map;
+}
+
 /** Module-scoped mode flag: set by compile() before every run. Lets the
  *  type compiler emit `undefined` for `nil` in rbxts mode (where roblox-ts
  *  rejects `null` outright) while keeping the original `null` mapping in
  *  native mode (where every nilable annotation `T?` is `T | null`). */
 let currentCompatMode: 'native' | 'rbxts' = 'native';
+
+/** Resolves the prefix of a qualified Luau type reference (`Mod.Foo`,
+ *  where `Mod` is a require-bound local) to the alias of a type-only
+ *  namespace import, or undefined to leave the prefix as written. Set
+ *  by compile() per run. */
+let typePrefixResolver: ((prefix: string) => string | undefined) | null = null;
+
+export function setTypePrefixResolver(fn: ((prefix: string) => string | undefined) | null): void {
+  typePrefixResolver = fn;
+}
 
 export function setTypeCompatMode(mode: 'native' | 'rbxts'): void {
   currentCompatMode = mode;
@@ -45,6 +63,29 @@ function nilTypeNode(): ts.TypeNode {
   return currentCompatMode === 'rbxts'
     ? factory.createKeywordTypeNode(ts.SyntaxKind.UndefinedKeyword)
     : factory.createLiteralTypeNode(factory.createNull());
+}
+
+/** Primitive named by a Luau annotation, or undefined when the annotation
+ *  is absent, non-primitive, or generic. Used to register locals/params
+ *  whose emitted TS declaration TS itself types as that primitive. */
+export function primitiveFromAnnotation(
+  t: TypeNode | null | undefined,
+): 'number' | 'string' | 'boolean' | undefined {
+  if (!t) return undefined;
+  switch (t.type) {
+    case 'TypeReference':
+      if (t.prefix || t.parameters.length > 0) return undefined;
+      if (t.name === 'number' || t.name === 'string' || t.name === 'boolean') return t.name;
+      return undefined;
+    case 'TypeSingletonBool':
+      return 'boolean';
+    case 'TypeSingletonString':
+      return 'string';
+    case 'TypeGroup':
+      return primitiveFromAnnotation(t.groupType);
+    default:
+      return undefined;
+  }
 }
 
 export function compileType(t: TypeNode | null | undefined): ts.TypeNode {
@@ -121,8 +162,9 @@ function compileTypeReference(t: TypeReferenceNode): ts.TypeNode {
     return factory.createKeywordTypeNode(kw);
   }
 
-  const name = t.prefix
-    ? factory.createQualifiedName(factory.createIdentifier(t.prefix), t.name)
+  const resolvedPrefix = t.prefix ? (typePrefixResolver?.(t.prefix) ?? t.prefix) : null;
+  const name = resolvedPrefix
+    ? factory.createQualifiedName(factory.createIdentifier(resolvedPrefix), t.name)
     : factory.createIdentifier(t.name);
 
   // Convert each Luau type arg to a TS type node. Type-pack args (rare in
@@ -168,6 +210,29 @@ function compileTypeReference(t: TypeReferenceNode): ts.TypeNode {
   return factory.createTypeReferenceNode(name, typeArgs.length > 0 ? typeArgs : undefined);
 }
 
+/** True for key types a TS mapped type can iterate: string/number
+ *  literals and unions of them. */
+function isLiteralKeyType(t: TypeNode): boolean {
+  switch (t.type) {
+    case 'TypeGroup':
+      return isLiteralKeyType(t.groupType);
+    case 'TypeSingletonString':
+      return true;
+    case 'TypeUnion':
+      return t.types.length > 0 && t.types.every(isLiteralKeyType);
+    case 'TypeReference': {
+      // A script-local alias may itself be a literal union
+      // (`type Level = "a" | "b"`). A name with no alias is a global
+      // type — a Roblox class, say — which can't key a mapped type.
+      if (t.prefix || t.parameters.length > 0) return false;
+      const body = aliasBodies.get(t.name);
+      return !!body && isLiteralKeyType(body);
+    }
+    default:
+      return false;
+  }
+}
+
 function compileTypeTable(t: TypeTableNode): ts.TypeNode {
   // Luau's `{T}` is the conventional array shorthand for `{[number]: T}`.
   // Emit it as a TS array `T[]` so `push`/`pop`/`length` work; falling
@@ -207,6 +272,28 @@ function compileTypeTable(t: TypeTableNode): ts.TypeNode {
     const isPlainIndex =
       idxName !== null
       && (idxName === 'string' || idxName === 'number' || idxName === 'symbol');
+    // A mapped type only works when the key is a union of literals. Luau
+    // tables keyed by an object (`{[Player]: boolean}`) have no TS
+    // equivalent, and every bracket access we emit casts the key to
+    // string — so a string index signature is what matches the emit.
+    if (!isPlainIndex && !isLiteralKeyType(idx)) {
+      members.push(
+        factory.createIndexSignature(
+          undefined,
+          [
+            factory.createParameterDeclaration(
+              undefined,
+              undefined,
+              factory.createIdentifier('key'),
+              undefined,
+              factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+            ),
+          ],
+          compileType(t.indexer.resultType),
+        ),
+      );
+      return factory.createTypeLiteralNode(members);
+    }
     if (!isPlainIndex) {
       const mapped = factory.createMappedTypeNode(
         undefined,

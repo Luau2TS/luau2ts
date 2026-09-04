@@ -924,3 +924,135 @@ describe('compile — class-shape (setmetatable OOP)', () => {
     expect(r.source).toMatch(/health!\s*:/);
   });
 });
+
+describe('compile — rbxts type fidelity', () => {
+  const rbxts = (source: string) =>
+    compile(source, { compatMode: 'rbxts' });
+
+  it('ModuleScript return emits `export =`, not `export default`', async () => {
+    // roblox-ts lowers `export default X` to `return { default = X }`,
+    // which breaks every consumer's `require(M).member` access.
+    const r = await rbxts('local M = {}\nfunction M.go() end\nreturn M');
+    expect(r.source).toContain('export = M');
+    expect(r.source).not.toContain('export default');
+  });
+
+  it('exported type aliases drop `export` beside an export assignment', async () => {
+    // TS2309: an export assignment cannot sit beside another exported
+    // element, and `export =` has no way to also expose types.
+    const r = await rbxts('export type Frame = { n: number }\nlocal M = {}\nreturn M');
+    expect(r.source).toContain('type Frame');
+    expect(r.source).not.toContain('export type Frame');
+    expect(r.source).toContain('export = M');
+  });
+
+  it('annotated primitive params need no cast at use sites', async () => {
+    const r = await rbxts('local function f(a: number, b: number) return a + b end');
+    expect(norm(r.source)).toContain('return a + b;');
+    expect(r.source).not.toContain('as unknown as number');
+  });
+
+  it('an annotation beats body-usage primitive inference', async () => {
+    // `p - q` on two vectors must not conclude `p: number`.
+    const r = await rbxts('local function f(p: vector, q: vector) return p - q end');
+    expect(r.source).toContain('p: vector');
+    expect(r.source).toContain('q: vector');
+  });
+
+  it('vector arithmetic bridges through number and casts back', async () => {
+    // @rbxts/types declares `vector` with no arithmetic methods, so the
+    // operands go through number and the result is restored.
+    const r = await rbxts('local function f(v: vector, s: number) return v * s end');
+    expect(r.source).toContain('as unknown as vector');
+  });
+
+  it('vector library results keep their type', async () => {
+    const r = await rbxts('local v = vector.create(1, 2, 3)\nprint(vector.magnitude(v))');
+    expect(r.source).toContain('const v = vector.create(1, 2, 3)');
+    expect(r.source).toContain('vector.magnitude(v)');
+  });
+
+  it('array-annotated locals index 0-based so roblox-ts rebases them back', async () => {
+    // roblox-ts lowers TS `t[i - 1]` to Lua `t[i]`.
+    const r = await rbxts('local function f(t: {number}, i: number)\nt[i] = t[i] + 1\nreturn t[1]\nend');
+    expect(r.source).toContain('t[i - 1]');
+    expect(r.source).toContain('t[0]');
+    expect(r.source).not.toContain('Record<string, unknown>');
+  });
+
+  it('fields resolve through a table type alias', async () => {
+    const r = await rbxts('type E = { hp: number }\nlocal function f(e: E) return e.hp - 1 end');
+    expect(norm(r.source)).toContain('return e.hp - 1;');
+  });
+
+  it('a string indexer types every named field', async () => {
+    const r = await rbxts('type B = { [string]: number }\nlocal function f(b: B) return b.x + b.y end');
+    expect(norm(r.source)).toContain('return b.x + b.y;');
+  });
+
+  it('a loop variable does not inherit an outer binding annotation', async () => {
+    const r = await rbxts(`
+      type Row = { w: number }
+      local row: Row = { w = 1 }
+      for _, item in pairs(rows) do
+        local row = item
+        print(row.w)
+      end
+      print(row.w)
+    `);
+    // The inner `row` is untyped, so its member read keeps the bridge.
+    expect(r.source).toContain('Record<string, unknown>');
+  });
+
+  it('object-keyed tables emit a string index signature, not a mapped type', async () => {
+    // `{ [K in Player]: V }` is invalid — Player is not a literal union.
+    const r = await rbxts('local t: { [Player]: boolean } = {}');
+    expect(r.source).toContain('[key: string]: boolean');
+    expect(r.source).not.toContain('K in Player');
+  });
+
+  it('duplicate record keys collapse to the last write', async () => {
+    // Lua allows `{a = 1, a = 2}`; TS rejects the duplicate (TS1117).
+    const r = await rbxts('local t = { a = 1, b = 2, a = 3 }');
+    expect(r.source).toContain('a: 3');
+    expect(r.source).not.toContain('a: 1');
+    expect(r.source).toContain('b: 2');
+  });
+
+  it('`:: any` is a no-op rather than an `unknown` bridge', async () => {
+    // Casting to `unknown` would erase what TS already knew.
+    const r = await rbxts('local p = Instance.new("Part") :: any\nprint(p.Name)');
+    expect(r.source).not.toContain('as unknown');
+  });
+
+  it('`function C.m(self, ...)` is a method, not a static', async () => {
+    const r = await rbxts(`
+      local C = {}
+      C.__index = C
+      function C.new()
+        return setmetatable({ n = 0 }, C)
+      end
+      function C.step(self, d)
+        self.n += d
+      end
+      return C
+    `);
+    expect(r.source).not.toMatch(/static\s+step/);
+  });
+
+  it('a numeric for over unknown bounds bridges the bounds', async () => {
+    const r = await rbxts('local function f(cfg)\nfor i = 1, cfg.count do print(i) end\nend');
+    expect(r.source).toContain('as unknown as number');
+    expect(norm(r.source)).toContain('i <= ');
+  });
+
+  it('the ipairs index slot is a number', async () => {
+    const r = await rbxts('local function f(t)\nfor i, v in ipairs(t) do print(i + 1) end\nend');
+    expect(norm(r.source)).toContain('i + 1');
+  });
+
+  it('a declared return type bridges a value TS cannot prove', async () => {
+    const r = await rbxts('local function f(x): number\nreturn x\nend');
+    expect(r.source).toContain('as unknown as number');
+  });
+});

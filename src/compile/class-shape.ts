@@ -12,6 +12,7 @@ import type { CompileContext } from './context.js';
 import { collectLocalNames, collectShapes, mergeShape, shapeToTypeNode } from './shape-infer.js';
 import { inferParamPrimitives, type Primitive as ParamPrimitive } from './param-infer.js';
 import { compileType } from './type.js';
+import { safeIdentifier } from './util.js';
 
 const { factory } = ts;
 
@@ -390,7 +391,11 @@ export function compileClassPattern(
     if (nameExpr.type !== 'IndexName') continue;
     const methodName = nameExpr.index;
     const fnExpr = method.func;
-    const fnArgs = (fnExpr.args ?? []);
+    // `function M.step(self, ...)` is the dot-syntax spelling of a method:
+    // the explicit `self` param folds into `this`, not a static slot.
+    const explicitSelf =
+      (nameExpr as { op?: string }).op === '.' && fnExpr.args?.[0]?.name === 'self';
+    const fnArgs = explicitSelf ? (fnExpr.args ?? []).slice(1) : (fnExpr.args ?? []);
     let optionalFrom = ctx.compatMode === 'rbxts'
       ? trailingMissingStart(fnArgs)
       : fnArgs.length;
@@ -455,7 +460,7 @@ export function compileClassPattern(
         ),
       );
     }
-    const isStatic = (nameExpr as { op?: string }).op === '.';
+    const isStatic = (nameExpr as { op?: string }).op === '.' && !explicitSelf;
     // Each method gets its own withScope so locals don't bleed between sibling methods.
     if (methodShapes) ctx.pushShapeScope(methodShapes as Map<string, unknown>);
     // Expose the class's self-shape so compileAssign for `self.X = Y`
@@ -473,16 +478,22 @@ export function compileClassPattern(
     if (methodShapes && ctx.compatMode === 'rbxts') {
       for (const a of fnArgs) {
         const sh = methodShapes.get(a.name);
-        if (sh && !sh.empty && !ctx.tsShapeTypedLocal.has(a.name)) {
+        const annotatedUnknown = !!a.annotation && compileType(a.annotation).kind === ts.SyntaxKind.UnknownKeyword;
+        if (sh && !sh.empty && !annotatedUnknown && !ctx.tsShapeTypedLocal.has(a.name)) {
           ctx.tsShapeTypedLocal.add(a.name);
           trackedShapeParams.push(a.name);
         }
       }
     }
+    ctx.returnAnnotationStack.push(fnExpr.returnAnnotation);
     const rawBody = ctx.withScope(() => {
-      for (const a of fnExpr.args ?? []) ctx.defineLocal(a.name, 'unknown');
+      for (const a of fnExpr.args ?? []) {
+        ctx.defineLocal(a.name, 'unknown');
+        ctx.noteDeclaredType(a.name, a.annotation);
+      }
       return compileBlockBody(fnExpr.body as Stat, ctx);
     });
+    ctx.returnAnnotationStack.pop();
     for (const n of trackedShapeParams) ctx.tsShapeTypedLocal.delete(n);
     ctx.selfFieldShapes = prevSelfFieldShapes;
     if (methodShapes) ctx.popShapeScope();
@@ -691,7 +702,7 @@ function paramDecl(
   const question = isTrailingUnannotated && !a.annotation && !hasInferredShape
     ? factory.createToken(ts.SyntaxKind.QuestionToken)
     : undefined;
-  return factory.createParameterDeclaration(undefined, undefined, a.name, question, ty);
+  return factory.createParameterDeclaration(undefined, undefined, safeIdentifier(a.name), question, ty);
 }
 
 /** Params whose runtime type admits missing (unannotated or nilable). */

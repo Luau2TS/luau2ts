@@ -75,6 +75,13 @@ async function writeCompiled(
 /** Translate a .luau source filename to its .ts counterpart, preserving
  *  Rojo-style `.server` / `.client` suffixes so the output still maps to
  *  the original instance kind. */
+/** Output-relative `.ts` path → module path for import specifiers
+ *  (POSIX separators, extension stripped). */
+function modulePathOf(outRel: string): string {
+  const posix = outRel.split(/[\\/]/).join('/');
+  return posix.endsWith('.ts') ? posix.slice(0, -3) : posix;
+}
+
 function tsCounterpart(filename: string): string {
   const lower = filename.toLowerCase();
   const replacements: { from: string; to: string }[] = [
@@ -200,19 +207,27 @@ export async function compileDirMode(
     })),
   );
 
+  const moduleOutPaths = new Map<string, string>();
+  for (const e of entries) {
+    const rel = relative(inputRoot, e.filePath);
+    moduleOutPaths.set(e.corpusPath, modulePathOf(join(dirname(rel), tsCounterpart(basename(rel)))));
+  }
+
   let anyErrors = false;
   for (const e of entries) {
     const base = compileOptionsFor(e.filePath, opts);
+    const rel = relative(inputRoot, e.filePath);
+    const outRel = join(dirname(rel), tsCounterpart(basename(rel)));
     const result = await compile(e.source, {
       ...base,
       corpusPath: e.corpusPath,
       moduleReturnTypes,
       moduleRecordMapFields,
       moduleExportedMembers,
+      moduleOutPaths,
+      outPath: modulePathOf(outRel),
     });
     if (reportErrors(e.filePath, result)) anyErrors = true;
-    const rel = relative(inputRoot, e.filePath);
-    const outRel = join(dirname(rel), tsCounterpart(basename(rel)));
     await writeCompiled(join(outputRoot, outRel), result, opts.sourcemap);
     await emitDtsIfApplicable({
       outputRoot,
@@ -267,20 +282,31 @@ export async function compileProjectMode(
   }));
   const { index, moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers } = await buildCorpus(corpusScripts);
 
+  const moduleOutPaths = new Map<string, string>();
+  for (const entry of project.scripts) {
+    const rel = relative(projectDir, entry.filePath);
+    moduleOutPaths.set(
+      instancePathToCorpusPath(entry.instancePath),
+      modulePathOf(join(dirname(rel), tsCounterpart(basename(rel)))),
+    );
+  }
+
   let anyErrors = false;
   for (const entry of project.scripts) {
     const corpusPath = instancePathToCorpusPath(entry.instancePath);
     const base = compileOptionsFor(entry.filePath, opts);
+    const rel = relative(projectDir, entry.filePath);
+    const outRel = join(dirname(rel), tsCounterpart(basename(rel)));
     const result = await compile(entry.source, {
       ...base,
       corpusPath,
       moduleReturnTypes,
       moduleRecordMapFields,
       moduleExportedMembers,
+      moduleOutPaths,
+      outPath: modulePathOf(outRel),
     });
     if (reportErrors(entry.filePath, result)) anyErrors = true;
-    const rel = relative(projectDir, entry.filePath);
-    const outRel = join(dirname(rel), tsCounterpart(basename(rel)));
     await writeCompiled(join(outputRoot, outRel), result, opts.sourcemap);
     await emitDtsIfApplicable({
       outputRoot,

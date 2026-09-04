@@ -42,6 +42,38 @@ function stringLit(e: P.Expr | undefined): string | undefined {
   return undefined;
 }
 
+/** Fact for a Luau type annotation: primitives, oracle classes (nullable
+ *  when unioned with nil), and `{T}` arrays. Anything else is unknown. */
+function annotationToFact(t: P.TypeNode | null | undefined, ctx: CompileContext): FlowFact {
+  if (!t) return { kind: 'unknown' };
+  switch (t.type) {
+    case 'TypeGroup':
+      return annotationToFact(t.groupType, ctx);
+    case 'TypeReference': {
+      if (t.prefix || t.parameters.length > 0) return { kind: 'unknown' };
+      if (t.name === 'number' || t.name === 'string' || t.name === 'boolean') {
+        return { kind: 'primitive', name: t.name };
+      }
+      if (ctx.oracle.isClass(t.name)) return { kind: 'class', name: t.name };
+      return { kind: 'unknown' };
+    }
+    case 'TypeUnion': {
+      const nonNil = t.types.filter((m) => !(m.type === 'TypeReference' && m.name === 'nil') && m.type !== 'TypeOptional');
+      if (nonNil.length !== 1 || nonNil.length === t.types.length) return { kind: 'unknown' };
+      const inner = annotationToFact(nonNil[0], ctx);
+      return inner.kind === 'class' ? { kind: 'class', name: inner.name, nullable: true } : { kind: 'unknown' };
+    }
+    case 'TypeTable': {
+      if (t.props.length === 0 && t.indexer && t.indexer.indexType.type === 'TypeReference' && t.indexer.indexType.name === 'number') {
+        return { kind: 'array', element: annotationToFact(t.indexer.resultType, ctx) };
+      }
+      return { kind: 'unknown' };
+    }
+    default:
+      return { kind: 'unknown' };
+  }
+}
+
 function oracleTypeToFact(type: ReturnType<CompileContext['oracle']['propertyType']>): FlowFact {
   if (!type) return { kind: 'unknown' };
   if (type.kind === 'class') {
@@ -159,6 +191,9 @@ function computeExpressionFact(
       return { kind: 'unknown' };
     }
     case 'IndexName': {
+      if (expr.expr.type === 'Global' && expr.expr.name === 'math' && (expr.index === 'huge' || expr.index === 'pi')) {
+        return { kind: 'primitive', name: 'number' };
+      }
       const receiverFact = expressionFact(expr.expr, env, ctx, factMap);
       const prop = expr.index;
       if (receiverFact.kind === 'class') {
@@ -184,6 +219,8 @@ function computeExpressionFact(
       }
       return { kind: 'unknown' };
     }
+    case 'TypeAssertion':
+      return annotationToFact(expr.annotation, ctx);
     case 'Unary': {
       if (expr.op === 'not') return { kind: 'primitive', name: 'boolean' };
       if (expr.op === '-') return { kind: 'primitive', name: 'number' };
@@ -333,9 +370,13 @@ function visitStat(
     case 'Local': {
       for (let i = 0; i < stat.vars.length; i += 1) {
         const v = stat.vars[i]!;
-        const fact = stat.values[i]
+        const initFact: FlowFact = stat.values[i]
           ? expressionFact(stat.values[i]!, env, ctx, facts)
           : { kind: 'unknown' as const };
+        // An explicit annotation is the emitted TS type; it wins over an
+        // unknown init and is what TS sees regardless.
+        const annotated = annotationToFact(v.annotation, ctx);
+        const fact = annotated.kind !== 'unknown' ? annotated : initFact;
         env.scope.set(v.name, fact);
         localFinalFacts.set(v.name, fact);
       }
@@ -348,7 +389,7 @@ function visitStat(
       // walk through param locals
       for (const local of stat.func.args ?? []) {
         if (local && typeof local === 'object' && 'name' in local) {
-          inner.scope.set((local as { name: string }).name, { kind: 'unknown' });
+          inner.scope.set(local.name, annotationToFact(local.annotation, ctx));
         }
       }
       if (stat.func.body) visitBlock(stat.func.body, inner, ctx, facts, localFinalFacts);
@@ -358,7 +399,7 @@ function visitStat(
       const inner: Env = { scope: new Map(), parent: env };
       for (const local of stat.func.args ?? []) {
         if (local && typeof local === 'object' && 'name' in local) {
-          inner.scope.set((local as { name: string }).name, { kind: 'unknown' });
+          inner.scope.set(local.name, annotationToFact(local.annotation, ctx));
         }
       }
       if (stat.func.body) visitBlock(stat.func.body, inner, ctx, facts, localFinalFacts);

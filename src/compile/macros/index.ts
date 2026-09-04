@@ -59,10 +59,7 @@ export function registerConstructorMacro(
             // primitive in TS's view — Constant literals, math.X calls,
             // arithmetic on trusted operands, param-inferred number
             // locals, etc.
-            if (luauArg && ctx.staticTypeOf(luauArg) === 'number'
-                && isStaticallyNumberLuau(luauArg, ctx)) {
-              return a;
-            }
+            if (luauArg && ctx.tsVisibleTypeOf(luauArg) === 'number') return a;
             return factory.createAsExpression(
               factory.createAsExpression(
                 ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
@@ -84,32 +81,6 @@ export function registerConstructorMacro(
   );
 }
 
-/** True when a Luau expression compiles to a TS-side `number`-typed
- *  expression. Constant literals are the safe baseline; arithmetic /
- *  math.X / tonumber chains stay trusted; locals are trusted when the
- *  compiler has annotated them as `number` (param-infer or
- *  local-type-infer). */
-function isStaticallyNumberLuau(expr: Expr, ctx?: MacroArgs['ctx']): boolean {
-  if (expr.type === 'ConstantNumber' || expr.type === 'ConstantInteger') return true;
-  if (expr.type === 'Group') return isStaticallyNumberLuau(expr.expr, ctx);
-  if (expr.type === 'Unary' && expr.op === '-') return isStaticallyNumberLuau(expr.expr, ctx);
-  if (expr.type === 'Binary' && ['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
-    // rbxts compileBinary casts unknown operands to `number`, so when one
-    // side is statically number the TS-emitted expression types as number.
-    return isStaticallyNumberLuau(expr.left, ctx) || isStaticallyNumberLuau(expr.right, ctx);
-  }
-  if (expr.type === 'Call') {
-    const fn = expr.func;
-    if (fn.type === 'Global' && fn.name === 'tonumber') return true;
-    if (fn.type === 'IndexName' && fn.expr.type === 'Global' && fn.expr.name === 'math') return true;
-  }
-  if (expr.type === 'Local' && ctx) {
-    if (ctx.preInferredParamType.get(expr.name) === 'number') return true;
-    if (ctx.tsTypedPrimitiveLocal.has(expr.name)
-        && ctx.localTypeMap.byName.get(expr.name) === 'number') return true;
-  }
-  return false;
-}
 
 /** Look up the call shape and return a fired macro's TS expression, or
  *  `undefined` if no macro matched the current `compatMode`. */

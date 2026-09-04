@@ -197,7 +197,18 @@ function walkBlock(
 
 export function inferParamPrimitives(fn: P.FunctionExpr): Map<string, Primitive> {
   const params = new Map<string, ParamFact>();
-  for (const p of fn.args) params.set(p.name, 'unknown');
+  // An explicit annotation is the author's declaration and becomes the
+  // emitted TS type; body-usage inference must not contradict it (a
+  // `p: vector` param used in `p - q` is not a number).
+  for (const p of fn.args) {
+    if (!p.annotation) {
+      params.set(p.name, 'unknown');
+    } else if (p.annotation.type === 'TypeReference' && !p.annotation.prefix
+      && p.annotation.parameters.length === 0
+      && (p.annotation.name === 'number' || p.annotation.name === 'string' || p.annotation.name === 'boolean')) {
+      params.set(p.name, p.annotation.name);
+    }
+  }
   const observe = (name: string, t: ParamFact): void => {
     if (!params.has(name)) return;
     params.set(name, constrain(params.get(name)!, t));

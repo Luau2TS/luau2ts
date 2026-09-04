@@ -191,10 +191,13 @@ registerMacro(
         ]),
       ),
     );
-    const castedCmp = cmp
+    const cmpInner = cmp && (ts.isArrowFunction(cmp) || ts.isFunctionExpression(cmp))
+      ? factory.createParenthesizedExpression(cmp)
+      : cmp;
+    const castedCmp = cmpInner
       ? factory.createAsExpression(
           factory.createAsExpression(
-            cmp,
+            cmpInner,
             factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
           ),
           factory.createFunctionTypeNode(

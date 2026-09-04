@@ -51,9 +51,7 @@ function emitStaticCall(typeName: string, method: string): (a: MacroArgs) => ts.
           // Skip cast when the arg is statically a number per Luau
           // type inference — constant numerics, math.X results,
           // arithmetic on trusted operands, param-typed locals.
-          if (luauArg && ctx.staticTypeOf(luauArg) === 'number' && isLuauStaticallyNumber(luauArg, ctx)) {
-            return a;
-          }
+          if (luauArg && ctx.tsVisibleTypeOf(luauArg) === 'number') return a;
           return factory.createAsExpression(
             factory.createAsExpression(
               ts.isBinaryExpression(a) || ts.isConditionalExpression(a)
@@ -76,30 +74,6 @@ function emitStaticCall(typeName: string, method: string): (a: MacroArgs) => ts.
   };
 }
 
-function isLuauStaticallyNumber(
-  expr: import('../../parser/index.js').Expr,
-  ctx?: MacroArgs['ctx'],
-): boolean {
-  if (expr.type === 'ConstantNumber' || expr.type === 'ConstantInteger') return true;
-  if (expr.type === 'Group') return isLuauStaticallyNumber(expr.expr, ctx);
-  if (expr.type === 'Unary' && expr.op === '-') return isLuauStaticallyNumber(expr.expr, ctx);
-  if (expr.type === 'Binary' && ['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
-    // rbxts arithmetic casts unknown operands to `number`, so if either
-    // side is statically number the TS-emitted expression types as number.
-    return isLuauStaticallyNumber(expr.left, ctx) || isLuauStaticallyNumber(expr.right, ctx);
-  }
-  if (expr.type === 'Call') {
-    const fn = expr.func;
-    if (fn.type === 'Global' && fn.name === 'tonumber') return true;
-    if (fn.type === 'IndexName' && fn.expr.type === 'Global' && fn.expr.name === 'math') return true;
-  }
-  if (expr.type === 'Local' && ctx) {
-    if (ctx.preInferredParamType.get(expr.name) === 'number') return true;
-    if (ctx.tsTypedPrimitiveLocal.has(expr.name)
-        && ctx.localTypeMap.byName.get(expr.name) === 'number') return true;
-  }
-  return false;
-}
 
 for (const m of [
   'Angles',

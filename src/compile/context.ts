@@ -1,5 +1,33 @@
 import { getOracle, type ClassOracle } from './oracle/index.js';
 import type { FlowFact } from './flow.js';
+import type { TypeNode, TypePack } from '../parser/index.js';
+import { primitiveFromAnnotation } from './type.js';
+
+function declaredTypeFromAnnotation(t: TypeNode | null | undefined): StaticValueType | undefined {
+  const prim = primitiveFromAnnotation(t);
+  if (prim) return prim;
+  if (!t) return undefined;
+  if (t.type === 'TypeGroup') return declaredTypeFromAnnotation(t.groupType);
+  if (t.type === 'TypeReference' && !t.prefix && t.parameters.length === 0) {
+    if (ARITH_DATATYPES.has(t.name) || t.name === VECTOR_LIB_TYPE) return `datatype:${t.name}`;
+  }
+  return undefined;
+}
+
+/** Element annotation of a Luau array type (`{T}` / `{[number]: T}`);
+ *  `undefined` when the annotation isn't array-shaped. */
+function annotationArrayElement(t: TypeNode | null | undefined): TypeNode | null | undefined {
+  if (!t) return undefined;
+  if (t.type === 'TypeGroup') return annotationArrayElement(t.groupType);
+  if (t.type === 'TypeTable'
+    && t.props.length === 0
+    && !!t.indexer
+    && t.indexer.indexType.type === 'TypeReference'
+    && t.indexer.indexType.name === 'number') {
+    return t.indexer.resultType;
+  }
+  return undefined;
+}
 
 export const RUNTIME_MODULE = 'luau2ts/runtime';
 
@@ -19,6 +47,15 @@ export const ARITH_DATATYPES = new Set([
   'Vector3', 'Vector2', 'Vector3int16', 'Vector2int16', 'CFrame',
 ]);
 
+/** Luau's `vector` library type. @rbxts/types declares it as a nominal
+ *  interface with `x`/`y`/`z` and no arithmetic methods, so operators on
+ *  it bridge through `number` and cast the result back. */
+export const VECTOR_LIB_TYPE = 'vector';
+
+export function isDatatypeStatic(t: StaticValueType): t is `datatype:${string}` {
+  return typeof t === 'string' && t.startsWith('datatype:');
+}
+
 /** Compatibility mode for emitted TypeScript.
  *
  *  - `native`: imports stdlib helpers from `luau2ts/runtime`.
@@ -26,6 +63,14 @@ export const ARITH_DATATYPES = new Set([
  *    `@rbxts/services` imports, `new ClassName()` for `Instance.new`, etc).
  */
 export type CompatMode = 'native' | 'rbxts';
+
+export interface BindingSnapshot {
+  declared: StaticValueType | undefined;
+  annotation: TypeNode | undefined;
+  array: TypeNode | null | undefined;
+  classLocal: string | undefined;
+  shapeTyped: boolean;
+}
 
 export class CompileContext {
   private readonly imports = new Set<string>();
@@ -101,6 +146,116 @@ export class CompileContext {
    *  has TS narrowing is safe to pass into a same-typed slot. */
   readonly tsTypedPrimitiveLocal = new Set<string>();
 
+  /** Locals whose emitted TS declaration carries a primitive type TS can
+   *  see without help: an explicit Luau annotation (`local n: number`,
+   *  `function f(s: string)`), a numeric-for control variable, or the
+   *  index slot of an `ipairs` destructure. Distinct from the tracked
+   *  StaticValueType, which follows reassignments TS never sees. */
+  readonly tsDeclaredTypeLocal = new Map<string, StaticValueType>();
+
+  /** Declared annotation of a binding, kept as the parsed Luau node so
+   *  member reads can resolve field types through it (including through
+   *  `type` aliases). Only set where an annotation actually exists. */
+  readonly tsDeclaredAnnotation = new Map<string, TypeNode>();
+
+  /** Script-level `type X = …` declarations, for resolving annotations
+   *  that name an alias. */
+  readonly typeAliases = new Map<string, TypeNode>();
+
+  /** Follow alias references to the underlying type. Bounded so a
+   *  self-referential alias (`type T = T`) can't spin. */
+  resolveAlias(t: TypeNode | null | undefined): TypeNode | null {
+    let cur = t ?? null;
+    for (let i = 0; i < 8 && cur; i += 1) {
+      if (cur.type === 'TypeGroup') { cur = cur.groupType; continue; }
+      if (cur.type !== 'TypeReference' || cur.prefix || cur.parameters.length > 0) return cur;
+      const next = this.typeAliases.get(cur.name);
+      if (!next) return cur;
+      cur = next;
+    }
+    return cur;
+  }
+
+  /** Declared type of `<binding>.<field>`, when the binding's annotation
+   *  resolves to a table type declaring that field. */
+  declaredFieldAnnotation(binding: string, field: string): TypeNode | null {
+    const resolved = this.resolveAlias(this.tsDeclaredAnnotation.get(binding));
+    if (!resolved || resolved.type !== 'TypeTable') return null;
+    for (const prop of resolved.props) {
+      if (prop.name === field) return prop.propType ?? null;
+    }
+    // `{ [string]: number }` types every named field too — the emitted
+    // index signature is what TS resolves `t.field` against.
+    const indexer = resolved.indexer;
+    if (indexer && indexer.indexType.type === 'TypeReference' && indexer.indexType.name === 'string') {
+      return indexer.resultType;
+    }
+    return null;
+  }
+
+  /** Locals whose emitted TS type is an array (`local t: {number}`,
+   *  `function f(list: {Player})`). Runtime-index reads and writes on
+   *  these rebase the 1-based Luau index to roblox-ts's 0-based array
+   *  access instead of routing through a string-keyed Record bridge. */
+  readonly tsArrayTypedLocal = new Map<string, TypeNode | null>();
+
+  /** File-local functions with a single-type return annotation, mapped
+   *  to the static view of that type. The annotation is emitted on the
+   *  TS declaration, so call results type exactly as declared. */
+  readonly userFunctionReturnType = new Map<string, StaticValueType>();
+
+  /** Declared return packs of the functions currently being compiled,
+   *  innermost last. `return X` consults the top so a value TS can't
+   *  prove matches the declared type is bridged instead of erroring. */
+  readonly returnAnnotationStack: (TypePack | null)[] = [];
+
+  /** Record (or clear) the TS-visible type for a freshly declared
+   *  binding. Every declaration site must call this so a later same-named
+   *  binding without a usable annotation doesn't inherit stale trust. */
+  noteDeclaredType(name: string, annotation: TypeNode | null | undefined): void {
+    const resolved = this.resolveAlias(annotation);
+    this.noteDeclaredTypeKind(name, declaredTypeFromAnnotation(resolved));
+    const element = annotationArrayElement(resolved);
+    if (element !== undefined) this.tsArrayTypedLocal.set(name, element);
+    else this.tsArrayTypedLocal.delete(name);
+    if (annotation) this.tsDeclaredAnnotation.set(name, annotation);
+    else this.tsDeclaredAnnotation.delete(name);
+  }
+
+  /** Declare a binding's TS type without an annotation node (loop
+   *  variables, destructure slots). Clears any annotation an outer
+   *  same-named binding left behind — the new binding shadows it. */
+  noteDeclaredTypeKind(name: string, type: StaticValueType | undefined): void {
+    if (type && type !== 'unknown' && type !== 'nil') this.tsDeclaredTypeLocal.set(name, type);
+    else this.tsDeclaredTypeLocal.delete(name);
+    this.tsDeclaredAnnotation.delete(name);
+  }
+
+  /** Capture everything the TS-type maps know about `name`, so a
+   *  block-scoped binding can be undone when its scope ends. */
+  snapshotBinding(name: string): BindingSnapshot {
+    return {
+      declared: this.tsDeclaredTypeLocal.get(name),
+      annotation: this.tsDeclaredAnnotation.get(name),
+      array: this.tsArrayTypedLocal.has(name) ? this.tsArrayTypedLocal.get(name) ?? null : undefined,
+      classLocal: this.tsTypedClassLocal.get(name),
+      shapeTyped: this.tsShapeTypedLocal.has(name),
+    };
+  }
+
+  restoreBinding(name: string, snap: BindingSnapshot): void {
+    if (snap.declared !== undefined) this.tsDeclaredTypeLocal.set(name, snap.declared);
+    else this.tsDeclaredTypeLocal.delete(name);
+    if (snap.annotation !== undefined) this.tsDeclaredAnnotation.set(name, snap.annotation);
+    else this.tsDeclaredAnnotation.delete(name);
+    if (snap.array !== undefined) this.tsArrayTypedLocal.set(name, snap.array);
+    else this.tsArrayTypedLocal.delete(name);
+    if (snap.classLocal !== undefined) this.tsTypedClassLocal.set(name, snap.classLocal);
+    else this.tsTypedClassLocal.delete(name);
+    if (snap.shapeTyped) this.tsShapeTypedLocal.add(name);
+    else this.tsShapeTypedLocal.delete(name);
+  }
+
   /** Locals whose init resolved to a concrete Roblox class via the oracle
    *  — `local x = Instance.new(...)`, `:WaitForChild(...)`,
    *  `:FindFirstChildOfClass(...)`. Maps the local name to the resolved
@@ -167,6 +322,20 @@ export class CompileContext {
   /** Pass 2: the script's own corpus path, used as the anchor for
    *  resolving `require(script.Parent.X)` patterns. */
   currentScriptPath = '';
+
+  /** Corpus path → emitted module path (relative to the output root,
+   *  POSIX, no extension). Lets qualified type references into a
+   *  required module (`Mod.Foo`) become a type-only namespace import. */
+  moduleOutPaths: Map<string, string> = new Map();
+
+  /** This script's emitted module path in the same form as
+   *  `moduleOutPaths` values; empty when unknown (single-file mode). */
+  currentOutPath = '';
+
+  /** Top-level `local X = require(...)` bindings resolved to corpus
+   *  paths, regardless of whether a cached return type exists. */
+  readonly requireLocalPaths = new Map<string, string>();
+
 
   /** Pass 3: function-name → param-name → inferred TS-type-text. Set
    *  by `inferParamBackprop`; consulted by `paramsFromLocals` so a
@@ -239,6 +408,11 @@ export class CompileContext {
    *  for an expression's static Luau type without re-importing the
    *  monolithic compileExpr surface. Returns 'unknown' before injection. */
   staticTypeOf: (expr: unknown) => StaticValueType = () => 'unknown';
+
+  /** Like `staticTypeOf`, but only reports a type TS itself will see on
+   *  the emitted expression — the signal for skipping a cast. Injected
+   *  by compile/index.ts alongside `staticTypeOf`. */
+  tsVisibleTypeOf: (expr: unknown) => StaticValueType = () => 'unknown';
 
   /** LocalStats whose vars are never reassigned in their scope. Populated
    *  by inferConstLocals at compile setup and consulted by compileLocal so
