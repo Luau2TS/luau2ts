@@ -162,14 +162,61 @@ export class CompileContext {
    *  that name an alias. */
   readonly typeAliases = new Map<string, TypeNode>();
 
-  /** Follow alias references to the underlying type. Bounded so a
-   *  self-referential alias (`type T = T`) can't spin. */
+  /** Corpus path → that module's `export type` aliases (from the
+   *  cross-script index). Lets `Mod.Foo` annotations resolve. */
+  moduleTypeAliases: Map<string, Map<string, TypeNode>> = new Map();
+
+  /** Every node reachable from a foreign module's alias bodies, tagged
+   *  with that module's corpus path, so an unprefixed reference inside
+   *  such a body resolves against its own module rather than ours. */
+  private readonly nodeHome = new WeakMap<object, string>();
+  private readonly homedModules = new Set<string>();
+
+  private tagHome(node: unknown, home: string): void {
+    if (!node || typeof node !== 'object') return;
+    if (this.nodeHome.has(node)) return;
+    this.nodeHome.set(node, home);
+    for (const v of Object.values(node as Record<string, unknown>)) {
+      if (Array.isArray(v)) for (const it of v) this.tagHome(it, home);
+      else if (v && typeof v === 'object') this.tagHome(v, home);
+    }
+  }
+
+  /** Alias table a reference should resolve in: the foreign module the
+   *  node was loaded from, or this script's. */
+  aliasTableFor(node: TypeNode): { table: Map<string, TypeNode>; home: string | null } {
+    const home = this.nodeHome.get(node) ?? null;
+    if (home) return { table: this.moduleTypeAliases.get(home) ?? new Map(), home };
+    return { table: this.typeAliases, home: null };
+  }
+
+  /** Aliases of the module behind a require-bound local (`Mod.Foo`). */
+  foreignAliases(prefixLocal: string): { table: Map<string, TypeNode>; home: string } | null {
+    const home = this.requireLocalPaths.get(prefixLocal);
+    if (!home) return null;
+    const table = this.moduleTypeAliases.get(home);
+    if (!table) return null;
+    if (!this.homedModules.has(home)) {
+      this.homedModules.add(home);
+      for (const body of table.values()) this.tagHome(body, home);
+    }
+    return { table, home };
+  }
+
+  /** Follow alias references to the underlying type — script-local
+   *  aliases, `Mod.Foo` into a required module, and unprefixed names
+   *  inside a foreign alias body. Bounded so `type T = T` can't spin. */
   resolveAlias(t: TypeNode | null | undefined): TypeNode | null {
     let cur = t ?? null;
     for (let i = 0; i < 8 && cur; i += 1) {
       if (cur.type === 'TypeGroup') { cur = cur.groupType; continue; }
-      if (cur.type !== 'TypeReference' || cur.prefix || cur.parameters.length > 0) return cur;
-      const next = this.typeAliases.get(cur.name);
+      if (cur.type !== 'TypeReference' || cur.parameters.length > 0) return cur;
+      let next: TypeNode | undefined;
+      if (cur.prefix) {
+        next = this.foreignAliases(cur.prefix)?.table.get(cur.name);
+      } else {
+        next = this.aliasTableFor(cur).table.get(cur.name);
+      }
       if (!next) return cur;
       cur = next;
     }
@@ -203,6 +250,12 @@ export class CompileContext {
    *  to the static view of that type. The annotation is emitted on the
    *  TS declaration, so call results type exactly as declared. */
   readonly userFunctionReturnType = new Map<string, StaticValueType>();
+
+  /** File-local functions' single-type return annotations and per-param
+   *  annotations, as parsed nodes. The emitted signature carries them,
+   *  so call results and matching arguments are exactly typed. */
+  readonly userFunctionReturnAnnotation = new Map<string, TypeNode>();
+  readonly userFunctionParamAnnotations = new Map<string, (TypeNode | null)[]>();
 
   /** Declared return packs of the functions currently being compiled,
    *  innermost last. `return X` consults the top so a value TS can't
@@ -371,6 +424,12 @@ export class CompileContext {
    *  we currently have. */
   readonly tsShapeTypedLocal = new Set<string>();
 
+  /** Subset of `tsShapeTypedLocal` whose emitted annotation came from
+   *  this script's own observed-usage shape (compileLocal / function
+   *  params), so the shape's leaf evidence describes what TS sees. Loop
+   *  variables and class fields synthesize differently and are excluded. */
+  readonly tsPass6ShapeLocal = new Set<string>();
+
   /** Class-method-body context: a map of `self.X` field name → its
    *  synthesized field shape (TypeNode). Populated by class-shape's
    *  method-body compile loop so `self.X = Y` writes in compileAssign
@@ -413,6 +472,9 @@ export class CompileContext {
    *  the emitted expression — the signal for skipping a cast. Injected
    *  by compile/index.ts alongside `staticTypeOf`. */
   tsVisibleTypeOf: (expr: unknown) => StaticValueType = () => 'unknown';
+
+  /** Static view of an annotation after alias resolution. Injected. */
+  staticTypeOfAnnotation: (t: TypeNode | null | undefined) => StaticValueType = () => 'unknown';
 
   /** LocalStats whose vars are never reassigned in their scope. Populated
    *  by inferConstLocals at compile setup and consulted by compileLocal so

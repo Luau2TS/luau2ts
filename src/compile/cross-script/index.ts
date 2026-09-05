@@ -12,6 +12,7 @@
 // callers can refer to the full shape from day one.
 
 export { buildCorpusIndex, deriveCompileMaps, type CorpusScript } from './build-index.js';
+import type { TypeNode } from '../../parser/index.js';
 export { renderDts } from './dts-emit.js';
 
 export interface CorpusIndex {
@@ -28,6 +29,10 @@ export interface ModuleIndexEntry {
   /** TS type text from analyzeModuleReturn, or null if no usable
    *  return statement was found. */
   returnTypeText: string | null;
+  /** Script-level `export type X = …` declarations (non-generic), as
+   *  parsed Luau nodes. Consumers referencing `Mod.X` inline the alias
+   *  as a local type declaration and resolve field types through it. */
+  exportedTypes: Map<string, TypeNode>;
   /** Field names typed as Record<string, defined | undefined> (empty-table
    *  init pattern). Consulted by per-script compile to skip the Record
    *  bridge on `mod.<field>[k]` access. */

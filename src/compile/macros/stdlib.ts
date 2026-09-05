@@ -2,6 +2,7 @@ import ts from 'typescript';
 import { registerMacro, type MacroArgs } from './index.js';
 import type { Expr } from '../../parser/index.js';
 import type { CompileContext } from '../context.js';
+import { compileType } from '../type.js';
 
 const { factory } = ts;
 
@@ -49,29 +50,56 @@ function argIsTrustedNumber(expr: Expr, ctx: CompileContext): boolean {
 // `table.insert(t, v)` → `t.push(v)`; `table.insert(t, i, v)` → `t.insert(i - 1, v)`.
 registerMacro(
   'table.insert',
-  ({ compiledArgs }: MacroArgs) => {
+  ({ call, ctx, compiledArgs }: MacroArgs) => {
     const [target, second, third] = compiledArgs;
     if (!target) return undefined;
-    const asDefined = (e: ts.Expression) =>
-      factory.createAsExpression(
+    // An array-annotated local (`t: {T}`) already exposes `.push` /
+    // `.insert` with a typed element; only bridge a value TS can't see
+    // as `T`.
+    const targetLuau = call.args[0];
+    const declaredElement =
+      targetLuau && targetLuau.type === 'Local' && ctx.tsArrayTypedLocal.has(targetLuau.name)
+        ? (ctx.tsArrayTypedLocal.get(targetLuau.name) ?? null)
+        : undefined;
+    // An element that compiles to `unknown` makes the array `unknown[]`,
+    // whose `.push` rejects its own `this` (Array<T> wants T extends
+    // defined); keep the bridge for those.
+    const typedElement =
+      declaredElement && compileType(declaredElement).kind !== ts.SyntaxKind.UnknownKeyword
+        ? declaredElement
+        : undefined;
+    const asDefined = (e: ts.Expression, luau: Expr | undefined) => {
+      if (typedElement !== undefined) {
+        const want = ctx.staticTypeOf(luau ?? null) === 'unknown' ? 'unknown' : ctx.tsVisibleTypeOf(luau ?? null);
+        const elementStatic = typedElement ? ctx.staticTypeOfAnnotation(typedElement) : 'unknown';
+        if (elementStatic !== 'unknown' && want === elementStatic) return e;
+        return factory.createAsExpression(
+          factory.createAsExpression(e, factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+          compileType(typedElement),
+        );
+      }
+      return factory.createAsExpression(
         factory.createAsExpression(
           e,
           factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
         ),
         factory.createTypeReferenceNode('defined', undefined),
       );
+    };
     // Cast through `as unknown as Array<defined>` so unknown-typed receivers expose `.push`/`.insert`.
-    const asArrayTarget = factory.createParenthesizedExpression(
-      factory.createAsExpression(
+    const asArrayTarget = typedElement !== undefined
+      ? target
+      : factory.createParenthesizedExpression(
         factory.createAsExpression(
-          target,
-          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          factory.createAsExpression(
+            target,
+            factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          ),
+          factory.createTypeReferenceNode('Array', [
+            factory.createTypeReferenceNode('defined', undefined),
+          ]),
         ),
-        factory.createTypeReferenceNode('Array', [
-          factory.createTypeReferenceNode('defined', undefined),
-        ]),
-      ),
-    );
+      );
     if (third !== undefined) {
       const indexExpr = factory.createBinaryExpression(
         second!,
@@ -81,14 +109,14 @@ registerMacro(
       return factory.createCallExpression(
         factory.createPropertyAccessExpression(asArrayTarget, factory.createIdentifier('insert')),
         undefined,
-        [indexExpr, asDefined(third)],
+        [indexExpr, asDefined(third, call.args[2])],
       );
     }
     if (second === undefined) return undefined;
     return factory.createCallExpression(
       factory.createPropertyAccessExpression(asArrayTarget, factory.createIdentifier('push')),
       undefined,
-      [asDefined(second)],
+      [asDefined(second, call.args[1])],
     );
   },
   'rbxts',

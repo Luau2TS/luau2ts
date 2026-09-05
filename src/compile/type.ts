@@ -45,14 +45,17 @@ export function setAliasBodies(map: Map<string, TypeNode>): void {
  *  native mode (where every nilable annotation `T?` is `T | null`). */
 let currentCompatMode: 'native' | 'rbxts' = 'native';
 
-/** Resolves the prefix of a qualified Luau type reference (`Mod.Foo`,
- *  where `Mod` is a require-bound local) to the alias of a type-only
- *  namespace import, or undefined to leave the prefix as written. Set
- *  by compile() per run. */
-let typePrefixResolver: ((prefix: string) => string | undefined) | null = null;
+/** Resolves a Luau type reference that names an alias of a required
+ *  module — `Mod.Foo`, or a bare `Foo` inside one of Mod's own alias
+ *  bodies — to the identifier of a hoisted local declaration for it,
+ *  or undefined to leave the reference as written. Set by compile()
+ *  per run. */
+let typeAliasResolver: ((prefix: string | null, name: string, node: TypeNode) => string | undefined) | null = null;
 
-export function setTypePrefixResolver(fn: ((prefix: string) => string | undefined) | null): void {
-  typePrefixResolver = fn;
+export function setTypePrefixResolver(
+  fn: ((prefix: string | null, name: string, node: TypeNode) => string | undefined) | null,
+): void {
+  typeAliasResolver = fn;
 }
 
 export function setTypeCompatMode(mode: 'native' | 'rbxts'): void {
@@ -162,9 +165,10 @@ function compileTypeReference(t: TypeReferenceNode): ts.TypeNode {
     return factory.createKeywordTypeNode(kw);
   }
 
-  const resolvedPrefix = t.prefix ? (typePrefixResolver?.(t.prefix) ?? t.prefix) : null;
-  const name = resolvedPrefix
-    ? factory.createQualifiedName(factory.createIdentifier(resolvedPrefix), t.name)
+  const hoisted = t.parameters.length === 0 ? typeAliasResolver?.(t.prefix, t.name, t) : undefined;
+  if (hoisted) return factory.createTypeReferenceNode(hoisted, undefined);
+  const name = t.prefix
+    ? factory.createQualifiedName(factory.createIdentifier(t.prefix), t.name)
     : factory.createIdentifier(t.name);
 
   // Convert each Luau type arg to a TS type node. Type-pack args (rare in

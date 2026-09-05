@@ -9,6 +9,7 @@ import {
   type CorpusScript,
 } from '../compile/cross-script/index.js';
 import { loadProject } from '../rojo/index.js';
+import type { TypeNode } from '../parser/index.js';
 import { classifyFile } from '../rojo/walk-tree.js';
 import type { LuauScriptEntry } from '../rojo/types.js';
 import type { CompatMode } from '../compile/context.js';
@@ -199,7 +200,7 @@ export async function compileDirMode(
     });
   });
 
-  const { index, moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers } = await buildCorpus(
+  const { index, moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers, moduleTypeAliases } = await buildCorpus(
     entries.map((e) => ({
       corpusPath: e.corpusPath,
       source: e.source,
@@ -224,6 +225,7 @@ export async function compileDirMode(
       moduleReturnTypes,
       moduleRecordMapFields,
       moduleExportedMembers,
+      moduleTypeAliases,
       moduleOutPaths,
       outPath: modulePathOf(outRel),
     });
@@ -280,7 +282,7 @@ export async function compileProjectMode(
     source: s.source,
     scriptKind: s.scriptKind,
   }));
-  const { index, moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers } = await buildCorpus(corpusScripts);
+  const { index, moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers, moduleTypeAliases } = await buildCorpus(corpusScripts);
 
   const moduleOutPaths = new Map<string, string>();
   for (const entry of project.scripts) {
@@ -303,6 +305,7 @@ export async function compileProjectMode(
       moduleReturnTypes,
       moduleRecordMapFields,
       moduleExportedMembers,
+      moduleTypeAliases,
       moduleOutPaths,
       outPath: modulePathOf(outRel),
     });
@@ -333,6 +336,7 @@ async function buildCorpus(scripts: readonly CorpusScript[]): Promise<{
   moduleReturnTypes: Map<string, string>;
   moduleRecordMapFields: Map<string, string[]>;
   moduleExportedMembers: Map<string, Map<string, 'method' | 'property' | 'recordMap'>>;
+  moduleTypeAliases: Map<string, Map<string, TypeNode>>;
 }> {
   // rbxts emit is the only mode that consumes the cross-script maps
   // today, but building the index unconditionally costs ~1ms/script
@@ -344,11 +348,12 @@ async function buildCorpus(scripts: readonly CorpusScript[]): Promise<{
       moduleReturnTypes: new Map(),
       moduleRecordMapFields: new Map(),
       moduleExportedMembers: new Map(),
+      moduleTypeAliases: new Map(),
     };
   }
   const index = await buildCorpusIndex(scripts);
-  const { moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers } = deriveCompileMaps(index);
-  return { index, moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers };
+  const { moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers, moduleTypeAliases } = deriveCompileMaps(index);
+  return { index, moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers, moduleTypeAliases };
 }
 
 // Surface extname so the v8 minifier doesn't drop it as unused; we keep

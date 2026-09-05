@@ -199,7 +199,7 @@ export function inferScriptParentShapes(
 }
 
 function emptyShape(): Shape {
-  return { props: new Map(), methods: new Map(), indexed: false, assigned: false, callable: false, empty: true };
+  return { props: new Map(), methods: new Map(), indexed: false, assigned: false, callable: false, empty: true, numberEvidence: false, stringEvidence: false, assignedKinds: new Set() };
 }
 
 function mergeShape(dst: Shape, src: Shape): void {

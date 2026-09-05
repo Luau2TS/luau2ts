@@ -9,6 +9,7 @@ import { parse } from '../../parser/index.js';
 import { analyzeModuleReturn } from '../require-infer.js';
 import { buildPromotionMap, collectCrossScriptCallSites } from './call-sites.js';
 import type { CorpusIndex, ModuleIndexEntry } from './index.js';
+import type { TypeAliasStat, TypeNode } from '../../parser/index.js';
 
 export interface CorpusScript {
   /** Corpus key for this script — Roblox instance path or filesystem
@@ -71,10 +72,22 @@ export async function buildCorpusIndex(
     if (!e) continue;
     const promote = promotions.get(e.script.corpusPath);
     const { type, recordMapFields, members } = analyzeModuleReturn(e.root, promote);
-    if (!type) continue;
-    const returnTypeText = printer.printNode(ts.EmitHint.Unspecified, type, dummySF);
+    const exportedTypes = new Map<string, TypeNode>();
+    for (const stat of e.root.body) {
+      if (stat.type !== 'TypeAlias') continue;
+      const alias = stat as TypeAliasStat;
+      // Non-exported siblings are collected too: an exported alias body
+      // may reference them, and the consumer hoists the whole graph.
+      if (alias.generics.length === 0 && alias.genericPacks.length === 0) {
+        exportedTypes.set(alias.name, alias.aliasType);
+      }
+    }
+    // A module with no usable return shape can still export types.
+    if (!type && exportedTypes.size === 0) continue;
+    const returnTypeText = type ? printer.printNode(ts.EmitHint.Unspecified, type, dummySF) : null;
     modules.set(e.script.corpusPath, {
       returnTypeText,
+      exportedTypes,
       recordMapFields,
       exportedMembers: new Map(members),
       exportedFns: new Map(),
@@ -93,11 +106,14 @@ export function deriveCompileMaps(index: CorpusIndex): {
   moduleReturnTypes: Map<string, string>;
   moduleRecordMapFields: Map<string, string[]>;
   moduleExportedMembers: Map<string, Map<string, 'method' | 'property' | 'recordMap'>>;
+  moduleTypeAliases: Map<string, Map<string, TypeNode>>;
 } {
   const moduleReturnTypes = new Map<string, string>();
   const moduleRecordMapFields = new Map<string, string[]>();
   const moduleExportedMembers = new Map<string, Map<string, 'method' | 'property' | 'recordMap'>>();
+  const moduleTypeAliases = new Map<string, Map<string, TypeNode>>();
   for (const [path, entry] of index.modules) {
+    if (entry.exportedTypes.size > 0) moduleTypeAliases.set(path, entry.exportedTypes);
     if (entry.returnTypeText) moduleReturnTypes.set(path, entry.returnTypeText);
     if (entry.recordMapFields.length > 0) {
       moduleRecordMapFields.set(path, entry.recordMapFields);
@@ -106,5 +122,5 @@ export function deriveCompileMaps(index: CorpusIndex): {
       moduleExportedMembers.set(path, new Map(entry.exportedMembers));
     }
   }
-  return { moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers };
+  return { moduleReturnTypes, moduleRecordMapFields, moduleExportedMembers, moduleTypeAliases };
 }

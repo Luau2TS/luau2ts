@@ -18,8 +18,15 @@ All notable changes to `luau2ts` are documented here. Format adheres loosely to 
 - Annotated arrays (`t: {T}`) index 0-based so roblox-ts rebases them back to Lua's 1-based access, instead of routing through a string-keyed `Record`.
 - An explicit parameter annotation now beats body-usage primitive inference, which could contradict it.
 - Loop variables no longer inherit a same-named outer binding's annotation.
+- `export type` aliases of required modules resolve: `Mod.Foo` is inlined as a local `type Mod__Foo` (with the sibling aliases its body needs), and fields read through it are typed. Directory and Rojo modes feed the alias tables through the corpus index.
+- Declared annotations propagate: `local c = zeroControls()` inherits the function's declared return type, `local m = s.mut` inherits the field's declared type, and `for _, x in ipairs(list)` over an annotated array types `x` and drops the `any[]` cast.
+- Arguments TypeScript already types (annotated bindings, declared fields, function literals, trusted primitives/datatypes) skip the `Parameters<typeof …>` wrap for every callee, so a genuine mismatch surfaces instead of being hidden.
+- `x == nil` compares directly (TypeScript never raises no-overlap against `undefined`), which also lets it narrow nilable annotations; other equalities widen only one operand.
+- Synthesized shape leaves used only where a number or string can go (`x % 2`, `x + 1`, `math.floor(x)`, `string.upper(x)`) are declared as that primitive instead of `unknown`.
 
-Measured on a 350-script Roblox place: TypeScript errors in the emitted tree fell from 4381 to 1060, `as unknown` casts from 34.8k to 29.5k, `Record<string, unknown>` bridges from 6824 to 4854, and `Parameters<typeof …>` wraps from 6490 to 4718. Three scripts that previously emitted unparseable TypeScript now compile.
+Measured on a 350-script Roblox place: TypeScript errors in the emitted tree fell from 4381 to 1031, `as unknown` casts from 34.8k to 22.9k, `Record<string, unknown>` bridges from 6824 to 4893, and `Parameters<typeof …>` wraps from 6490 to 2110. Three scripts that previously emitted unparseable TypeScript now compile.
+
+Known limit: roblox-ts rejects any use of an `any`-typed value ("Using values of type `any` is not supported"), so a Luau value with no type information in the source can only be represented as `unknown` and bridged at each typed use. The remaining casts sit almost entirely on such values.
 
 ## [0.1.0]
 

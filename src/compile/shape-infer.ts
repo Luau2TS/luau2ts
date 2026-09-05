@@ -19,6 +19,14 @@ export interface Shape {
   callable: boolean;
   /** No access observed — fall back to caller's existing annotation. */
   empty: boolean;
+  /** Leaf-usage evidence. A leaf read in a position only a number can
+   *  occupy (`x + 1`, `x % 2`, `math.floor(x)`) is `number`; one only a
+   *  string can occupy (`string.upper(x)`) is `string`. Both together,
+   *  or a write of anything else, and the leaf stays `unknown` — the
+   *  per-use bridge is no worse than a wrong declaration. */
+  numberEvidence: boolean;
+  stringEvidence: boolean;
+  assignedKinds: Set<'number' | 'string' | 'other'>;
 }
 
 function newShape(): Shape {
@@ -29,8 +37,45 @@ function newShape(): Shape {
     assigned: false,
     callable: false,
     empty: true,
+    numberEvidence: false,
+    stringEvidence: false,
+    assignedKinds: new Set(),
   };
 }
+
+/** True when a Luau expression is a number on its face: a numeric
+ *  literal, `#x`, or a `math.*` call. Used to disambiguate `+`/`-`/`<`
+ *  (valid on vectors and strings too) — a number on the other side
+ *  pins the tracked operand to number. */
+function isPlainNumber(e: Expr | null | undefined): boolean {
+  if (!e) return false;
+  switch (e.type) {
+    case 'ConstantNumber':
+    case 'ConstantInteger':
+      return true;
+    case 'Group':
+      return isPlainNumber(e.expr);
+    case 'Unary':
+      return e.op === '#' || (e.op === '-' && isPlainNumber(e.expr));
+    case 'Call':
+      return e.func.type === 'IndexName' && e.func.expr.type === 'Global' && e.func.expr.name === 'math';
+    default:
+      return false;
+  }
+}
+
+function kindOfWrite(e: Expr): 'number' | 'string' | 'other' {
+  if (e.type === 'ConstantNumber' || e.type === 'ConstantInteger') return 'number';
+  if (e.type === 'ConstantString') return 'string';
+  if (e.type === 'Group') return kindOfWrite(e.expr);
+  if (isPlainNumber(e)) return 'number';
+  return 'other';
+}
+
+/** Members only a string has. `string.format`'s first arg and `..`
+ *  operands are excluded: numbers flow through both. */
+const STRING_ONLY_LIB = new Set(['upper', 'lower', 'sub', 'rep', 'reverse', 'split', 'gsub', 'gmatch', 'find', 'match', 'byte', 'len']);
+const NUMBER_ONLY_OPS = new Set(['%', '//', '^']);
 
 function getOrAddProp(shape: Shape, name: string): Shape {
   shape.empty = false;
@@ -116,6 +161,27 @@ export function collectShapes(body: Stat, vars: Set<string>): Map<string, Shape>
         if (call.func && call.func.type === 'IndexName') {
           const idx = (call.func as { index: string }).index;
           const innerExpr = (call.func as { expr: Expr }).expr;
+          if (innerExpr.type === 'Global' && innerExpr.name === 'math') {
+            // Every math.* argument is a number.
+            for (const a of call.args) {
+              const s = visitExpr(a);
+              if (s) s.numberEvidence = true;
+            }
+            return null;
+          }
+          if (innerExpr.type === 'Global' && innerExpr.name === 'string' && STRING_ONLY_LIB.has(idx) && call.args.length > 0) {
+            const s = visitExpr(call.args[0]);
+            if (s) s.stringEvidence = true;
+            for (const a of call.args.slice(1)) visitExpr(a);
+            return null;
+          }
+          if (call.self && STRING_ONLY_LIB.has(idx)) {
+            // `s:upper()` — the receiver is a string.
+            const s = visitExpr(innerExpr);
+            if (s) s.stringEvidence = true;
+            for (const a of call.args) visitExpr(a);
+            return null;
+          }
           const innerShape = visitExpr(innerExpr);
           if (innerShape) {
             recordMethod(innerShape, idx, call.args.length);
@@ -138,9 +204,15 @@ export function collectShapes(body: Stat, vars: Set<string>): Map<string, Shape>
         return null;
       }
       case 'Binary': {
-        const b = expr as { left: Expr; right: Expr };
-        visitExpr(b.left);
-        visitExpr(b.right);
+        const b = expr as Extract<Expr, { type: 'Binary' }>;
+        const ls = visitExpr(b.left);
+        const rs = visitExpr(b.right);
+        const numberOnly = NUMBER_ONLY_OPS.has(b.op);
+        // `+`/`-`/`<`… admit vectors and strings; a plain-number partner
+        // rules those out for the tracked side.
+        const pinnedByPartner = ['+', '-', '<', '>', '<=', '>='].includes(b.op);
+        if (ls && (numberOnly || (pinnedByPartner && isPlainNumber(b.right)))) ls.numberEvidence = true;
+        if (rs && (numberOnly || (pinnedByPartner && isPlainNumber(b.left)))) rs.numberEvidence = true;
         return null;
       }
       case 'Unary': {
@@ -227,13 +299,15 @@ export function collectShapes(body: Stat, vars: Set<string>): Map<string, Shape>
       }
       case 'Assign': {
         const a = stat as { vars: Expr[]; values: Expr[] };
-        for (const tgt of a.vars) {
+        a.vars.forEach((tgt, ti) => {
           if (tgt.type === 'IndexName') {
             const inner = visitExpr((tgt as { expr: Expr }).expr);
             if (inner) {
               const propName = (tgt as { index: string }).index;
               const prop = getOrAddProp(inner, propName);
               prop.assigned = true;
+              const rhs = a.values[ti];
+              prop.assignedKinds.add(rhs ? kindOfWrite(rhs) : 'other');
             }
           } else if (tgt.type === 'IndexExpr') {
             const inner = visitExpr((tgt as { expr: Expr }).expr);
@@ -242,14 +316,24 @@ export function collectShapes(body: Stat, vars: Set<string>): Map<string, Shape>
           } else {
             visitExpr(tgt);
           }
-        }
+        });
         for (const v of a.values) visitExpr(v);
         return;
       }
       case 'CompoundAssign': {
-        const c = stat as { var: Expr; value: Expr };
-        visitExpr(c.var);
+        const c = stat as Extract<Stat, { type: 'CompoundAssign' }>;
+        const target = visitExpr(c.var);
         visitExpr(c.value);
+        if (target) {
+          if (NUMBER_ONLY_OPS.has(c.op) || (['+', '-'].includes(c.op) && isPlainNumber(c.value))) {
+            target.numberEvidence = true;
+            target.assignedKinds.add('number');
+          } else if (c.op === '..') {
+            target.assignedKinds.add('other');
+          } else {
+            target.assignedKinds.add('other');
+          }
+        }
         return;
       }
       case 'Expr': {
@@ -444,6 +528,7 @@ export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
       continue;
     }
     const childType = shapeToTypeNode(child)
+      ?? leafTypeNode(child)
       ?? factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
     members.push(
       factory.createPropertySignature(
@@ -495,6 +580,28 @@ export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
   return factory.createTypeLiteralNode(members);
 }
 
+/** The primitive a leaf's usage pins it to, or null. */
+export function leafPrimitive(shape: Shape): 'number' | 'string' | null {
+  if (!shape.empty) return null;
+  const writes = shape.assignedKinds;
+  if (shape.numberEvidence && !shape.stringEvidence) {
+    for (const k of writes) if (k !== 'number') return null;
+    return 'number';
+  }
+  if (shape.stringEvidence && !shape.numberEvidence) {
+    for (const k of writes) if (k !== 'string') return null;
+    return 'string';
+  }
+  return null;
+}
+
+function leafTypeNode(shape: Shape): ts.TypeNode | null {
+  const prim = leafPrimitive(shape);
+  if (prim === 'number') return factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword);
+  if (prim === 'string') return factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword);
+  return null;
+}
+
 function propertyName(name: string): ts.PropertyName {
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) {
     return factory.createIdentifier(name);
@@ -505,6 +612,9 @@ function propertyName(name: string): ts.PropertyName {
 /** Merge `other` into `dst` in place. Same-name props recurse;
  *  same-name methods keep the larger maxArgs. */
 export function mergeShape(dst: Shape, other: Shape): void {
+  dst.numberEvidence = dst.numberEvidence || other.numberEvidence;
+  dst.stringEvidence = dst.stringEvidence || other.stringEvidence;
+  for (const k of other.assignedKinds) dst.assignedKinds.add(k);
   if (other.empty) return;
   dst.empty = false;
   dst.indexed = dst.indexed || other.indexed;

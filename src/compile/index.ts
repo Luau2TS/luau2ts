@@ -33,7 +33,7 @@ import './macros/instance.js';
 import './macros/stdlib.js';
 import './rbxts-runtime.js';
 import { detectClasses, compileClassPattern, type ClassPattern } from './class-shape.js';
-import { collectLocalNames, collectShapes, shapeToTypeNode } from './shape-infer.js';
+import { collectLocalNames, collectShapes, leafPrimitive, shapeToTypeNode } from './shape-infer.js';
 import { inferScriptParentShapes } from './script-parent-infer.js';
 import { inferLoopVarShapes } from './loop-var-infer.js';
 import { resolveRequirePath } from './require-infer.js';
@@ -874,6 +874,13 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       ctx.suppressLocal(v.name);
       ctx.defineLocal(v.name, typeFromAnnotation(v.annotation, init, ctx));
       ctx.noteDeclaredType(v.name, v.annotation);
+      // `local c = zeroControls()` / `local mut = s.mut`: TS infers the
+      // init's declared type for the binding, so track it as if it had
+      // been written on the local.
+      if (!v.annotation && init && ctx.compatMode === 'rbxts') {
+        const inherited = declaredAnnotationOfExpr(init, ctx);
+        if (inherited) bindDeclaredAnnotation(v.name, inherited, ctx);
+      }
       if (ctx.compatMode === 'rbxts' && initIsOracleTyped(init, ctx)) {
         ctx.tsTypedClassLocal.set(v.name, resolveOracleClassOfExpr(init, ctx) ?? 'Instance');
       }
@@ -917,7 +924,21 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
     });
     if (anyShadow) {
       // Same-scope shadow: emit destructuring assignment, not `let` — Luau reuses the binding.
-      return [factory.createExpressionStatement(
+      // Names not yet declared in this scope (`local _, x = f()` after an
+      // earlier `local _`) still need their own `let`.
+      const fresh = stat.vars.filter((v) => !ctx.hasLocalInCurrentScope(v.name));
+      const decls: ts.Statement[] = fresh.length > 0
+        ? [factory.createVariableStatement(
+            undefined,
+            factory.createVariableDeclarationList(
+              [...new Set(fresh.map((v) => safeIdentifier(v.name)))].map((n) =>
+                factory.createVariableDeclaration(factory.createIdentifier(n), undefined, undefined, undefined),
+              ),
+              ts.NodeFlags.Let,
+            ),
+          )]
+        : [];
+      return [...decls, factory.createExpressionStatement(
         factory.createAssignment(
           factory.createArrayLiteralExpression(
             stat.vars.map((v) => factory.createIdentifier(safeIdentifier(v.name))),
@@ -1206,7 +1227,10 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
         // with an observed shape — `const v: { x: unknown } = vector.create(...)`
         // throws away the real type and forces casts on every use.
         const initIsTsTyped =
-          !!init && isTrustedTypedExpr(init, ctx) && staticTypeOfExpr(init, ctx) !== 'unknown';
+          !!init && (
+            (isTrustedTypedExpr(init, ctx) && staticTypeOfExpr(init, ctx) !== 'unknown')
+            || !!declaredAnnotationOfExpr(init, ctx)
+          );
         const initIsShapelyCandidate =
           !initHasOracleType && !initIsCachedRequire && !initIsTsTyped && (
             !init
@@ -1225,6 +1249,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
           const fromShape = inferred ? shapeToTypeNode(inferred) : null;
           if (fromShape) {
             ctx.tsShapeTypedLocal.add(v.name);
+            ctx.tsPass6ShapeLocal.add(v.name);
             typeNode = fromShape;
             if (initExpr) {
               // Route init through `as unknown as <shape>` — paren-wrap binary/ternary first
@@ -1307,6 +1332,13 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       );
       ctx.defineLocal(v.name, typeFromAnnotation(v.annotation, init, ctx));
       ctx.noteDeclaredType(v.name, v.annotation);
+      // `local c = zeroControls()` / `local mut = s.mut`: TS infers the
+      // init's declared type for the binding, so track it as if it had
+      // been written on the local.
+      if (!v.annotation && init && ctx.compatMode === 'rbxts') {
+        const inherited = declaredAnnotationOfExpr(init, ctx);
+        if (inherited) bindDeclaredAnnotation(v.name, inherited, ctx);
+      }
       // Track which locals TS will know as a primitive — used by the
       // arg-cast skip logic so `let s = tostring(...); string.reverse(s)`
       // doesn't re-cast `s`. Only safe when the init is a trusted-typed
@@ -2199,6 +2231,19 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     const elementFact = !userWantsPairs
       ? iterableElementFactOf(iterableSource ?? (stat.values.length === 1 ? stat.values[0]! : null), ctx)
       : null;
+    // Iterating an annotated array (`for _, c in ipairs(cars)` with
+    // `cars: {Car}`): the element type is declared, so the value var
+    // carries it and the iterable needs no cast at all.
+    const declaredElement = (() => {
+      if (userWantsPairs) return null;
+      const iter = iterableSource ?? (stat.values.length === 1 ? stat.values[0]! : null);
+      if (!iter) return null;
+      const ann = declaredAnnotationOfExpr(iter, ctx);
+      const table = ann ? ctx.resolveAlias(ann) : null;
+      if (!table || table.type !== 'TypeTable' || table.props.length > 0 || !table.indexer) return null;
+      if (table.indexer.indexType.type !== 'TypeReference' || table.indexer.indexType.name !== 'number') return null;
+      return table.indexer.resultType;
+    })();
     const canUseClassElement =
       elementFact?.kind === 'class'
       && loopValueCanUseClass(stat, elementFact.name, ctx);
@@ -2225,6 +2270,12 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
         // `for i, v in ipairs(t)` — @rbxts/types declares the ipairs
         // index slot as `number`, so TS sees `i: number` directly.
         const isIpairsIndex = !userWantsPairs && stat.vars.length >= 2 && i === 0;
+        const isValueSlot = stat.vars.length === 1 ? i === 0 : i === 1;
+        if (declaredElement && isValueSlot) {
+          ctx.defineLocal(v.name, typeFromAnnotation(ctx.resolveAlias(declaredElement)));
+          bindDeclaredAnnotation(v.name, declaredElement, ctx);
+          return;
+        }
         ctx.defineLocal(v.name, isIpairsIndex ? 'number' : 'unknown');
         ctx.noteDeclaredTypeKind(v.name, isIpairsIndex ? 'number' : undefined);
       });
@@ -2263,7 +2314,9 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     // `unknown` so record-shaped sources don't trip TS2352.
     //
     let elementType: ts.TypeNode;
-    if (canUseClassElement && elementFact) {
+    if (declaredElement) {
+      elementType = compileType(declaredElement);
+    } else if (canUseClassElement && elementFact) {
       elementType = typeNodeForFlowFact(elementFact) ?? factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
     } else if (useDynamicChildElement) {
       ctx.useLuauChildType();
@@ -2271,7 +2324,9 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     } else {
       elementType = factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
     }
-    const castedIterable = assertExpression(iterableExpr, factory.createArrayTypeNode(elementType));
+    const castedIterable = declaredElement
+      ? iterableExpr
+      : assertExpression(iterableExpr, factory.createArrayTypeNode(elementType));
     if (stat.vars.length === 1) {
       // `for v in arr do` — single binding, value-only iteration.
       // Pass 5: when we have a synthesized type for this var, annotate
@@ -2331,6 +2386,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
     // stays `unknown` unless Pass 5 synthesized a type for it.
     const tupleSlot = (i: number): ts.TypeNode => {
       const v = stat.vars[i];
+      if (declaredElement && i === 1) return compileType(declaredElement);
       const text = v ? loopVarTypeMap?.get(v.name) : undefined;
       if (text) return text;
       if (i === 0 && !userWantsPairs) {
@@ -2950,9 +3006,8 @@ function buildAssignmentStatement(
   if (
     ctx.compatMode === 'rbxts'
     && target.type === 'IndexName'
-    && target.expr.type === 'Local'
   ) {
-    const field = ctx.declaredFieldAnnotation(target.expr.name, target.index);
+    const field = declaredAnnotationOfExpr(target, ctx);
     const want = field ? typeFromAnnotation(ctx.resolveAlias(field)) : 'unknown';
     if (field && want !== 'unknown' && valueSeenAs() !== want && !isTsExpressionOfStatic(valueExpr, want)) {
       return factory.createExpressionStatement(
@@ -3088,7 +3143,7 @@ function compileLValue(target: Expr, ctx: CompileContext): ts.Expression {
       // Use `recv!.prop` to absorb the optional case when the local
       // was declared `ClassName | undefined` — the script's pattern
       // assumes the value is present at this point.
-      if (target.expr.type === 'Local' && ctx.declaredFieldAnnotation(target.expr.name, target.index)) {
+      if (declaredAnnotationOfExpr(target, ctx)) {
         return factory.createPropertyAccessExpression(
           compileExpr(target.expr, ctx),
           factory.createIdentifier(propertyName(target.index)),
@@ -3873,6 +3928,7 @@ function compileFunctionShape(
   const prevTsOptionalClass = new Set(ctx.tsOptionalClassLocal);
   const prevTsLuauChild = new Set(ctx.tsLuauChildLocal);
   const prevTsShapeTyped = new Set(ctx.tsShapeTypedLocal);
+  const prevPass6Shape = new Set(ctx.tsPass6ShapeLocal);
   // Pass 3: register backprop-typed params in `tsTypedClassLocal` so
   // downstream macros / receiver gates (Instance.new parent skip etc.)
   // see them as Instance/etc.
@@ -3968,7 +4024,13 @@ function compileFunctionShape(
         // preserve, so member reads must keep the Record bridge.
         const annotatedUnknown =
           !!arg.annotation && compileType(arg.annotation).kind === ts.SyntaxKind.UnknownKeyword;
-        if (shape && !shape.empty && !annotatedUnknown) ctx.tsShapeTypedLocal.add(arg.name);
+        if (shape && !shape.empty && !annotatedUnknown) {
+          ctx.tsShapeTypedLocal.add(arg.name);
+          if (!arg.annotation && !ctx.preInferredParamType.has(arg.name)) ctx.tsPass6ShapeLocal.add(arg.name);
+          else ctx.tsPass6ShapeLocal.delete(arg.name);
+        } else {
+          ctx.tsPass6ShapeLocal.delete(arg.name);
+        }
       }
     }
     if (fn.vararg) ctx.defineLocal('__varargs', 'unknown');
@@ -4032,6 +4094,9 @@ function compileFunctionShape(
   }
   for (const name of Array.from(ctx.tsShapeTypedLocal)) {
     if (!prevTsShapeTyped.has(name)) ctx.tsShapeTypedLocal.delete(name);
+  }
+  for (const name of Array.from(ctx.tsPass6ShapeLocal)) {
+    if (!prevPass6Shape.has(name)) ctx.tsPass6ShapeLocal.delete(name);
   }
   return {
     params,
@@ -4268,6 +4333,22 @@ function returnValueFitsDeclared(value: Expr, declared: TypeNode, ctx: CompileCo
   return isTrustedTypedExpr(value, ctx) && staticTypeOfExpr(value, ctx) === want;
 }
 
+/** Register everything the TS-type gates need to know about a binding
+ *  whose emitted declaration carries `annotation` — written on the
+ *  binding, inherited from its init, or the element of an iterated
+ *  array. Class annotations feed the member-access and `!` gates. */
+function bindDeclaredAnnotation(name: string, annotation: TypeNode | null | undefined, ctx: CompileContext): void {
+  ctx.noteDeclaredType(name, annotation);
+  if (ctx.compatMode !== 'rbxts') return;
+  const cls = annotation ? oracleClassOfAnnotation(annotation, ctx) : null;
+  if (cls) {
+    ctx.tsTypedClassLocal.set(name, cls.name);
+    if (cls.nullable) ctx.tsOptionalClassLocal.add(name);
+    else ctx.tsOptionalClassLocal.delete(name);
+    ctx.tsLuauChildLocal.delete(name);
+  }
+}
+
 /** Oracle Instance class named by an annotation (`Frame`, `Frame?`,
  *  `Frame | nil`), or null. */
 function oracleClassOfAnnotation(
@@ -4456,14 +4537,18 @@ const VECTOR_LIB_COMPONENTS = new Set(['x', 'y', 'z']);
  *  x = tick(); x - 1` tracks as number but TS still sees `unknown`. */
 function tsSeesNumber(expr: Expr, ctx: CompileContext): boolean {
   switch (expr.type) {
-    case 'Local':
-      return tsVisibleType(expr, ctx) === 'number';
     case 'Group':
       return tsSeesNumber(expr.expr, ctx);
     case 'TypeAssertion':
       return typeFromAnnotation(expr.annotation) === 'number' || tsSeesNumber(expr.expr, ctx);
+    case 'ConstantNumber':
+    case 'ConstantInteger':
+      return true;
     default:
-      return staticTypeOfExpr(expr, ctx) === 'number';
+      // The static view alone can name a datatype receiver TS only
+      // sees as a synthesized shape (`{ X: unknown }`); a member read
+      // counts as number only when the receiver is trusted too.
+      return tsVisibleType(expr, ctx) === 'number';
   }
 }
 
@@ -4627,9 +4712,17 @@ function staticTypeOfExpr(expr: Expr, ctx: CompileContext): StaticValueType {
       // Field of a binding whose annotation (possibly via a `type`
       // alias) declares a table shape: the declared field type is
       // exactly what TS sees.
-      if (expr.expr.type === 'Local') {
-        const field = ctx.declaredFieldAnnotation(expr.expr.name, expr.index);
+      {
+        const field = declaredAnnotationOfExpr(expr, ctx);
         if (field) return typeFromAnnotation(ctx.resolveAlias(field));
+        const leaf = shapeLeafType(expr, ctx);
+        if (leaf) return leaf;
+      }
+      if (expr.expr.type === 'Local') {
+        // Member of a require-bound module whose cached return shape
+        // types it (`RLConst.MAX_SPEED: number`).
+        const fromModule = moduleMemberStaticType(expr.expr.name, expr.index, ctx);
+        if (fromModule) return fromModule;
       }
       // Receiver whose class is known: the oracle's declared property
       // type is authoritative, and the name-based datatype heuristics
@@ -5101,10 +5194,15 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
             ?? (expr.expr.type === 'Local' ? ctx.tsTypedClassLocal.get(expr.expr.name) : undefined)
             ?? resolveOracleClassOfExpr(expr.expr, ctx);
           const receiverStaticType = staticTypeOfExpr(expr.expr, ctx);
+          const receiverDatatypeName = isDatatypeStatic(receiverStaticType)
+            ? receiverStaticType.slice('datatype:'.length)
+            : null;
           const receiverIsTsDatatype =
-            isDatatypeStatic(receiverStaticType)
+            !!receiverDatatypeName
             && isTrustedTypedExpr(expr.expr, ctx)
-            && !!ctx.oracle.propertyType(receiverStaticType.slice('datatype:'.length), expr.index);
+            && (receiverDatatypeName === VECTOR_LIB_TYPE
+              ? VECTOR_LIB_COMPONENTS.has(expr.index)
+              : !!ctx.oracle.propertyType(receiverDatatypeName, expr.index));
           const receiverHasProperty =
             receiverIsTsDatatype
             || (!!receiverClass
@@ -5202,6 +5300,7 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         if (rootLocal && ctx.tsShapeTypedLocal.has(rootLocal)) {
           return access;
         }
+        if (declaredAnnotationOfExpr(expr, ctx)) return access;
         return factory.createPropertyAccessExpression(
           recordCastExpression(accessReceiver),
           factory.createIdentifier(propertyName(expr.index)),
@@ -5853,13 +5952,30 @@ function compileBinary(
         return factory.createBinaryExpression(wrap(left, leftExpr), direct, wrap(right, rightExpr));
       }
       // `===`/`!==` widen operands `as unknown` to avoid TS2367 when shape
-      // inference narrowed one side away from a primitive literal.
+      // inference narrowed one side away from a primitive literal. TS
+      // never raises it against `undefined`, so `x == nil` compares
+      // directly — which also lets TS narrow a nilable `x` afterwards.
+      // Operands TS sees as the same primitive or datatype compare
+      // directly too.
       if (op === '==' || op === '~=') {
+        const comparesNil = leftExpr?.type === 'ConstantNil' || rightExpr?.type === 'ConstantNil';
+        const lv = leftExpr ? tsVisibleType(leftExpr, ctx) : 'unknown';
+        const rv = rightExpr ? tsVisibleType(rightExpr, ctx) : 'unknown';
+        const sameConcrete = lv !== 'unknown' && lv !== 'nil' && lv === rv;
+        if (comparesNil || sameConcrete) {
+          return factory.createBinaryExpression(left, direct, right);
+        }
+        // `unknown` is comparable to every type, so widening one operand
+        // is enough; widen the non-literal side so a literal stays legible.
         const wrapU = (e: ts.Expression) =>
           factory.createParenthesizedExpression(
             factory.createAsExpression(e, factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
           );
-        return factory.createBinaryExpression(wrapU(left), direct, wrapU(right));
+        const rightIsLiteral = !!rightExpr && (rightExpr.type === 'ConstantString' || rightExpr.type === 'ConstantNumber'
+          || rightExpr.type === 'ConstantInteger' || rightExpr.type === 'ConstantBool');
+        return rightIsLiteral
+          ? factory.createBinaryExpression(wrapU(left), direct, right)
+          : factory.createBinaryExpression(left, direct, wrapU(right));
       }
       return factory.createBinaryExpression(left, direct, right);
     }
@@ -6155,19 +6271,24 @@ function scanYieldingFunctions(root: BlockStat, ctx: CompileContext): void {
 /** Collect `local function f(): T` / `function f(): T` return annotations
  *  (single-type packs only) so call sites see the declared type. */
 function scanUserFunctionReturnTypes(root: BlockStat, ctx: CompileContext): void {
-  const note = (name: string, fn: { returnAnnotation: TypePack | null }): void => {
+  const note = (name: string, fn: { returnAnnotation: TypePack | null; args?: { annotation: TypeNode | null }[] }): void => {
+    if (fn.args) ctx.userFunctionParamAnnotations.set(name, fn.args.map((a) => a.annotation));
     const pack = fn.returnAnnotation;
     if (!pack || pack.type !== 'TypePackExplicit') return;
     if (pack.typeList.types.length !== 1 || pack.typeList.tailType) return;
-    const t = typeFromAnnotation(pack.typeList.types[0]);
+    const single = pack.typeList.types[0]!;
+    const t = typeFromAnnotation(ctx.resolveAlias(single));
     if (t !== 'unknown' && t !== 'nil') ctx.userFunctionReturnType.set(name, t);
+    if (compileType(single).kind !== ts.SyntaxKind.UnknownKeyword) {
+      ctx.userFunctionReturnAnnotation.set(name, single);
+    }
   };
   walkLuauNodes(root, (n) => {
     if (n.type === 'LocalFunction') {
       const s = n as unknown as LocalFunctionStat;
       note(s.name.name, s.func);
     } else if (n.type === 'Function' && 'func' in n && 'name' in n) {
-      const s = n as unknown as { name: Expr; func: { returnAnnotation: TypePack | null } };
+      const s = n as unknown as { name: Expr; func: { returnAnnotation: TypePack | null; args: { annotation: TypeNode | null }[] } };
       if (s.name && (s.name.type === 'Global' || s.name.type === 'Local')) {
         note((s.name as { name: string }).name, s.func);
       }
@@ -6235,6 +6356,144 @@ function tsVisibleClassOfExpr(expr: Expr, ctx: CompileContext): string | undefin
   if (cls && ctx.oracle.isClass(cls)) return cls;
   const st = staticTypeOfExpr(expr, ctx);
   if (isDatatypeStatic(st) && isTrustedTypedExpr(expr, ctx)) return st.slice('datatype:'.length);
+  return undefined;
+}
+
+/** True when TS sees a concrete type on the emitted argument: a declared
+ *  annotation (as long as it doesn't compile to `unknown`), a trusted
+ *  primitive/datatype view, or a function literal. */
+function argIsTsTyped(arg: Expr, ctx: CompileContext): boolean {
+  if (arg.type === 'Group') return argIsTsTyped(arg.expr, ctx);
+  if (arg.type === 'Function') return true;
+  // Arithmetic on bridged operands types as `number` only because the
+  // bridge said so; the value may be a vector at runtime. Trust the
+  // result only when every operand is itself TS-typed.
+  if (arg.type === 'Binary' && ['+', '-', '*', '/', '%', '^', '//'].includes(arg.op)) {
+    return argIsTsTyped(arg.left, ctx) && argIsTsTyped(arg.right, ctx);
+  }
+  if (arg.type === 'Unary' && arg.op === '-') return argIsTsTyped(arg.expr, ctx);
+  const ann = declaredAnnotationOfExpr(arg, ctx);
+  if (ann && compileType(ann).kind !== ts.SyntaxKind.UnknownKeyword) return true;
+  const seen = tsVisibleType(arg, ctx);
+  return seen !== 'unknown' && seen !== 'nil';
+}
+
+/** Primitive a synthesized shape declares for a member chain rooted in
+ *  a shape-typed local (or `self` inside a class body): the emitted
+ *  annotation carries it, so TS sees exactly this. */
+function shapeLeafType(expr: Extract<Expr, { type: 'IndexName' }>, ctx: CompileContext): StaticValueType | undefined {
+  const path: string[] = [expr.index];
+  let cur: Expr = expr.expr;
+  while (cur.type === 'IndexName') { path.unshift(cur.index); cur = cur.expr; }
+  if (cur.type !== 'Local') return undefined;
+  type S = import('./shape-infer.js').Shape;
+  let shape: S | undefined;
+  if (cur.name === 'self' && ctx.selfFieldShapes) {
+    const first = path.shift()!;
+    shape = ctx.selfFieldShapes.get(first) as S | undefined;
+  } else {
+    if (!ctx.tsPass6ShapeLocal.has(cur.name)) return undefined;
+    shape = ctx.getShape(cur.name) as S | undefined;
+  }
+  for (const seg of path) {
+    if (!shape || shape.methods.has(seg)) return undefined;
+    shape = shape.props.get(seg);
+  }
+  if (!shape) return undefined;
+  const prim = leafPrimitive(shape);
+  return prim ?? undefined;
+}
+
+/** True when the argument's declared annotation prints to the same TS
+ *  type as the callee's declared parameter annotation, or when TS sees
+ *  the argument as the primitive/datatype the parameter declares. */
+function argMatchesDeclaredParam(arg: Expr, fnName: string, index: number, ctx: CompileContext): boolean {
+  const paramAnn = ctx.userFunctionParamAnnotations.get(fnName)?.[index];
+  if (!paramAnn) return false;
+  const argAnn = declaredAnnotationOfExpr(arg, ctx);
+  if (argAnn && annotationText(argAnn) === annotationText(paramAnn)) return true;
+  const want = typeFromAnnotation(ctx.resolveAlias(paramAnn));
+  return want !== 'unknown' && tsVisibleType(arg, ctx) === want;
+}
+
+/** The annotation TS sees for an expression, as the parsed Luau node:
+ *  a declared binding, a field of one (through table types and
+ *  aliases, foreign or local), a `::` assertion, or a call to a
+ *  file-local function with a declared return type. Null when TS's
+ *  view of the expression is not pinned by an annotation. */
+function declaredAnnotationOfExpr(expr: Expr, ctx: CompileContext): TypeNode | null {
+  switch (expr.type) {
+    case 'Local':
+      return ctx.tsDeclaredAnnotation.get(expr.name) ?? null;
+    case 'Group':
+      return declaredAnnotationOfExpr(expr.expr, ctx);
+    case 'TypeAssertion':
+      if (ctx.compatMode === 'rbxts' && compileType(expr.annotation).kind === ts.SyntaxKind.UnknownKeyword) {
+        return declaredAnnotationOfExpr(expr.expr, ctx);
+      }
+      return expr.annotation;
+    case 'IndexName': {
+      const parent = declaredAnnotationOfExpr(expr.expr, ctx);
+      if (!parent) return null;
+      const table = ctx.resolveAlias(parent);
+      if (!table || table.type !== 'TypeTable') return null;
+      for (const prop of table.props) {
+        if (prop.name === expr.index) return prop.propType ?? null;
+      }
+      const indexer = table.indexer;
+      if (indexer && indexer.indexType.type === 'TypeReference' && indexer.indexType.name === 'string') {
+        return indexer.resultType;
+      }
+      return null;
+    }
+    case 'Call': {
+      const f = expr.func;
+      if (!expr.self && (f.type === 'Local' || f.type === 'Global')) {
+        return ctx.userFunctionReturnAnnotation.get(f.name) ?? null;
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
+const typeTextPrinter = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
+const typeTextFile = ts.createSourceFile('_t.ts', '', ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
+function annotationText(t: TypeNode): string {
+  return typeTextPrinter.printNode(ts.EmitHint.Unspecified, compileType(t), typeTextFile);
+}
+
+const moduleShapeCache = new WeakMap<CompileContext, Map<string, ts.TypeNode | null>>();
+
+/** Static view of `<requireLocal>.<member>` from the module's cached
+ *  return shape: the emitted `as unknown as { member: number; … }` cast
+ *  is what TS resolves the read against. */
+function moduleMemberStaticType(local: string, member: string, ctx: CompileContext): StaticValueType | undefined {
+  const path = ctx.requireBoundLocals.get(local);
+  if (!path) return undefined;
+  let cache = moduleShapeCache.get(ctx);
+  if (!cache) { cache = new Map(); moduleShapeCache.set(ctx, cache); }
+  let shape = cache.get(path);
+  if (shape === undefined) {
+    const text = ctx.moduleReturnTypes.get(path);
+    shape = text ? parseTypeText(text) : null;
+    cache.set(path, shape);
+  }
+  if (!shape || !ts.isTypeLiteralNode(shape)) return undefined;
+  for (const m of shape.members) {
+    if (!ts.isPropertySignature(m) || !m.type || !ts.isIdentifier(m.name) || m.name.text !== member) continue;
+    switch (m.type.kind) {
+      case ts.SyntaxKind.NumberKeyword: return 'number';
+      case ts.SyntaxKind.StringKeyword: return 'string';
+      case ts.SyntaxKind.BooleanKeyword: return 'boolean';
+      default:
+        if (ts.isTypeReferenceNode(m.type) && ts.isIdentifier(m.type.typeName) && ARITH_DATATYPES.has(m.type.typeName.text)) {
+          return `datatype:${m.type.typeName.text}` as StaticValueType;
+        }
+        return undefined;
+    }
+  }
   return undefined;
 }
 
@@ -6473,6 +6732,15 @@ function castArgsForCall(
       }
     } else if (
       luauArgs?.[i]
+      && ts.isIdentifier(callee)
+      && argMatchesDeclaredParam(luauArgs[i]!, callee.text, i, ctx)
+    ) {
+      // The argument's own annotation is the parameter's annotation:
+      // TS checks them directly, and a mismatch would be a real error
+      // the bridge was hiding.
+      return arg;
+    } else if (
+      luauArgs?.[i]
       && isTrustedTypedExpr(luauArgs[i]!, ctx)
       && ts.isIdentifier(callee)
     ) {
@@ -6509,6 +6777,11 @@ function castArgsForCall(
         return arg;
       }
     }
+    // An argument TS already types — an annotated binding, a member
+    // read through a declared table, a datatype/primitive expression,
+    // or a function literal — is checked against the real parameter.
+    // The wrap would only hide a genuine mismatch.
+    if (luauArgs?.[i] && argIsTsTyped(luauArgs[i]!, ctx)) return arg;
     if (ts.isParenthesizedExpression(arg) && ts.isAsExpression(arg.expression) && !expected && !ts.isIdentifier(callee)) return arg;
     if (ts.isAsExpression(arg) && !expected && !ts.isIdentifier(callee)) return arg;
     // No expected slot kind + complex callee: the Parameters<typeof
@@ -6543,13 +6816,32 @@ function castArgsForCall(
         factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
       ),
       factory.createIndexedAccessTypeNode(
-        factory.createTypeReferenceNode('Parameters', [
-          factory.createTypeQueryNode(calleeAsEntityName(callee)),
-        ]),
+        factory.createTypeReferenceNode('Parameters', [calleeTypeQuery(callee)]),
         factory.createLiteralTypeNode(factory.createNumericLiteral(i)),
       ),
     );
   });
+}
+
+/** `typeof callee` for the Parameters<> wrap. A `recv!.method` callee
+ *  can't be written as a type query (`!` isn't allowed there), so it
+ *  becomes `NonNullable<typeof recv>["method"]`. */
+function calleeTypeQuery(callee: ts.Expression): ts.TypeNode {
+  let cur: ts.Expression = callee;
+  while (ts.isParenthesizedExpression(cur)) cur = cur.expression;
+  if (
+    ts.isPropertyAccessExpression(cur)
+    && ts.isIdentifier(cur.name)
+    && ts.isNonNullExpression(cur.expression)
+  ) {
+    return factory.createIndexedAccessTypeNode(
+      factory.createTypeReferenceNode('NonNullable', [
+        factory.createTypeQueryNode(calleeAsEntityName(cur.expression.expression)),
+      ]),
+      factory.createLiteralTypeNode(factory.createStringLiteral(cur.name.text)),
+    );
+  }
+  return factory.createTypeQueryNode(calleeAsEntityName(callee));
 }
 
 function slotKindToTypeNode(kind: SlotKind | undefined): ts.TypeNode | undefined {
@@ -6772,10 +7064,10 @@ function isTrustedTypedExpr(expr: Expr, ctx: CompileContext): boolean {
     const flowed = flowFactToStatic(flowFactOf(expr, ctx));
     if (flowed && flowed !== 'unknown') return true;
   }
-  if (expr.type === 'IndexName' && expr.expr.type === 'Local') {
-    if (ctx.declaredFieldAnnotation(expr.expr.name, expr.index)) {
-      return staticTypeOfExpr(expr, ctx) !== 'unknown';
-    }
+  if (expr.type === 'IndexName') {
+    if (declaredAnnotationOfExpr(expr, ctx)) return staticTypeOfExpr(expr, ctx) !== 'unknown';
+    if (shapeLeafType(expr, ctx)) return true;
+    if (expr.expr.type === 'Local' && moduleMemberStaticType(expr.expr.name, expr.index, ctx)) return true;
   }
   if (expr.type === 'IndexName') {
     // Member of a TS-typed datatype receiver (`v.x` on `vector`,
@@ -6815,7 +7107,8 @@ function isTrustedTypedExpr(expr: Expr, ctx: CompileContext): boolean {
     case 'Call': {
       const fn = expr.func;
       if (fn.type === 'Global' && (fn.name === 'tostring' || fn.name === 'tonumber')) return true;
-      if ((fn.type === 'Local' || fn.type === 'Global') && !expr.self && ctx.userFunctionReturnType.has(fn.name)) {
+      if ((fn.type === 'Local' || fn.type === 'Global') && !expr.self
+        && (ctx.userFunctionReturnType.has(fn.name) || ctx.userFunctionReturnAnnotation.has(fn.name))) {
         return true;
       }
       if (fn.type === 'IndexName' && fn.expr.type === 'Global') {
@@ -7588,8 +7881,17 @@ function shouldRouteDynamicChildRead(
   }
   // Declared table shape: the annotation names the field, so the read
   // resolves against it directly.
-  if (expr.expr.type === 'Local' && ctx.declaredFieldAnnotation(expr.expr.name, expr.index)) {
-    return false;
+  if (declaredAnnotationOfExpr(expr, ctx)) return false;
+  // Component of a trusted datatype receiver (`v.x` on vector,
+  // `cf.Position` on CFrame): @rbxts/types declares it.
+  {
+    const recv = staticTypeOfExpr(expr.expr, ctx);
+    if (isDatatypeStatic(recv) && isTrustedTypedExpr(expr.expr, ctx)) {
+      const dt = recv.slice('datatype:'.length);
+      if (dt === VECTOR_LIB_TYPE ? VECTOR_LIB_COMPONENTS.has(expr.index) : !!ctx.oracle.propertyType(dt, expr.index)) {
+        return false;
+      }
+    }
   }
   const observedUntypedLocal =
     expr.expr.type === 'Local'
@@ -8136,6 +8438,10 @@ export interface CompileOptions {
    *  callable cast on calls to known-method members of require-bound
    *  locals. */
   moduleExportedMembers?: Map<string, Map<string, 'method' | 'property' | 'recordMap'>>;
+  /** Corpus path → that module's `export type` aliases, from the
+   *  cross-script index. Consumers referencing `Mod.Foo` inline the
+   *  alias as a local type declaration and resolve fields through it. */
+  moduleTypeAliases?: Map<string, Map<string, TypeNode>>;
   /** Corpus path for this script (Roblox instance path or filesystem
    *  path-sans-extension), used as the lookup key for cross-script
    *  `require()` resolution. Distinct from `sourceFile`, which feeds the
@@ -8178,9 +8484,11 @@ export async function compile(
   const ctx = new CompileContext(options.compatMode ?? 'native');
   ctx.staticTypeOf = (expr) => staticTypeOfExpr(expr as Expr, ctx);
   ctx.tsVisibleTypeOf = (expr) => tsVisibleType(expr as Expr, ctx);
+  ctx.staticTypeOfAnnotation = (t) => typeFromAnnotation(ctx.resolveAlias(t));
   if (options.moduleReturnTypes) ctx.moduleReturnTypes = options.moduleReturnTypes;
   if (options.moduleRecordMapFields) ctx.moduleRecordMapFields = options.moduleRecordMapFields;
   if (options.moduleExportedMembers) ctx.moduleExportedMembers = options.moduleExportedMembers;
+  if (options.moduleTypeAliases) ctx.moduleTypeAliases = options.moduleTypeAliases;
   ctx.currentScriptPath = options.corpusPath ?? options.sourceFile ?? '';
   if (options.moduleOutPaths) ctx.moduleOutPaths = options.moduleOutPaths;
   ctx.currentOutPath = options.outPath ?? '';
@@ -8277,11 +8585,36 @@ export async function compile(
   setAliasBodies(ctx.typeAliases);
   setTypeCompatMode(ctx.compatMode);
   if (parsed.root) scanRequireLocalPaths(parsed.root, ctx);
-  // A qualified type reference (`Mod.Foo`) would need `Mod` to export
-  // types, which a module emitting `export = value` cannot do. Leave the
-  // prefix as written rather than importing a namespace that has no
-  // types to offer.
-  setTypePrefixResolver(null);
+  // `Mod.Foo` names an alias exported by a required module. A module
+  // emitting `export = value` cannot also export types, so instead of
+  // importing, the alias body is inlined here as `type Mod__Foo = …`.
+  // Bare references inside that body to Mod's other aliases hoist the
+  // same way, so a whole alias graph carries over.
+  const foreignAliasDecls = new Map<string, ts.Statement>();
+  const foreignAliasQueue: { local: string; prefix: string; name: string; body: TypeNode }[] = [];
+  setTypePrefixResolver((prefix, name, node) => {
+    let home: { table: Map<string, TypeNode>; home: string } | null = null;
+    let prefixLocal = prefix;
+    if (prefix) {
+      home = ctx.foreignAliases(prefix);
+    } else {
+      const scope = ctx.aliasTableFor(node);
+      if (!scope.home) return undefined;
+      home = { table: scope.table, home: scope.home };
+      for (const [local, path] of ctx.requireLocalPaths) {
+        if (path === scope.home) { prefixLocal = local; break; }
+      }
+      if (!prefixLocal) return undefined;
+    }
+    const body = home?.table.get(name);
+    if (!body || !prefixLocal) return undefined;
+    const local = `${safeIdentifier(prefixLocal)}__${name}`;
+    if (!foreignAliasDecls.has(local)) {
+      foreignAliasDecls.set(local, factory.createEmptyStatement());
+      foreignAliasQueue.push({ local, prefix: prefixLocal, name, body });
+    }
+    return local;
+  });
 
   // rbxts mode pre-scan: walk every top-level function declaration and
   // remember those whose body emits multi-return (any return path with
@@ -8700,6 +9033,21 @@ export async function compile(
   allStatements.push(...implicitGlobalDecls);
   // Pass 1: type aliases for synthesized script/workspace shapes.
   allStatements.push(...scriptParentDecls);
+  // Each hoisted body may reference further foreign aliases; keep
+  // draining until the graph closes.
+  while (foreignAliasQueue.length > 0) {
+    const item = foreignAliasQueue.shift()!;
+    foreignAliasDecls.set(item.local, factory.createTypeAliasDeclaration(
+      undefined,
+      factory.createIdentifier(item.local),
+      undefined,
+      compileType(item.body),
+    ));
+  }
+  allStatements.push(...[...foreignAliasDecls.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([, s]) => s)
+    .filter((s) => !ts.isEmptyStatement(s)));
   allStatements.push(...loopVarDecls);
   allStatements.push(...stmts);
 

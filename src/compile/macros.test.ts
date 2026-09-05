@@ -518,19 +518,23 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
   });
 
   it('rbxts mode emits `for (const v of arr)` for single-binding iteration', async () => {
-    // roblox-ts compiles `for-of` on arrays to Lua ipairs-style. Single-
-    // binding source maps to value-only TS iteration (no destructure).
-    // The iterable is cast to `any[]` so the destructured element type
-    // is `any` rather than `unknown` — `unknown` would trip TS18046 on
-    // every property access in the loop body.
+    // roblox-ts compiles `for-of` on arrays to Lua ipairs-style. An
+    // annotated array (`xs: {number}`) is `number[]` to TS, so the
+    // iterable needs no cast and the value binding is typed by it.
     const out = await emit(
       `local function f(xs: { number }) for _, x in xs do print(x) end end`,
       'rbxts',
     );
-    // The cast routes through `unknown` first so record-shaped tables
-    // (no overlap with `any[]`) don't trip TS2352. Array-shaped sources
-    // pass through unchanged at runtime.
-    expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs as unknown as any\[\]\)\)/);
+    expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs\)\)/);
+    // An untyped iterable still routes through `unknown` to `any[]` so
+    // the element is `any` rather than `unknown` (which would trip
+    // TS18046 on every property access in the loop body) and record-
+    // shaped tables don't trip TS2352.
+    const untyped = await emit(
+      `local function f(xs) for _, x in xs do print(x) end end`,
+      'rbxts',
+    );
+    expect(untyped).toMatch(/for \(const \[_, x\] of ipairs\(xs as unknown as any\[\]\)\)/);
   });
 
   it('rbxts mode uses Instance[] for safe GetDescendants ipairs loops', async () => {
