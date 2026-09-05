@@ -108964,6 +108964,42 @@ const data: ApiData = {
       {
         "args": [
           {
+            "name": "x",
+            "optional": false,
+            "rest": false,
+            "type": "number"
+          }
+        ],
+        "name": "isfinite",
+        "returnText": "boolean"
+      },
+      {
+        "args": [
+          {
+            "name": "x",
+            "optional": false,
+            "rest": false,
+            "type": "number"
+          }
+        ],
+        "name": "isinf",
+        "returnText": "boolean"
+      },
+      {
+        "args": [
+          {
+            "name": "x",
+            "optional": false,
+            "rest": false,
+            "type": "number"
+          }
+        ],
+        "name": "isnan",
+        "returnText": "boolean"
+      },
+      {
+        "args": [
+          {
             "name": "m",
             "optional": false,
             "rest": false,

@@ -162,6 +162,21 @@ export const STDLIB_SLOTS: Record<string, SlotEntry> = {
       "0": "number"
     }
   },
+  "math.isfinite": {
+    "slots": {
+      "0": "number"
+    }
+  },
+  "math.isinf": {
+    "slots": {
+      "0": "number"
+    }
+  },
+  "math.isnan": {
+    "slots": {
+      "0": "number"
+    }
+  },
   "math.ldexp": {
     "slots": {
       "0": "number",
