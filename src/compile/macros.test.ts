@@ -373,10 +373,12 @@ describe('class-shape recognition (R.9, rbxts mode only)', () => {
     // (TS7006), and `any` would trip roblox-ts's no-any rule on every
     // body access; `unknown` keeps both happy. Body accesses on
     // `unknown` will require narrowing — Phase 2's job.
-    // Unannotated trailing params are marked optional (`?: unknown`)
-    // so a 1-arg `new Vec(x)` call site (Luau missing-positional →
-    // nil semantics) still typechecks under roblox-ts strict mode.
-    expect(out).toMatch(/constructor\(x\?: unknown, y\?: unknown\)/);
+    // Unannotated trailing params are declared `<name>_?: unknown` so
+    // a 1-arg `new Vec(x)` call site (Luau missing-positional → nil
+    // semantics) still typechecks, and rebound as `_LuauValue` at the
+    // top of the body so every use inside is typed.
+    expect(out).toMatch(/constructor\(x_\?: unknown, y_\?: unknown\)/);
+    expect(out).toMatch(/let x = x_ as _LuauValue/);
     expect(out).toContain('getX()');
     // The metatable plumbing should be gone.
     expect(out).not.toContain('setmetatable');
@@ -445,14 +447,12 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
   it('rbxts mode lowers `nil` literals to `undefined` (not `null`)', async () => {
     // roblox-ts rejects `null` outright ("null is not supported — use
     // undefined"). The native-mode null mapping (matched against
-    // `T | null` annotations) is wrong for the rbxts target. We also
-    // annotate the local as `: unknown` so subsequent writes are
-    // open-ended (without it TS narrows to `undefined` and rejects
-    // assignment of any non-undefined value — TS2322). `unknown`
-    // satisfies roblox-ts's no-any rule, unlike the prior `: any`
-    // annotation.
+    // `T | null` annotations) is wrong for the rbxts target. A `nil`
+    // init carries no type information, so the local is declared as
+    // `_LuauValue` with a definite-assignment marker — roblox-ts lowers
+    // that to a bare `local x`, and later writes bridge once.
     const out = await emit('local x = nil', 'rbxts');
-    expect(out).toMatch(/(let|const) x:\s*unknown\s*=\s*undefined/);
+    expect(out).toMatch(/let x!:\s*_LuauValue;/);
     expect(out).not.toContain('let x = null');
   });
 
@@ -475,15 +475,13 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
        function C:get() return self.x end`,
       'rbxts',
     );
-    // Class constructor + method params default to `: unknown` (Phase 1
-    // of the rbxts cleanup switched from `: any` — every body access
-    // on an `any` param tripped roblox-ts's no-any rule). `unknown`
-    // satisfies TS7006 (no implicit any) AND roblox-ts's no-any rule;
-    // body accesses on `unknown` will require narrowing (TS18046) —
-    // surface area for Phase 2's per-variable shape inference.
-    // Unannotated trailing params keep their `?` marker so 1-arg
-    // call sites (Luau missing-positional → nil) still typecheck.
-    expect(out).toMatch(/constructor\(x\?: unknown, y\?: unknown\)/);
+    // Class constructor + method params with no type information are
+    // declared `<name>_?: unknown` (any argument fits, roblox-ts rejects
+    // `any`) and rebound as `_LuauValue` in the body so accesses on them
+    // need no per-use narrowing. Trailing ones keep the `?` marker so
+    // 1-arg call sites (Luau missing-positional → nil) still typecheck.
+    expect(out).toMatch(/constructor\(x_\?: unknown, y_\?: unknown\)/);
+    expect(out).toMatch(/let y = y_ as _LuauValue/);
   });
 
   it('rbxts mode does NOT synthesize a `static new(...)` forwarder', async () => {
@@ -526,15 +524,15 @@ describe('rbxts mode roundtrip-readiness (R.14)', () => {
       'rbxts',
     );
     expect(out).toMatch(/for \(const \[_, x\] of ipairs\(xs\)\)/);
-    // An untyped iterable still routes through `unknown` to `any[]` so
-    // the element is `any` rather than `unknown` (which would trip
-    // TS18046 on every property access in the loop body) and record-
-    // shaped tables don't trip TS2352.
+    // An untyped iterable routes through `unknown` to `_LuauValue[]` so
+    // the element is a Luau value TS can read, index and do arithmetic
+    // on directly (roblox-ts rejects `any`), and record-shaped tables
+    // don't trip TS2352.
     const untyped = await emit(
       `local function f(xs) for _, x in xs do print(x) end end`,
       'rbxts',
     );
-    expect(untyped).toMatch(/for \(const \[_, x\] of ipairs\(xs as unknown as any\[\]\)\)/);
+    expect(untyped).toMatch(/for \(const \[_, x\] of ipairs\(xs as unknown as _LuauValue\[\]\)\)/);
   });
 
   it('rbxts mode uses Instance[] for safe GetDescendants ipairs loops', async () => {

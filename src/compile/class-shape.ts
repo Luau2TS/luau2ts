@@ -8,8 +8,8 @@ import type {
   LocalStat,
   Stat,
 } from '../parser/index.js';
-import type { CompileContext } from './context.js';
-import { collectLocalNames, collectShapes, mergeShape, shapeToTypeNode } from './shape-infer.js';
+import { DYN_VALUE_TYPE, type CompileContext } from './context.js';
+import { collectLocalNames, collectShapes, intersectionTypeName, mergeShape, shapeToTypeNode } from './shape-infer.js';
 import { inferParamPrimitives, type Primitive as ParamPrimitive } from './param-infer.js';
 import { compileType } from './type.js';
 import { safeIdentifier } from './util.js';
@@ -286,7 +286,7 @@ export function compileClassPattern(
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
         fieldNames.add(name);
         const fieldType = shapeToTypeNode(childShape)
-          ?? factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+          ?? factory.createTypeReferenceNode(DYN_VALUE_TYPE, undefined);
         members.push(
           factory.createPropertyDeclaration(
             undefined,
@@ -327,17 +327,22 @@ export function compileClassPattern(
         ctorOptionalFrom = lastShapeRequired + 1;
       }
     }
+    const ctorDyn = new Set(
+      ctorArgs.filter((a) => methodParamIsDyn(a, ctorShapes?.get(a.name), null, ctx)).map((a) => a.name),
+    );
     const params = ctorArgs.map((a, idx) =>
-      paramDecl(a, idx >= ctorOptionalFrom, ctorShapes?.get(a.name) ?? null),
+      paramDecl(a, idx >= ctorOptionalFrom, ctorShapes?.get(a.name) ?? null, null, ctorDyn.has(a.name)),
     );
     if (ctorShapes) ctx.pushShapeScope(ctorShapes as Map<string, unknown>);
+    for (const n of ctorDyn) ctx.noteDeclaredTypeKind(n, 'dyn');
     const body = ctorBody(fnExpr.body, pattern, ctx, compileBlockBody, compileExpr);
+    for (const n of ctorDyn) ctx.tsDynLocal.delete(n);
     if (ctorShapes) ctx.popShapeScope();
     members.push(
       factory.createConstructorDeclaration(
         undefined,
         params,
-        factory.createBlock([...fieldInitStmts, ...body], true),
+        factory.createBlock([...fieldInitStmts, ...dynPrologue([...ctorDyn]), ...body], true),
       ),
     );
   }
@@ -405,10 +410,18 @@ export function compileClassPattern(
       for (const n of collectLocalNames(fnExpr.body)) trackedNames.add(n);
       methodShapes = collectShapes(fnExpr.body, trackedNames);
     }
+    const paramPrimitivesEarly = ctx.compatMode === 'rbxts' && fnExpr.body
+      ? inferParamPrimitives(fnExpr as unknown as Parameters<typeof inferParamPrimitives>[0])
+      : new Map<string, ParamPrimitive>();
+    const methodDyn = new Set(
+      fnArgs
+        .filter((a) => methodParamIsDyn(a, methodShapes?.get(a.name), paramPrimitivesEarly.get(a.name) ?? null, ctx))
+        .map((a) => a.name),
+    );
     if (methodShapes) {
       let lastShapeRequired = -1;
       fnArgs.forEach((a, i) => {
-        if (a.annotation) return;
+        if (a.annotation || methodDyn.has(a.name)) return;
         const sh = methodShapes.get(a.name);
         if (sh && !sh.empty) lastShapeRequired = i;
       });
@@ -426,7 +439,7 @@ export function compileClassPattern(
     if (paramPrimitives.size > 0) {
       let lastPrimitiveRequired = -1;
       fnArgs.forEach((a, i) => {
-        if (a.annotation) return;
+        if (a.annotation || methodDyn.has(a.name)) return;
         if (paramPrimitives.has(a.name)) lastPrimitiveRequired = i;
       });
       if (lastPrimitiveRequired + 1 > optionalFrom) {
@@ -439,8 +452,10 @@ export function compileClassPattern(
         idx >= optionalFrom,
         methodShapes?.get(a.name) ?? null,
         paramPrimitives.get(a.name) ?? null,
+        methodDyn.has(a.name),
       ),
     );
+    for (const n of methodDyn) ctx.preInferredParamType.delete(n);
     // Make the inferred primitives visible inside the body so call sites
     // can drop the redundant `as unknown as <prim>` arg casts.
     const prevPreInferred = new Map<string, ParamPrimitive | undefined>();
@@ -479,7 +494,7 @@ export function compileClassPattern(
       for (const a of fnArgs) {
         const sh = methodShapes.get(a.name);
         const annotatedUnknown = !!a.annotation && compileType(a.annotation).kind === ts.SyntaxKind.UnknownKeyword;
-        if (sh && !sh.empty && !annotatedUnknown && !ctx.tsShapeTypedLocal.has(a.name)) {
+        if (sh && !sh.empty && !annotatedUnknown && !methodDyn.has(a.name) && !ctx.tsShapeTypedLocal.has(a.name)) {
           ctx.tsShapeTypedLocal.add(a.name);
           trackedShapeParams.push(a.name);
         }
@@ -491,7 +506,10 @@ export function compileClassPattern(
         ctx.defineLocal(a.name, 'unknown');
         ctx.noteDeclaredType(a.name, a.annotation);
       }
-      return compileBlockBody(fnExpr.body as Stat, ctx);
+      for (const n of methodDyn) ctx.noteDeclaredTypeKind(n, 'dyn');
+      const compiled = compileBlockBody(fnExpr.body as Stat, ctx);
+      for (const n of methodDyn) ctx.tsDynLocal.delete(n);
+      return [...dynPrologue(fnArgs.filter((a) => methodDyn.has(a.name)).map((a) => a.name)), ...compiled];
     });
     ctx.returnAnnotationStack.pop();
     for (const n of trackedShapeParams) ctx.tsShapeTypedLocal.delete(n);
@@ -669,14 +687,62 @@ function rewriteSelfToThis(stat: ts.Statement): ts.Statement {
 }
 
 /** Build a parameter decl. Uses annotation, falls back to shape-inferred type, else `unknown`. */
+/** Same rule as the function compiler's `paramIsDyn`: an unannotated
+ *  param with no string/boolean constraint and no class-pinning shape
+ *  is declared `unknown` and rebound as `_LuauValue` in the body. */
+function methodParamIsDyn(
+  a: { name: string; annotation?: import('../parser/index.js').TypeNode | null },
+  shape: import('./shape-infer.js').Shape | null | undefined,
+  prim: ParamPrimitive | null | undefined,
+  ctx: CompileContext,
+): boolean {
+  if (ctx.compatMode !== 'rbxts') return false;
+  if (a.annotation && compileType(a.annotation).kind !== ts.SyntaxKind.UnknownKeyword) return false;
+  if (prim === 'string' || prim === 'boolean') return false;
+  if (shape && !shape.empty && intersectionTypeName(shape)) return false;
+  return true;
+}
+
+function dynPrologue(names: readonly string[]): ts.Statement[] {
+  return names.map((name) => {
+    const js = safeIdentifier(name);
+    return factory.createVariableStatement(
+      undefined,
+      factory.createVariableDeclarationList(
+        [factory.createVariableDeclaration(
+          factory.createIdentifier(js),
+          undefined,
+          undefined,
+          factory.createAsExpression(
+            factory.createIdentifier(`${js}_`),
+            factory.createTypeReferenceNode(DYN_VALUE_TYPE, undefined),
+          ),
+        )],
+        ts.NodeFlags.Let,
+      ),
+    );
+  });
+}
+
 function paramDecl(
   a: { name: string; annotation?: import('../parser/index.js').TypeNode | null },
   isTrailingUnannotated = false,
   shape?: import('./shape-infer.js').Shape | null,
   paramPrimitive?: ParamPrimitive | null,
+  dyn = false,
 ): ts.ParameterDeclaration {
   let ty: ts.TypeNode;
   let hasInferredShape = false;
+  if (dyn) {
+    const question = isTrailingUnannotated ? factory.createToken(ts.SyntaxKind.QuestionToken) : undefined;
+    return factory.createParameterDeclaration(
+      undefined,
+      undefined,
+      `${safeIdentifier(a.name)}_`,
+      question,
+      factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+    );
+  }
   if (a.annotation) {
     ty = compileType(a.annotation);
   } else if (paramPrimitive) {

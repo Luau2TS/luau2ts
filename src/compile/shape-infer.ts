@@ -8,6 +8,13 @@ import type { Expr, Stat, FunctionExpr } from '../parser/index.js';
 
 const { factory } = ts;
 
+/** Leaf / index / call-result fallback: the emitted `_LuauValue` alias
+ *  (see context.ts). Reads, arithmetic and indexing on it need no
+ *  bridge; compile() emits the alias whenever the output names it. */
+function dynLeaf(): ts.TypeNode {
+  return factory.createTypeReferenceNode('_LuauValue', undefined);
+}
+
 /** Recursive structural shape for a single Luau variable. The shape
  *  is monotone — the union of all observed accesses. */
 export interface Shape {
@@ -430,7 +437,7 @@ const PLAYER_DISCRIMINATORS = new Set([
   'GetRankInGroup', 'IsInGroup', 'Kick',
 ]);
 
-function intersectionTypeName(shape: Shape): string | null {
+export function intersectionTypeName(shape: Shape): string | null {
   const has = (name: string) =>
     shape.props.has(name) || shape.methods.has(name);
   for (const d of PLAYER_DISCRIMINATORS) if (has(d)) return 'Player';
@@ -456,7 +463,7 @@ function looksLikeArray(shape: Shape): boolean {
 
 /** Names the intersection target already declares — drop from synthesized literal
  *  so our loose `(...args: unknown[]): unknown` doesn't shadow the @rbxts/types one. */
-function intersectionTargetDeclaresName(target: string, name: string): boolean {
+export function intersectionTargetDeclaresName(target: string, name: string): boolean {
   if (target === 'Instance') return INSTANCE_DISCRIMINATORS.has(name);
   // Player extends Instance — every Instance member is also a Player
   // member.
@@ -497,7 +504,7 @@ export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
           undefined,
           factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
         )],
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        dynLeaf(),
       ),
     );
     void callMeta;
@@ -522,14 +529,14 @@ export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
             undefined,
             factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
           )],
-          factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+          dynLeaf(),
         ),
       );
       continue;
     }
     const childType = shapeToTypeNode(child)
       ?? leafTypeNode(child)
-      ?? factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+      ?? dynLeaf();
     members.push(
       factory.createPropertySignature(
         undefined,
@@ -551,7 +558,7 @@ export function shapeToTypeNode(shape: Shape): ts.TypeNode | null {
           undefined,
           factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
         )],
-        factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
+        dynLeaf(),
       ),
     );
   }

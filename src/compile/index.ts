@@ -25,7 +25,7 @@ import {
 } from '../parser/index.js';
 import ts from 'typescript';
 import { format as prettierFormat } from 'prettier';
-import { ARITH_DATATYPES, CompileContext, RUNTIME_MODULE, VECTOR_LIB_TYPE, isDatatypeStatic, type CompatMode, type StaticValueType } from './context.js';
+import { ARITH_DATATYPES, CompileContext, DYN_FN_TYPE, DYN_METHOD_TYPE, DYN_VALUE_TYPE, RUNTIME_MODULE, VECTOR_LIB_TYPE, isDatatypeStatic, type CompatMode, type StaticValueType } from './context.js';
 import { lookupMacro } from './macros/index.js';
 // Side-effect imports — populate the macro registry consulted by lookupMacro.
 import './macros/datatypes.js';
@@ -33,7 +33,7 @@ import './macros/instance.js';
 import './macros/stdlib.js';
 import './rbxts-runtime.js';
 import { detectClasses, compileClassPattern, type ClassPattern } from './class-shape.js';
-import { collectLocalNames, collectShapes, leafPrimitive, shapeToTypeNode } from './shape-infer.js';
+import { collectLocalNames, collectShapes, intersectionTargetDeclaresName, intersectionTypeName, leafPrimitive, shapeToTypeNode } from './shape-infer.js';
 import { inferScriptParentShapes } from './script-parent-infer.js';
 import { inferLoopVarShapes } from './loop-var-infer.js';
 import { resolveRequirePath } from './require-infer.js';
@@ -421,6 +421,54 @@ function zeroBasedIndex(index: ts.Expression): ts.Expression {
   return factory.createBinaryExpression(inner, ts.SyntaxKind.MinusToken, factory.createNumericLiteral(1));
 }
 
+function dynTypeNode(): ts.TypeNode {
+  return factory.createTypeReferenceNode(DYN_VALUE_TYPE, undefined);
+}
+
+/** Bridge a value into a `_LuauValue` slot. A number is a constituent
+ *  of the intersection, so a single `as` suffices; anything else goes
+ *  through `unknown`. A value TS already sees as `_LuauValue` passes. */
+function dynCoerce(expr: ts.Expression, source: Expr | undefined, ctx: CompileContext): ts.Expression {
+  const seen = source ? tsVisibleType(source, ctx) : 'unknown';
+  if (seen === 'dyn') return expr;
+  const inner = ts.isBinaryExpression(expr) || ts.isConditionalExpression(expr)
+    || ts.isArrowFunction(expr) || ts.isFunctionExpression(expr)
+    ? factory.createParenthesizedExpression(expr)
+    : expr;
+  if (seen === 'number' || ts.isNumericLiteral(expr)) return factory.createAsExpression(inner, dynTypeNode());
+  return assertExpression(expr, dynTypeNode());
+}
+
+/** True when TS sees the emitted expression as `_LuauValue`: a dyn
+ *  binding, a member chain or index rooted in one (unless the read was
+ *  narrowed to a datatype), or a call through the `_LuauFn` bridge. */
+function isDynExpr(expr: Expr, ctx: CompileContext): boolean {
+  if (ctx.compatMode !== 'rbxts') return false;
+  switch (expr.type) {
+    case 'Local':
+      return ctx.tsDynLocal.has(expr.name);
+    case 'Group':
+      return isDynExpr(expr.expr, ctx);
+    case 'TypeAssertion':
+      return compileType(expr.annotation).kind === ts.SyntaxKind.UnknownKeyword && isDynExpr(expr.expr, ctx);
+    case 'IndexName':
+      if (isDatatypeStatic(staticTypeOfExpr(expr, ctx))) return false;
+      if (shapeLeafIsDyn(expr, ctx)) return true;
+      if (expr.index === 'Parent' || expr.index === 'Value') return false;
+      return isDynExpr(expr.expr, ctx);
+    case 'IndexExpr':
+      return isDynExpr(expr.expr, ctx);
+    case 'Call':
+      return ctx.dynResultCalls.has(expr) || (!expr.self && isDynExpr(expr.func, ctx));
+    case 'Binary':
+      return ['+', '-', '*', '/', '%', '^'].includes(expr.op)
+        && !isDatatypeStatic(staticTypeOfExpr(expr.left, ctx))
+        && (isDynExpr(expr.left, ctx) || isDynExpr(expr.right, ctx));
+    default:
+      return false;
+  }
+}
+
 function recordCastExpression(expr: ts.Expression): ts.Expression {
   return factory.createParenthesizedExpression(
     factory.createAsExpression(
@@ -449,25 +497,19 @@ function luauChildCastExpression(expr: ts.Expression, ctx: CompileContext): ts.E
   );
 }
 
-function unknownCallableTypeNode(): ts.FunctionTypeNode {
-  return factory.createFunctionTypeNode(
-    undefined,
-    [factory.createParameterDeclaration(
-      undefined,
-      factory.createToken(ts.SyntaxKind.DotDotDotToken),
-      'args',
-      undefined,
-      factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
-    )],
-    factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
-  );
+function unknownCallableTypeNode(selfCall = false): ts.TypeNode {
+  // The result of a call TS can't type is a Luau value like any other:
+  // `_LuauValue`, so chained reads and arithmetic on it need no bridge.
+  // A `:` call takes the `this`-typed alias: roblox-ts emits `:` from the
+  // signature's `this` parameter, which is what preserves the receiver.
+  return factory.createTypeReferenceNode(selfCall ? DYN_METHOD_TYPE : DYN_FN_TYPE, undefined);
 }
 
-function unknownCallableCastExpression(expr: ts.Expression): ts.Expression {
+function unknownCallableCastExpression(expr: ts.Expression, selfCall = false): ts.Expression {
   return factory.createParenthesizedExpression(
     assertExpression(
       expr,
-      unknownCallableTypeNode(),
+      unknownCallableTypeNode(selfCall),
     ),
   );
 }
@@ -902,10 +944,7 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
     const init = ctx.compatMode === 'rbxts'
       ? tupleSlots
         ? rawInit
-        : assertExpression(
-            rawInit,
-            factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
-          )
+        : assertExpression(rawInit, factory.createArrayTypeNode(dynTypeNode()))
       : factory.createCallExpression(
           factory.createIdentifier(ctx.use('multiret')),
           undefined,
@@ -920,6 +959,8 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
         if (slot.staticType !== 'unknown') ctx.noteDeclaredTypeKind(v.name, slot.staticType);
         if (slot.className) ctx.tsTypedClassLocal.set(v.name, slot.className);
         else ctx.tsTypedClassLocal.delete(v.name);
+      } else if (!v.annotation && ctx.compatMode === 'rbxts') {
+        ctx.noteDeclaredTypeKind(v.name, 'dyn');
       }
     });
     if (anyShadow) {
@@ -1148,6 +1189,9 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       // rbxts: materialize observed structural shape as the annotation;
       // bare `let x` / `let x = nil` fall back to `unknown` so writes don't trip TS7034.
       let typeNode: ts.TypeNode | undefined = v.annotation ? compileType(v.annotation) : undefined;
+      // `local x: any` carries no type; let the untyped path handle it.
+      if (typeNode && typeNode.kind === ts.SyntaxKind.UnknownKeyword && ctx.compatMode === 'rbxts') typeNode = undefined;
+      let declaredDyn = false;
       const initIsNil = init?.type === 'ConstantNil';
       // Phase 3: per-local TS-type inference. When the entire local's
       // init + reassignment chain agrees on a single primitive (number /
@@ -1180,10 +1224,9 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
               )
                 ? factory.createParenthesizedExpression(initExpr)
                 : initExpr;
-              initExpr = factory.createAsExpression(
-                inner,
-                typeNode,
-              );
+              initExpr = !init || tsVisibleType(init, ctx) === 'unknown'
+                ? factory.createAsExpression(inner, typeNode)
+                : assertExpression(inner, typeNode);
             }
           }
         }
@@ -1246,8 +1289,35 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
           const inferred = ctx.getShape(v.name) as
             | import('./shape-infer.js').Shape
             | undefined;
-          const fromShape = inferred ? shapeToTypeNode(inferred) : null;
-          if (fromShape) {
+          // A shape that pins a Roblox class (`& Instance`, `& Player`,
+          // Vector3) keeps the typed API surface. Anything else is a
+          // Luau value with no type information: declare `_LuauValue`
+          // once and let every read, index and arithmetic go direct.
+          const classShape = !!inferred && !inferred.empty && !!intersectionTypeName(inferred);
+          // A `_LuauChild` init (dynamic Instance child, uncached require)
+          // keeps its callable/indexable alias — `_LuauValue` would lose
+          // the call signature those values rely on.
+          const keepChild = !!init && !initIsNil && exprEmitsLuauChild(init, ctx);
+          const useDyn = !classShape && !keepChild
+            && !ctx.backpropInstanceLocals.has(v.name)
+            && !ctx.instanceNarrowings.has(v.name);
+          const fromShape = inferred && !useDyn ? shapeToTypeNode(inferred) : null;
+          if (useDyn) {
+            const initSeen = init && !initIsNil ? tsVisibleType(init, ctx) : 'unknown';
+            if (initExpr && !initIsNil && initSeen === 'dyn') {
+              // TS infers `_LuauValue` from the init itself.
+            } else if (init && init.type === 'Table' && init.items.length === 0) {
+              typeNode = dynTypeNode();
+              initExpr = factory.createAsExpression(factory.createObjectLiteralExpression([], false), dynTypeNode());
+            } else {
+              typeNode = dynTypeNode();
+              if (initExpr && !initIsNil) initExpr = dynCoerce(initExpr, init, ctx);
+              else initExpr = undefined;
+            }
+            declaredDyn = true;
+          } else if (!fromShape) {
+            if (!initExpr || initIsNil) typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+          } else {
             ctx.tsShapeTypedLocal.add(v.name);
             ctx.tsPass6ShapeLocal.add(v.name);
             typeNode = fromShape;
@@ -1269,8 +1339,6 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
               );
             }
             // No init → `let X!: <shape>`; user's Luau assigns X in a branch TS can't prove.
-          } else if (!initExpr || initIsNil) {
-            typeNode = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
           }
         }
       }
@@ -1319,7 +1387,8 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
         ctx.compatMode === 'rbxts'
         && !initExpr
         && typeNode !== undefined
-        && typeNode.kind !== ts.SyntaxKind.UnknownKeyword;
+        && typeNode.kind !== ts.SyntaxKind.UnknownKeyword
+        && !(v.annotation && annotationIsNilable(v.annotation));
       newDecls.push(
         factory.createVariableDeclaration(
           factory.createIdentifier(jsName),
@@ -1332,10 +1401,22 @@ function compileLocal(stat: LocalStat, ctx: CompileContext): ts.Statement[] {
       );
       ctx.defineLocal(v.name, typeFromAnnotation(v.annotation, init, ctx));
       ctx.noteDeclaredType(v.name, v.annotation);
+      const emittedDyn = !!typeNode && ts.isTypeReferenceNode(typeNode)
+        && ts.isIdentifier(typeNode.typeName) && typeNode.typeName.text === DYN_VALUE_TYPE;
+      if (declaredDyn && (emittedDyn || !typeNode)) ctx.noteDeclaredTypeKind(v.name, 'dyn');
+      // `const n = q.count * 2`: TS infers `number` for the binding from
+      // the init regardless of const-ness; record it so later uses and
+      // writes of `n` see a primitive.
+      if (!v.annotation && !declaredDyn && init && !typeNode && ctx.compatMode === 'rbxts') {
+        const seen = tsVisibleType(init, ctx);
+        if (seen === 'number' || seen === 'string' || seen === 'boolean' || seen === 'dyn' || isDatatypeStatic(seen)) {
+          ctx.noteDeclaredTypeKind(v.name, seen);
+        }
+      }
       // `local c = zeroControls()` / `local mut = s.mut`: TS infers the
       // init's declared type for the binding, so track it as if it had
       // been written on the local.
-      if (!v.annotation && init && ctx.compatMode === 'rbxts') {
+      if (!v.annotation && !declaredDyn && init && ctx.compatMode === 'rbxts') {
         const inherited = declaredAnnotationOfExpr(init, ctx);
         if (inherited) bindDeclaredAnnotation(v.name, inherited, ctx);
       }
@@ -1709,7 +1790,12 @@ function compileFunctionStat(stat: FunctionStat, ctx: CompileContext): ts.Statem
       undefined,
       factory.createIdentifier(safeIdentifier(stat.name.name)),
       undefined,
-      paramsFromLocals(stat.func.args, ctx, declShapes, undefined, stat.name.name),
+      // Reuse the parameters the expression compile produced: the body
+      // was compiled against them (rebound `_LuauValue` params included),
+      // and a second inference here could disagree.
+      ts.isFunctionExpression(fn) || ts.isArrowFunction(fn)
+        ? fn.parameters
+        : paramsFromLocals(stat.func.args, ctx, declShapes, undefined, stat.name.name),
       stat.func.returnAnnotation ? compileTypePack(stat.func.returnAnnotation) : undefined,
       fn.body,
     );
@@ -2277,7 +2363,11 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
           return;
         }
         ctx.defineLocal(v.name, isIpairsIndex ? 'number' : 'unknown');
-        ctx.noteDeclaredTypeKind(v.name, isIpairsIndex ? 'number' : undefined);
+        // Untyped slots destructure as `_LuauValue` (see tupleSlot /
+        // elementType below) unless Pass 5 synthesized a class or shape.
+        const pass5 = loopVarTypeMap?.get(v.name);
+        const dynSlot = !isIpairsIndex && !pass5 && !(canUseClassElement && isValueSlot);
+        ctx.noteDeclaredTypeKind(v.name, isIpairsIndex ? 'number' : dynSlot ? 'dyn' : undefined);
       });
       // When the iterable's element resolves to a class, the value-binding
       // (second var for two-binding `for k, v in ipairs(arr)`, first var
@@ -2322,7 +2412,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
       ctx.useLuauChildType();
       elementType = factory.createTypeReferenceNode('_LuauChild', undefined);
     } else {
-      elementType = factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
+      elementType = dynTypeNode();
     }
     const castedIterable = declaredElement
       ? iterableExpr
@@ -2368,14 +2458,15 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
         userWantsPairs
           // pairs() expects an object — cast through `any` to
           // tolerate the Luau record-as-array idiom (`{[1]=…, ["k"]=…}`).
-          ? factory.createAsExpression(
-              iterableSource
-                ? compileExpr(iterableSource, ctx)
-                : (stat.values.length === 1
-                    ? compileExpr(stat.values[0]!, ctx)
-                    : factory.createArrayLiteralExpression(stat.values.map((v) => compileExpr(v, ctx)))),
-              factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
-            )
+          ? (() => {
+              const src = iterableSource ?? (stat.values.length === 1 ? stat.values[0]! : null);
+              const compiledSrc = src
+                ? compileExpr(src, ctx)
+                : factory.createArrayLiteralExpression(stat.values.map((v) => compileExpr(v, ctx)));
+              // `pairs()` wants an object; a `_LuauValue` source already
+              // is one, anything else bridges through `_LuauValue`.
+              return src && isDynExpr(src, ctx) ? compiledSrc : assertExpression(compiledSrc, dynTypeNode());
+            })()
           : castedIterable,
       ],
     );
@@ -2392,7 +2483,7 @@ function compileForIn(stat: ForInStat, ctx: CompileContext): ts.Statement[] {
       if (i === 0 && !userWantsPairs) {
         return factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword);
       }
-      return factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+      return dynTypeNode();
     };
     // Keep the iterable typed as tuple entries. A bare `any` iterable
     // makes roblox-ts assert when lowering the binding pattern. On the
@@ -2876,6 +2967,40 @@ function buildAssignmentStatement(
 ): ts.Statement {
   const valueSeenAs = (): StaticValueType =>
     valueSource ? tsVisibleType(valueSource, ctx) : 'unknown';
+  // `_LuauValue` slots — a dyn local, or a member / index of one — take
+  // the value directly once it is bridged to `_LuauValue`.
+  if (ctx.compatMode === 'rbxts') {
+    const dynTarget =
+      (target.type === 'Local' && ctx.tsDynLocal.has(target.name))
+      || ((target.type === 'IndexName' || target.type === 'IndexExpr') && isDynExpr(target.expr, ctx))
+      || (target.type === 'IndexName' && shapeLeafIsDyn(target, ctx));
+    if (dynTarget) {
+      const rhs = dynCoerce(valueExpr, valueSource, ctx);
+      if (target.type === 'IndexExpr') {
+        const keyLuau = target.index;
+        const compiledKey = compileExpr(keyLuau, ctx);
+        const keySeen = tsVisibleType(keyLuau, ctx);
+        const key = keySeen === 'string' || keySeen === 'number' || keySeen === 'dyn'
+          || keyLuau.type === 'ConstantString' || keyLuau.type === 'ConstantNumber' || keyLuau.type === 'ConstantInteger'
+          ? compiledKey
+          : assertExpression(compiledKey, factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword));
+        return factory.createExpressionStatement(
+          factory.createAssignment(factory.createElementAccessExpression(compileExpr(target.expr, ctx), key), rhs),
+        );
+      }
+      if (target.type === 'IndexName') {
+        return factory.createExpressionStatement(
+          factory.createAssignment(
+            factory.createPropertyAccessExpression(compileExpr(target.expr, ctx), factory.createIdentifier(propertyName(target.index))),
+            rhs,
+          ),
+        );
+      }
+      return factory.createExpressionStatement(
+        factory.createAssignment(factory.createIdentifier(ctx.getLocalJsName(target.name) ?? safeIdentifier(target.name)), rhs),
+      );
+    }
+  }
   if (target.type === 'IndexExpr') {
     const indexExpr = target.index;
     // Literal numeric: `t[1] = v` → `t[0] = v`.
@@ -3929,6 +4054,7 @@ function compileFunctionShape(
   const prevTsLuauChild = new Set(ctx.tsLuauChildLocal);
   const prevTsShapeTyped = new Set(ctx.tsShapeTypedLocal);
   const prevPass6Shape = new Set(ctx.tsPass6ShapeLocal);
+  const prevDyn = new Set(ctx.tsDynLocal);
   // Pass 3: register backprop-typed params in `tsTypedClassLocal` so
   // downstream macros / receiver gates (Instance.new parent skip etc.)
   // see them as Instance/etc.
@@ -3949,6 +4075,9 @@ function compileFunctionShape(
   for (const p of paramsFromLocals(realArgs, ctx, paramShapes, paramPrimitives, options.enclosingName)) {
     params.push(p);
   }
+  const dynParams = new Set(lastDynParams);
+  // A number constraint on a rebound param is no longer what TS sees.
+  for (const n of dynParams) ctx.preInferredParamType.delete(n);
   if (fn.vararg) {
     params.push(
       factory.createParameterDeclaration(
@@ -3996,6 +4125,9 @@ function compileFunctionShape(
           && declaredPack.typeList.types.length === tupleArity
           ? declaredPack.typeList.types
           : null;
+      // Undeclared components stay `unknown`: a literal `return "a", 1`
+      // must satisfy them, and `_LuauValue` would reject it. The
+      // destructuring side bridges to `_LuauValue` once.
       const componentTypes = Array.from({ length: tupleArity }, (_, i) =>
         declaredTypes ? compileType(declaredTypes[i]) : factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword),
       );
@@ -4024,18 +4156,23 @@ function compileFunctionShape(
         // preserve, so member reads must keep the Record bridge.
         const annotatedUnknown =
           !!arg.annotation && compileType(arg.annotation).kind === ts.SyntaxKind.UnknownKeyword;
-        if (shape && !shape.empty && !annotatedUnknown) {
+        if (shape && !shape.empty && !annotatedUnknown && !dynParams.has(arg.name)) {
           ctx.tsShapeTypedLocal.add(arg.name);
           if (!arg.annotation && !ctx.preInferredParamType.has(arg.name)) ctx.tsPass6ShapeLocal.add(arg.name);
           else ctx.tsPass6ShapeLocal.delete(arg.name);
         } else {
+          ctx.tsShapeTypedLocal.delete(arg.name);
           ctx.tsPass6ShapeLocal.delete(arg.name);
         }
       }
+      for (const n of dynParams) ctx.noteDeclaredTypeKind(n, 'dyn');
     }
     if (fn.vararg) ctx.defineLocal('__varargs', 'unknown');
     if (hasSelf) ctx.defineLocal('self', 'unknown');
-    const bodyStatements = compileBlockBody(fn.body, ctx);
+    const bodyStatements = [
+      ...dynParamPrologue(realArgs.filter((a) => dynParams.has(a.name)).map((a) => a.name)),
+      ...compileBlockBody(fn.body, ctx),
+    ];
     if (hasSelf && statementsReferenceSelf(bodyStatements)) {
       bodyStatements.unshift(
         factory.createVariableStatement(
@@ -4098,12 +4235,65 @@ function compileFunctionShape(
   for (const name of Array.from(ctx.tsPass6ShapeLocal)) {
     if (!prevPass6Shape.has(name)) ctx.tsPass6ShapeLocal.delete(name);
   }
+  for (const name of Array.from(ctx.tsDynLocal)) {
+    if (!prevDyn.has(name)) ctx.tsDynLocal.delete(name);
+  }
   return {
     params,
     typeParams: buildTypeParams(fn.generics, fn.genericPacks),
     returnType: finalReturnType,
     body: block,
   };
+}
+
+/** Luau names of the params the most recent paramsFromLocals call
+ *  rebound as `_LuauValue` (declared `<name>_?: unknown`, rebound in the
+ *  body prologue). Read by the function compiler right after the call. */
+let lastDynParams: string[] = [];
+
+/** True when an unannotated param carries no type TS could use: no
+ *  backprop class, no string/boolean usage constraint, no shape that
+ *  pins a Roblox class. A number constraint is deliberately not enough
+ *  — `p - q` is just as likely vector math, and `_LuauValue` covers
+ *  both. Such a param is declared `unknown` (so any argument fits) and
+ *  rebound as `_LuauValue` at the top of the body. */
+function paramIsDyn(
+  local: { name: string; annotation: TypeNode | null },
+  shapes: Map<string, import('./shape-infer.js').Shape> | undefined,
+  primitives: Map<string, 'number' | 'string' | 'boolean'> | undefined,
+  backprop: Map<string, string> | undefined,
+  ctx: CompileContext,
+): boolean {
+  if (ctx.compatMode !== 'rbxts') return false;
+  // `p: any` compiles to `unknown` — no more information than no
+  // annotation at all, so it takes the same rebinding.
+  if (local.annotation && compileType(local.annotation).kind !== ts.SyntaxKind.UnknownKeyword) return false;
+  if (backprop?.get(local.name)) return false;
+  const prim = primitives?.get(local.name);
+  if (prim === 'string' || prim === 'boolean') return false;
+  const shape = shapes?.get(local.name);
+  if (shape && !shape.empty && intersectionTypeName(shape)) return false;
+  return true;
+}
+
+/** `let p = p_ as unknown as _LuauValue;` for each rebound param. */
+function dynParamPrologue(names: readonly string[]): ts.Statement[] {
+  return names.map((name) => {
+    const js = safeIdentifier(name);
+    return factory.createVariableStatement(
+      undefined,
+      factory.createVariableDeclarationList(
+        [factory.createVariableDeclaration(
+          factory.createIdentifier(js),
+          undefined,
+          undefined,
+          // `unknown` converts to any type with a single `as`.
+          factory.createAsExpression(factory.createIdentifier(`${js}_`), dynTypeNode()),
+        )],
+        ts.NodeFlags.Let,
+      ),
+    );
+  });
 }
 
 function paramsFromLocals(
@@ -4138,10 +4328,17 @@ function paramsFromLocals(
   // Shape-typed AND primitive-inferred params are required (body access
   // fails if undefined). TS forbids required-after-optional, so pull the
   // cutoff past them.
+  const backpropForDyn = enclosingFunctionName
+    ? ctx.paramBackpropTypes.get(enclosingFunctionName)
+    : undefined;
+  const dynNames = new Set(
+    locals.filter((l) => paramIsDyn(l, shapes, primitives, backpropForDyn, ctx)).map((l) => l.name),
+  );
+  lastDynParams = [...dynNames];
   {
     let lastRequired = -1;
     locals.forEach((local, i) => {
-      if (local.annotation) return;
+      if (local.annotation || dynNames.has(local.name)) return;
       const sh = shapes?.get(local.name);
       const hasPrim = primitives?.has(local.name) ?? false;
       if (hasPrim || (sh && !sh.empty)) lastRequired = i;
@@ -4163,7 +4360,12 @@ function paramsFromLocals(
     let ty: ts.TypeNode | undefined;
     // Shape-typed params drop the `?` marker — callers must supply.
     let hasInferredShape = false;
-    if (local.annotation) {
+    if (dynNames.has(local.name)) {
+      // Declared `<name>_?: unknown` so every caller's argument fits;
+      // the body prologue rebinds `<name>` as `_LuauValue`.
+      name = `${name}_`;
+      ty = factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword);
+    } else if (local.annotation) {
       ty = compileType(local.annotation);
     } else if (ctx.compatMode === 'rbxts') {
       // Pass 3 (call-site backprop): if every call site passes a
@@ -4472,6 +4674,7 @@ function extractEnumRoot(expr: Expr): string | undefined {
 }
 
 function tsVisibleType(expr: Expr, ctx: CompileContext): StaticValueType {
+  if (isDynExpr(expr, ctx)) return 'dyn';
   switch (expr.type) {
     case 'ConstantInteger':
     case 'ConstantNumber':
@@ -4544,11 +4747,14 @@ function tsSeesNumber(expr: Expr, ctx: CompileContext): boolean {
     case 'ConstantNumber':
     case 'ConstantInteger':
       return true;
-    default:
+    default: {
       // The static view alone can name a datatype receiver TS only
       // sees as a synthesized shape (`{ X: unknown }`); a member read
       // counts as number only when the receiver is trusted too.
-      return tsVisibleType(expr, ctx) === 'number';
+      // `_LuauValue` intersects number, so arithmetic accepts it.
+      const seen = tsVisibleType(expr, ctx);
+      return seen === 'number' || seen === 'dyn';
+    }
   }
 }
 
@@ -5068,9 +5274,14 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       }
       // rbxts: `obj[k].X` — receiver is unknown from Record cast, so
       // direct `.X` trips TS2571. Recast through Record so `.X` resolves.
+      // A `_LuauValue` element (`dyn.list[k]`) or an annotated array
+      // element already carries a type.
       if (
         ctx.compatMode === 'rbxts'
         && expr.expr.type === 'IndexExpr'
+        && !isDynExpr(expr.expr, ctx)
+        && !declaredAnnotationOfExpr(expr.expr, ctx)
+        && !(expr.expr.expr.type === 'Local' && ctx.tsArrayTypedLocal.has(expr.expr.expr.name))
       ) {
         return factory.createPropertyAccessExpression(
           factory.createParenthesizedExpression(
@@ -5121,6 +5332,15 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
         accessReceiver,
         factory.createIdentifier(propertyName(expr.index)),
       );
+      // `_LuauValue` receivers index to `_LuauValue`; only a read the
+      // static view narrows to a datatype still takes the cast below.
+      if (
+        ctx.compatMode === 'rbxts'
+        && isDynExpr(expr.expr, ctx)
+        && !isDatatypeStatic(staticTypeOfExpr(expr, ctx))
+      ) {
+        return access;
+      }
       // rbxts mode: `.Parent` access on Instance returns `Instance |
       // undefined` per @rbxts/types. Real Roblox scripts treat parent
       // chains as non-null (runtime errors if a chain link is missing)
@@ -5337,9 +5557,12 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           : factory.createNumericLiteral(n);
         // rbxts: chained receiver (`obj[k][i]`) is `unknown`; recast
         // through `Record<string|number, unknown>` to avoid TS2571.
+        // A `_LuauValue` receiver indexes to `_LuauValue` as-is.
         if (
           ctx.compatMode === 'rbxts'
           && (expr.expr.type === 'IndexExpr' || expr.expr.type === 'IndexName')
+          && !isDynExpr(expr.expr, ctx)
+          && !declaredAnnotationOfExpr(expr.expr, ctx)
         ) {
           target = factory.createParenthesizedExpression(
             assertExpression(
@@ -5362,6 +5585,15 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
       // Runtime key: rbxts uses native bracket (roblox-ts preserves indices);
       // native mode uses luaIndex helper for 1-indexed handling.
       if (ctx.compatMode === 'rbxts') {
+        // `_LuauValue` target: its string index signature takes string
+        // and number keys; only a key TS can't type needs the bridge.
+        if (isDynExpr(expr.expr, ctx)) {
+          const keySeen = tsVisibleType(indexExpr, ctx);
+          const key = keySeen === 'string' || keySeen === 'number' || keySeen === 'dyn'
+            ? index
+            : assertExpression(index, factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword));
+          return factory.createElementAccessExpression(target, key);
+        }
         // Array-typed local (`t: T[]`) with a number index: roblox-ts
         // rebases array element access by +1, so emit the 0-based form.
         if (expr.expr.type === 'Local' && ctx.tsArrayTypedLocal.has(expr.expr.name) && tsSeesNumber(indexExpr, ctx)) {
@@ -5461,6 +5693,7 @@ function compileExpr(expr: Expr, ctx: CompileContext): ts.Expression {
           exprEmitsLuauChild(expr.expr, ctx)
           || expr.expr.type === 'Call'
           || expr.expr.type === 'IndexName'
+          || tsVisibleType(expr.expr, ctx) !== 'unknown'
         )
       ) {
         return assertExpression(inner, targetTy);
@@ -5523,6 +5756,14 @@ function compileUnary(expr: Extract<Expr, { type: 'Unary' }>, ctx: CompileContex
     case '#': {
       const innerType = staticTypeOfExpr(expr.expr, ctx);
       if (innerType === 'string') {
+        // @rbxts/types strings expose `.size()`, not `.length`.
+        if (ctx.compatMode === 'rbxts') {
+          return factory.createCallExpression(
+            factory.createPropertyAccessExpression(inner, factory.createIdentifier('size')),
+            undefined,
+            [],
+          );
+        }
         return factory.createPropertyAccessExpression(inner, 'length');
       }
       // rbxts: `(expr as Array<defined>).size()` — roblox-ts's Array.size()
@@ -5689,7 +5930,16 @@ function compileBinaryExpr(expr: Extract<Expr, { type: 'Binary' }>, ctx: Compile
         '^': ts.SyntaxKind.AsteriskAsteriskToken,
       };
       const op = directNumeric[expr.op];
-      if (op !== undefined) return factory.createBinaryExpression(left, op, right);
+      if (op !== undefined) {
+        const direct = factory.createBinaryExpression(left, op, right);
+        // A `_LuauValue` operand keeps the value type (see compileBinary).
+        if (ctx.compatMode === 'rbxts' && (isDynExpr(expr.left, ctx) || isDynExpr(expr.right, ctx))) {
+          return factory.createParenthesizedExpression(
+            factory.createAsExpression(factory.createParenthesizedExpression(direct), dynTypeNode()),
+          );
+        }
+        return direct;
+      }
       if (expr.op === '//') {
         return factory.createCallExpression(
           factory.createPropertyAccessExpression(factory.createIdentifier('Math'), 'floor'),
@@ -5924,6 +6174,7 @@ function compileBinary(
           if (src.type === 'Group' || src.type === 'TypeAssertion') return receiverTsTyped(src.expr);
           if (src.type !== 'IndexName') return true;
           if (isTrustedTypedExpr(src, ctx)) return true;
+          if (isDynExpr(src.expr, ctx)) return true;
           if (chainRootedInSynthesizedDynamic(src, ctx)) return true;
           if (src.expr.type === 'Local') {
             const n = src.expr.name;
@@ -5949,7 +6200,18 @@ function compileBinary(
             ),
           );
         };
-        return factory.createBinaryExpression(wrap(left, leftExpr), direct, wrap(right, rightExpr));
+        const arith = factory.createBinaryExpression(wrap(left, leftExpr), direct, wrap(right, rightExpr));
+        // `a - b` on `_LuauValue` operands may be a vector at runtime;
+        // TS types the operator result `number`, so restore the value
+        // type (a single `as`: number is a constituent of it).
+        if ((leftExpr && isDynExpr(leftExpr, ctx)) || (rightExpr && isDynExpr(rightExpr, ctx))) {
+          // Parenthesized: a bare `x as _LuauValue < y` parses as a type
+          // argument list.
+          return factory.createParenthesizedExpression(
+            factory.createAsExpression(factory.createParenthesizedExpression(arith), dynTypeNode()),
+          );
+        }
+        return arith;
       }
       // `===`/`!==` widen operands `as unknown` to avoid TS2367 when shape
       // inference narrowed one side away from a primitive literal. TS
@@ -6271,8 +6533,20 @@ function scanYieldingFunctions(root: BlockStat, ctx: CompileContext): void {
 /** Collect `local function f(): T` / `function f(): T` return annotations
  *  (single-type packs only) so call sites see the declared type. */
 function scanUserFunctionReturnTypes(root: BlockStat, ctx: CompileContext): void {
-  const note = (name: string, fn: { returnAnnotation: TypePack | null; args?: { annotation: TypeNode | null }[] }): void => {
+  const note = (name: string, fn: { returnAnnotation: TypePack | null; args?: { name: string; annotation: TypeNode | null }[]; body?: BlockStat }): void => {
     if (fn.args) ctx.userFunctionParamAnnotations.set(name, fn.args.map((a) => a.annotation));
+    if (fn.args && fn.body && ctx.compatMode === 'rbxts') {
+      // Which positions the emitted signature declares `unknown` (rebound
+      // as `_LuauValue` inside): any argument fits those, so call sites
+      // skip the `Parameters<typeof f>[i]` wrap. Mirrors `paramIsDyn`
+      // without call-site backprop, whose class-typed params only ever
+      // receive class-typed arguments anyway.
+      const argNames = new Set(fn.args.map((a) => a.name));
+      for (const n of collectLocalNames(fn.body)) argNames.add(n);
+      const shapes = collectShapes(fn.body, argNames);
+      const prims = inferParamPrimitives({ args: fn.args, body: fn.body } as unknown as Parameters<typeof inferParamPrimitives>[0]);
+      ctx.userFunctionDynParams.set(name, fn.args.map((a) => paramIsDyn(a, shapes, prims, undefined, ctx)));
+    }
     const pack = fn.returnAnnotation;
     if (!pack || pack.type !== 'TypePackExplicit') return;
     if (pack.typeList.types.length !== 1 || pack.typeList.tailType) return;
@@ -6288,7 +6562,7 @@ function scanUserFunctionReturnTypes(root: BlockStat, ctx: CompileContext): void
       const s = n as unknown as LocalFunctionStat;
       note(s.name.name, s.func);
     } else if (n.type === 'Function' && 'func' in n && 'name' in n) {
-      const s = n as unknown as { name: Expr; func: { returnAnnotation: TypePack | null; args: { annotation: TypeNode | null }[] } };
+      const s = n as unknown as { name: Expr; func: { returnAnnotation: TypePack | null; args: { name: string; annotation: TypeNode | null }[]; body: BlockStat } };
       if (s.name && (s.name.type === 'Global' || s.name.type === 'Local')) {
         note((s.name as { name: string }).name, s.func);
       }
@@ -6375,7 +6649,9 @@ function argIsTsTyped(arg: Expr, ctx: CompileContext): boolean {
   const ann = declaredAnnotationOfExpr(arg, ctx);
   if (ann && compileType(ann).kind !== ts.SyntaxKind.UnknownKeyword) return true;
   const seen = tsVisibleType(arg, ctx);
-  return seen !== 'unknown' && seen !== 'nil';
+  // `_LuauValue` fits number-ish slots (handled by the expected-slot
+  // path) but not string / Instance / datatype ones — keep the wrap.
+  return seen !== 'unknown' && seen !== 'nil' && seen !== 'dyn';
 }
 
 /** Primitive a synthesized shape declares for a member chain rooted in
@@ -6395,6 +6671,10 @@ function shapeLeafType(expr: Extract<Expr, { type: 'IndexName' }>, ctx: CompileC
     if (!ctx.tsPass6ShapeLocal.has(cur.name)) return undefined;
     shape = ctx.getShape(cur.name) as S | undefined;
   }
+  if (shape && path.length > 0) {
+    const target = intersectionTypeName(shape);
+    if (target && intersectionTargetDeclaresName(target, path[0]!)) return undefined;
+  }
   for (const seg of path) {
     if (!shape || shape.methods.has(seg)) return undefined;
     shape = shape.props.get(seg);
@@ -6402,6 +6682,35 @@ function shapeLeafType(expr: Extract<Expr, { type: 'IndexName' }>, ctx: CompileC
   if (!shape) return undefined;
   const prim = leafPrimitive(shape);
   return prim ?? undefined;
+}
+
+/** True when a member chain rooted in a Pass-6 shape-typed local (or
+ *  `self` inside a class body) lands on a leaf the synthesized
+ *  annotation declares as `_LuauValue`. */
+function shapeLeafIsDyn(expr: Extract<Expr, { type: 'IndexName' }>, ctx: CompileContext): boolean {
+  const path: string[] = [expr.index];
+  let cur: Expr = expr.expr;
+  while (cur.type === 'IndexName') { path.unshift(cur.index); cur = cur.expr; }
+  if (cur.type !== 'Local') return false;
+  type S = import('./shape-infer.js').Shape;
+  let shape: S | undefined;
+  if (cur.name === 'self' && ctx.selfFieldShapes) {
+    const first = path.shift()!;
+    shape = ctx.selfFieldShapes.get(first) as S | undefined;
+  } else {
+    if (!ctx.tsPass6ShapeLocal.has(cur.name)) return false;
+    shape = ctx.getShape(cur.name) as S | undefined;
+  }
+  // `{ … } & Instance` shapes hand the class's own members to the class.
+  if (shape && path.length > 0) {
+    const target = intersectionTypeName(shape);
+    if (target && intersectionTargetDeclaresName(target, path[0]!)) return false;
+  }
+  for (const seg of path) {
+    if (!shape || shape.methods.has(seg)) return false;
+    shape = shape.props.get(seg);
+  }
+  return !!shape && shape.empty && !leafPrimitive(shape);
 }
 
 /** True when the argument's declared annotation prints to the same TS
@@ -6723,6 +7032,7 @@ function castArgsForCall(
         // type stays `unknown`/`string` — the cast must still apply.
         const tsT = tsVisibleType(luau, ctx);
         if (tsT === expected) return arg;
+        if (tsT === 'dyn' && (expected === 'number' || expected === 'number|string')) return arg;
         if (expected === 'vector' && tsT === `datatype:${VECTOR_LIB_TYPE}`) return arg;
         if (expected === 'number|string' && (tsT === 'number' || tsT === 'string')) return arg;
         // Instance-slot acceptance for class-typed expressions. TS will
@@ -6777,6 +7087,8 @@ function castArgsForCall(
         return arg;
       }
     }
+    // A user function's `<name>_?: unknown` slot takes any argument.
+    if (ts.isIdentifier(callee) && ctx.userFunctionDynParams.get(callee.text)?.[i]) return arg;
     // An argument TS already types — an annotated binding, a member
     // read through a declared table, a datatype/primitive expression,
     // or a function literal — is checked against the real parameter.
@@ -7067,6 +7379,14 @@ function isTrustedTypedExpr(expr: Expr, ctx: CompileContext): boolean {
   if (expr.type === 'IndexName') {
     if (declaredAnnotationOfExpr(expr, ctx)) return staticTypeOfExpr(expr, ctx) !== 'unknown';
     if (shapeLeafType(expr, ctx)) return true;
+    // Oracle property of a receiver TS types as that class (`item.Name`
+    // on `item: Instance`): declared by @rbxts/types.
+    if (expr.expr.type === 'Local') {
+      const cls = ctx.tsTypedClassLocal.get(expr.expr.name);
+      if (cls && !ctx.tsLuauChildLocal.has(expr.expr.name) && oracleHasMember(ctx, cls, expr.index)) {
+        return staticTypeOfExpr(expr, ctx) !== 'unknown';
+      }
+    }
     if (expr.expr.type === 'Local' && moduleMemberStaticType(expr.expr.name, expr.index, ctx)) return true;
   }
   if (expr.type === 'IndexName') {
@@ -7503,7 +7823,8 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     // NOT have the next-level property (e.g. `hum.Died` where `hum` is
     // Instance | undefined and `Died` is a Humanoid signal), route the
     // cast to the chain root so the missing property is absorbed.
-    const innerRecv = needsReceiverCast
+    const receiverIsDyn = isDynExpr(recv, ctx);
+    const innerRecv = needsReceiverCast && !receiverIsDyn
       ? (signalChainNeedsRootCast(expr.func.expr, ctx)
           ? buildRecordCastReceiver(expr.func.expr, ctx)
           : factory.createParenthesizedExpression(
@@ -7526,10 +7847,12 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
       innerRecv,
       factory.createIdentifier(propertyName(emittedMethodName)),
     );
-    if (needsReceiverCast) {
+    if (needsReceiverCast || receiverIsDyn) {
       // Cast the unknown-typed method slot through a callable so the
-      // call site doesn't re-trip TS2571.
-      calleeAccess = unknownCallableCastExpression(calleeAccess);
+      // call site doesn't re-trip TS2571. A `_LuauValue` member is
+      // readable but not callable, so it takes the same bridge.
+      calleeAccess = unknownCallableCastExpression(calleeAccess, true);
+      ctx.dynResultCalls.add(expr);
       methodCallReceiverWasRecordRouted = true;
     }
     call = factory.createCallExpression(
@@ -7586,7 +7909,10 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
     } else {
       let calleeExpr = compileExpr(expr.func, ctx);
       const calleeRoot = expr.func.type === 'IndexName' ? rootGlobalName(expr.func.expr) : null;
-      if (
+      if (ctx.compatMode === 'rbxts' && isDynExpr(expr.func, ctx)) {
+        calleeExpr = unknownCallableCastExpression(calleeExpr);
+        ctx.dynResultCalls.add(expr);
+      } else if (
         ctx.compatMode === 'rbxts'
         && expr.func.type === 'IndexName'
         && !isRequireBoundKnownMethod(expr.func.expr, expr.func.index, ctx)
@@ -7611,6 +7937,7 @@ function compileCall(expr: Extract<Expr, { type: 'Call' }>, ctx: CompileContext)
         && calleeRoot !== 'Enum'
       ) {
         calleeExpr = unknownCallableCastExpression(calleeExpr);
+        ctx.dynResultCalls.add(expr);
       }
       call = factory.createCallExpression(calleeExpr, undefined, castArgsForCall(calleeExpr, args, ctx, expr.args, expr.func));
     }
@@ -7882,6 +8209,7 @@ function shouldRouteDynamicChildRead(
   // Declared table shape: the annotation names the field, so the read
   // resolves against it directly.
   if (declaredAnnotationOfExpr(expr, ctx)) return false;
+  if (isDynExpr(expr.expr, ctx)) return false;
   // Component of a trusted datatype receiver (`v.x` on vector,
   // `cf.Position` on CFrame): @rbxts/types declares it.
   {
@@ -8930,6 +9258,7 @@ export async function compile(
   }
   if (implicitGlobals.size > 0) ctx.useAmbient('_G');
   for (const name of implicitGlobals) {
+    if (ctx.compatMode === 'rbxts') ctx.tsDynLocal.add(name);
     // Init predecl from `_G[name]` so cross-script globals are visible at
     // script start. rbxts: `_G` is an empty interface in @rbxts/types, so
     // route through Record<string, unknown> for the bracket access. The
@@ -8951,9 +9280,9 @@ export async function compile(
             factory.createIdentifier(safeIdentifier(name)),
             undefined,
             ctx.compatMode === 'rbxts'
-              ? factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)
+              ? dynTypeNode()
               : undefined,
-            gRead,
+            ctx.compatMode === 'rbxts' ? factory.createAsExpression(gRead, dynTypeNode()) : gRead,
           )],
           ts.NodeFlags.Let,
         ),
@@ -9050,6 +9379,72 @@ export async function compile(
     .filter((s) => !ts.isEmptyStatement(s)));
   allStatements.push(...loopVarDecls);
   allStatements.push(...stmts);
+  if (ctx.compatMode === 'rbxts' && statementsReference(allStatements, [DYN_VALUE_TYPE, DYN_FN_TYPE, DYN_METHOD_TYPE])) {
+    const dynDecls: ts.Statement[] = [
+      factory.createTypeAliasDeclaration(
+        undefined,
+        factory.createIdentifier(DYN_VALUE_TYPE),
+        undefined,
+        factory.createIntersectionTypeNode([
+          factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+          factory.createTypeLiteralNode([
+            factory.createIndexSignature(
+              undefined,
+              [factory.createParameterDeclaration(
+                undefined,
+                undefined,
+                factory.createIdentifier('k'),
+                undefined,
+                factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword),
+              )],
+              dynTypeNode(),
+            ),
+          ]),
+        ]),
+      ),
+      factory.createTypeAliasDeclaration(
+        undefined,
+        factory.createIdentifier(DYN_FN_TYPE),
+        undefined,
+        factory.createFunctionTypeNode(
+          undefined,
+          [factory.createParameterDeclaration(
+            undefined,
+            factory.createToken(ts.SyntaxKind.DotDotDotToken),
+            'args',
+            undefined,
+            factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+          )],
+          dynTypeNode(),
+        ),
+      ),
+      factory.createTypeAliasDeclaration(
+        undefined,
+        factory.createIdentifier(DYN_METHOD_TYPE),
+        undefined,
+        factory.createFunctionTypeNode(
+          undefined,
+          [
+            // `this: unknown`: any receiver TS knows (or doesn't) qualifies;
+            // the parameter's presence alone is what roblox-ts keys `:` on.
+            factory.createParameterDeclaration(undefined, undefined, 'this', undefined, factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+            factory.createParameterDeclaration(
+              undefined,
+              factory.createToken(ts.SyntaxKind.DotDotDotToken),
+              'args',
+              undefined,
+              factory.createArrayTypeNode(factory.createKeywordTypeNode(ts.SyntaxKind.UnknownKeyword)),
+            ),
+          ],
+          dynTypeNode(),
+        ),
+      ),
+    ];
+    // After imports, before everything else.
+    let at = 0;
+    while (at < allStatements.length && ts.isImportDeclaration(allStatements[at]!)) at += 1;
+    allStatements.splice(at, 0, ...dynDecls);
+  }
 
   // Force module shape so top-level `await` is legal. Append `export {};`
   // only when the file actually requires module semantics — top-level
@@ -9750,6 +10145,22 @@ function runPostEmitCheck(
     });
   }
   return out;
+}
+
+/** True when any statement references one of `names` as a type. */
+function statementsReference(stmts: readonly ts.Statement[], names: readonly string[]): boolean {
+  const wanted = new Set(names);
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName) && wanted.has(node.typeName.text)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  for (const s of stmts) { visit(s); if (found) break; }
+  return found;
 }
 
 function buildRuntimeImport(names: string[]): ts.Statement {

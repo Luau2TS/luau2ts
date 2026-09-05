@@ -1040,10 +1040,13 @@ describe('compile — rbxts type fidelity', () => {
     expect(r.source).not.toMatch(/static\s+step/);
   });
 
-  it('a numeric for over unknown bounds bridges the bounds', async () => {
+  it('a numeric for over an untyped param needs no bound bridge', async () => {
+    // `cfg` is rebound as `_LuauValue`, which intersects number, so
+    // `cfg.count` is a legal `<=` operand as-is.
     const r = await rbxts('local function f(cfg)\nfor i = 1, cfg.count do print(i) end\nend');
-    expect(r.source).toContain('as unknown as number');
-    expect(norm(r.source)).toContain('i <= ');
+    expect(r.source).toContain('let cfg = cfg_ as _LuauValue');
+    expect(norm(r.source)).toContain('i <= cfg.count');
+    expect(r.source).not.toContain('as unknown as number');
   });
 
   it('the ipairs index slot is a number', async () => {
@@ -1054,5 +1057,54 @@ describe('compile — rbxts type fidelity', () => {
   it('a declared return type bridges a value TS cannot prove', async () => {
     const r = await rbxts('local function f(x): number\nreturn x\nend');
     expect(r.source).toContain('as unknown as number');
+  });
+});
+
+describe('compile — rbxts `_LuauValue` for untyped values', () => {
+  const rbxts = (source: string) => compile(source, { compatMode: 'rbxts' });
+
+  it('rebinds an untyped param once and reads members directly', async () => {
+    const r = await rbxts('local function f(p)\nlocal n = p.child.count * 2\nreturn n\nend');
+    expect(r.source).toContain('f(p_?: unknown)');
+    expect(r.source).toContain('let p = p_ as _LuauValue');
+    expect(norm(r.source)).toContain('(p.child.count * 2) as _LuauValue');
+    expect(r.source).not.toContain('Record<string, unknown>');
+    expect(r.source).toContain('type _LuauValue = number & {');
+  });
+
+  it('keeps `:` for self-calls and `.` for dot-calls through the bridges', async () => {
+    // roblox-ts keys the `:` call form on the signature's `this`
+    // parameter, so a self-call casts to `_LuauMethod` and a dot-call
+    // to `_LuauFn`.
+    const r = await rbxts('local function f(q)\nq:fn(1)\nq.fn(2)\nend');
+    expect(r.source).toContain('(q.fn as unknown as _LuauMethod)(1)');
+    expect(r.source).toContain('(q.fn as unknown as _LuauFn)(2)');
+    expect(r.source).toContain('type _LuauMethod = (this: unknown, ...args: unknown[]) => _LuauValue');
+  });
+
+  it('coerces writes into `_LuauValue` slots: numbers with one cast, others via unknown', async () => {
+    const r = await rbxts('local function f(p)\np.a = 1\np.b = "s"\np.c = p.a\nend');
+    expect(r.source).toContain('p.a = 1 as _LuauValue');
+    expect(r.source).toContain('p.b = "s" as unknown as _LuauValue');
+    expect(norm(r.source)).toContain('p.c = p.a;');
+  });
+
+  it('an untyped local with no type information is declared `_LuauValue`', async () => {
+    const r = await rbxts('local function g()\nreturn nil\nend\nlocal x = g()\nlocal t = {}\nprint(x.y, t.z)');
+    expect(r.source).toContain('const x: _LuauValue = g() as unknown as _LuauValue');
+    expect(r.source).toContain('const t: _LuauValue = {} as _LuauValue');
+    expect(norm(r.source)).toContain('print(x.y, t.z)');
+  });
+
+  it('`:: any` and `: any` are treated as no type information', async () => {
+    const r = await rbxts('local function f(p: any)\nreturn p.x\nend');
+    expect(r.source).toContain('let p = p_ as _LuauValue');
+    expect(norm(r.source)).toContain('return p.x;');
+  });
+
+  it('`pairs` over an untyped value iterates it without `any`', async () => {
+    const r = await rbxts('local function f(t)\nfor k, v in pairs(t) do print(k, v) end\nend');
+    expect(r.source).not.toMatch(/\bany\b/);
+    expect(norm(r.source)).toContain('for (const [k, v] of pairs(t)');
   });
 });

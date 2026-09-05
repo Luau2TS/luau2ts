@@ -14,35 +14,10 @@ const { factory } = ts;
 function argIsTrustedNumber(expr: Expr, ctx: CompileContext): boolean {
   if (expr.type === 'ConstantNumber' || expr.type === 'ConstantInteger') return true;
   if (expr.type === 'Group') return argIsTrustedNumber(expr.expr, ctx);
-  if (expr.type !== 'Local' && ctx.staticTypeOf(expr) === 'number') return true;
-  if (expr.type === 'TypeAssertion') {
-    const ann = expr.annotation;
-    if (ann.type === 'TypeReference' && ann.name === 'number') return true;
-  }
-  if (expr.type === 'Call') {
-    const fn = expr.func;
-    if (fn.type === 'Global' && fn.name === 'tonumber') return true;
-    if (
-      fn.type === 'IndexName'
-      && fn.expr.type === 'Global'
-      && fn.expr.name === 'math'
-    ) return true;
-  }
-  if (expr.type === 'Local') {
-    // Function param whose primitive was inferred as number — those emit
-    // with a `: number` annotation, so TS sees them as number. Or an
-    // un-reassigned local that TS already knows as number.
-    return ctx.preInferredParamType.get(expr.name) === 'number'
-      || ctx.tsTypedPrimitiveLocal.has(expr.name);
-  }
-  // Arithmetic on trusted operands stays trusted-number.
-  if (expr.type === 'Binary' && ['+', '-', '*', '/', '%', '^', '//'].includes(expr.op)) {
-    return argIsTrustedNumber(expr.left, ctx) && argIsTrustedNumber(expr.right, ctx);
-  }
-  if (expr.type === 'Unary' && expr.op === '-') {
-    return argIsTrustedNumber(expr.expr, ctx);
-  }
-  return false;
+  // The compiler's own TS-visible view: a `number`, or a `_LuauValue`,
+  // which intersects number and so fits every numeric slot.
+  const seen = ctx.tsVisibleTypeOf(expr);
+  return seen === 'number' || seen === 'dyn';
 }
 
 // ─── table.* ───────────────────────────────────────────────────────────────

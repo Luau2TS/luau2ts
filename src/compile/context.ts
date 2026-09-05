@@ -39,7 +39,21 @@ export type StaticValueType =
   | 'string'
   | 'nil'
   | 'unknown'
+  | 'dyn'
   | `datatype:${string}`;
+
+/** Name of the emitted alias for a Luau value with no type information:
+ *  `type _LuauValue = number & { [k: string]: _LuauValue }`. Member
+ *  reads, indexing, arithmetic and comparisons all type-check on it
+ *  directly, and roblox-ts lowers each to the same Lua the Luau had —
+ *  so one cast at the binding replaces one per use. roblox-ts rejects
+ *  `any` outright, which is why this shape and not `any`. */
+export const DYN_VALUE_TYPE = '_LuauValue';
+export const DYN_FN_TYPE = '_LuauFn';
+/** `(this: _LuauValue, ...args) => _LuauValue` — the `this` parameter is
+ *  what makes roblox-ts lower the call with `:`, preserving Luau's
+ *  method-call receiver. */
+export const DYN_METHOD_TYPE = '_LuauMethod';
 
 /** Roblox datatypes with `__add`/`__sub`/`__mul`/`__div`/`__unm` metamethods
  *  the compiler can fast-path to instance methods. */
@@ -70,6 +84,7 @@ export interface BindingSnapshot {
   array: TypeNode | null | undefined;
   classLocal: string | undefined;
   shapeTyped: boolean;
+  dyn: boolean;
 }
 
 export class CompileContext {
@@ -256,6 +271,9 @@ export class CompileContext {
    *  so call results and matching arguments are exactly typed. */
   readonly userFunctionReturnAnnotation = new Map<string, TypeNode>();
   readonly userFunctionParamAnnotations = new Map<string, (TypeNode | null)[]>();
+  /** Per position: does the emitted signature declare `unknown` (a
+   *  `_LuauValue`-rebound param)? Any argument fits such a slot. */
+  readonly userFunctionDynParams = new Map<string, boolean[]>();
 
   /** Declared return packs of the functions currently being compiled,
    *  innermost last. `return X` consults the top so a value TS can't
@@ -266,6 +284,7 @@ export class CompileContext {
    *  binding. Every declaration site must call this so a later same-named
    *  binding without a usable annotation doesn't inherit stale trust. */
   noteDeclaredType(name: string, annotation: TypeNode | null | undefined): void {
+    this.tsDynLocal.delete(name);
     const resolved = this.resolveAlias(annotation);
     this.noteDeclaredTypeKind(name, declaredTypeFromAnnotation(resolved));
     const element = annotationArrayElement(resolved);
@@ -279,8 +298,14 @@ export class CompileContext {
    *  variables, destructure slots). Clears any annotation an outer
    *  same-named binding left behind — the new binding shadows it. */
   noteDeclaredTypeKind(name: string, type: StaticValueType | undefined): void {
-    if (type && type !== 'unknown' && type !== 'nil') this.tsDeclaredTypeLocal.set(name, type);
-    else this.tsDeclaredTypeLocal.delete(name);
+    if (type === 'dyn') {
+      this.tsDeclaredTypeLocal.delete(name);
+      this.tsDynLocal.add(name);
+    } else {
+      this.tsDynLocal.delete(name);
+      if (type && type !== 'unknown' && type !== 'nil') this.tsDeclaredTypeLocal.set(name, type);
+      else this.tsDeclaredTypeLocal.delete(name);
+    }
     this.tsDeclaredAnnotation.delete(name);
   }
 
@@ -293,10 +318,13 @@ export class CompileContext {
       array: this.tsArrayTypedLocal.has(name) ? this.tsArrayTypedLocal.get(name) ?? null : undefined,
       classLocal: this.tsTypedClassLocal.get(name),
       shapeTyped: this.tsShapeTypedLocal.has(name),
+      dyn: this.tsDynLocal.has(name),
     };
   }
 
   restoreBinding(name: string, snap: BindingSnapshot): void {
+    if (snap.dyn) this.tsDynLocal.add(name);
+    else this.tsDynLocal.delete(name);
     if (snap.declared !== undefined) this.tsDeclaredTypeLocal.set(name, snap.declared);
     else this.tsDeclaredTypeLocal.delete(name);
     if (snap.annotation !== undefined) this.tsDeclaredAnnotation.set(name, snap.annotation);
@@ -429,6 +457,15 @@ export class CompileContext {
    *  params), so the shape's leaf evidence describes what TS sees. Loop
    *  variables and class fields synthesize differently and are excluded. */
   readonly tsPass6ShapeLocal = new Set<string>();
+
+  /** Bindings whose emitted TS type is `_LuauValue`. Member chains
+   *  rooted in one are `_LuauValue` too and need no bridge. */
+  readonly tsDynLocal = new Set<string>();
+
+  /** Call expressions emitted through the `_LuauFn` / `_LuauMethod`
+   *  bridge; their result is `_LuauValue`. Recorded at emit time since
+   *  the decision lives in the call codegen. */
+  readonly dynResultCalls = new WeakSet<object>();
 
   /** Class-method-body context: a map of `self.X` field name → its
    *  synthesized field shape (TypeNode). Populated by class-shape's

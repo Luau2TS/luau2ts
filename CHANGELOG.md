@@ -24,9 +24,13 @@ All notable changes to `luau2ts` are documented here. Format adheres loosely to 
 - `x == nil` compares directly (TypeScript never raises no-overlap against `undefined`), which also lets it narrow nilable annotations; other equalities widen only one operand.
 - Synthesized shape leaves used only where a number or string can go (`x % 2`, `x + 1`, `math.floor(x)`, `string.upper(x)`) are declared as that primitive instead of `unknown`.
 
-Measured on a 350-script Roblox place: TypeScript errors in the emitted tree fell from 4381 to 1031, `as unknown` casts from 34.8k to 22.9k, `Record<string, unknown>` bridges from 6824 to 4893, and `Parameters<typeof …>` wraps from 6490 to 2110. Three scripts that previously emitted unparseable TypeScript now compile.
+- **`_LuauValue` for values with no type information.** roblox-ts rejects any use of an `any`-typed value, and `unknown` needs a bridge at every typed use. The `rbxts` emit now declares such values as `type _LuauValue = number & { [k: string]: _LuauValue }`: member reads, indexing, arithmetic, comparisons, `pairs` and templates all type-check on it directly, and roblox-ts lowers each to the same Lua the Luau had (verified by round-trip). An untyped parameter is declared `<name>_?: unknown` so any argument fits, and rebound once as `_LuauValue` at the top of the body; an untyped local is declared `_LuauValue` with one cast at its initializer; synthesized shape leaves, `pairs` loop slots, tuple destructures and implicit globals use it in place of `unknown`. Calls on such values go through `_LuauFn`; self-calls (`q:fn()`) through `_LuauMethod`, whose `this` parameter is what makes roblox-ts emit `:`. Writes into a `_LuauValue` slot bridge the value (a number with a single `as`).
+- A number-only usage constraint no longer types a parameter `number` — `p - q` is just as likely vector math — so those parameters take the `_LuauValue` path too. `: any` annotations are treated as no annotation.
+- `#s` on a string emits `.size()` (roblox-ts strings have no `.length`).
 
-Known limit: roblox-ts rejects any use of an `any`-typed value ("Using values of type `any` is not supported"), so a Luau value with no type information in the source can only be represented as `unknown` and bridged at each typed use. The remaining casts sit almost entirely on such values.
+Measured on a 350-script Roblox place: TypeScript errors in the emitted tree fell from 4381 to 1121, `as unknown` casts from 34.8k to 18.8k, `any` from 302 to 40, `Record<string, unknown>` bridges from 6824 to 3187, and `Parameters<typeof …>` wraps from 6490 to 1672. Three scripts that previously emitted unparseable TypeScript now compile.
+
+Known: `for k in pairs(t)` with a single binding still emits a value iteration (`for (const k of …)`), which roblox-ts lowers to `ipairs` — a pre-existing gap, unchanged here.
 
 ## [0.1.0]
 
