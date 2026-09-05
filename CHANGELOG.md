@@ -4,6 +4,8 @@ All notable changes to `luau2ts` are documented here. Format adheres loosely to 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-05
+
 ### Fixed
 - **ModuleScript exports.** `rbxts` mode emitted `export default X`, which roblox-ts lowers to `return { default = X }` — every consumer's `require(M).member` read resolved to `nil` at runtime. Modules now emit `export = X`, which lowers to `return X`. Luau `export type` aliases in such a module lose their `export` keyword, because TypeScript forbids an export assignment beside any other exported element.
 - Duplicate record keys (`{ a = 1, a = 2 }`, legal in Lua) no longer emit a duplicate TS property (TS1117); the last write wins, matching Lua.
@@ -48,5 +50,6 @@ First public release.
 - Roblox API + Roact macros baked in: `Vector3.new`, `CFrame.Angles`, `Instance.new`, `game:GetService`, `Roact.createElement`, `pcall`, `pairs` / `ipairs`, `setmetatable`, plus the per-datatype arithmetic fast-path.
 - 100% Luau conformance (53 / 53 upstream tests pass). 256 unit tests across the compiler, parser, runtime helpers, and CLI.
 
-[Unreleased]: https://github.com/luau2ts/luau2ts/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/luau2ts/luau2ts/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/luau2ts/luau2ts/releases/tag/v0.4.0
 [0.1.0]: https://github.com/luau2ts/luau2ts/releases/tag/v0.1.0
